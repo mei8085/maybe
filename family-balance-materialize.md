@@ -147,24 +147,22 @@ scope :visible, -> { incomplete.where("syncs.created_at > ?", VISIBLE_FOR.ago) }
 
 ### 5.1 父子同步层级结构
 
-家庭账户同步采用三级树形结构：
+家庭账户同步采用**混合树形结构**，Family 同时并行调度两条路径：
 
 ```
-Family（家庭级）
-  └── PlaidItem（银行连接级）
-        └── Account（账户级）
+                    Family（家庭级同步）
+                          │
+           ┌──────────────┼──────────────┐
+           ▼                             ▼
+   PlaidItem（银行连接级）       Manual Account（手动账户级）
+           │
+           ▼
+   Linked Account（链接账户级）
 ```
 
-**代码位置**：
-- `app/models/family/syncer.rb:17-20`：家庭同步创建子同步
-- `app/models/plaid_item/syncer.rb`：PlaidItem同步创建子同步
+**代码证据** (`app/models/family/syncer.rb:17-30`)：
 
 ```ruby
-# app/models/family/syncer.rb
-def child_syncables
-  family.plaid_items + family.accounts.manual
-end
-
 def perform_sync(sync)
   # Schedule child syncs
   child_syncables.each do |syncable|
@@ -173,7 +171,36 @@ def perform_sync(sync)
                         window_end_date: sync.window_end_date)
   end
 end
+
+private
+  def child_syncables
+    family.plaid_items + family.accounts.manual  # ← 两条路径并行
+  end
 ```
+
+**PlaidItem 再调度其下的链接账户** (`app/models/plaid_item/syncer.rb:8-21`)：
+
+```ruby
+def perform_sync(sync)
+  # Loads item metadata, accounts, transactions, and other data to our DB
+  plaid_item.import_latest_plaid_data
+
+  # Processes the raw Plaid data and updates internal domain objects
+  plaid_item.process_accounts
+
+  # All data is synced, so we can now run an account sync to calculate historical balances and more
+  plaid_item.schedule_account_syncs(
+    parent_sync: sync,
+    window_start_date: sync.window_start_date,
+    window_end_date: sync.window_end_date
+  )
+end
+```
+
+**层级说明**：
+1. **第一级（并行）**：Family 同步同时调度 `plaid_items` 和 `accounts.manual`
+2. **第二级**：PlaidItem 同步再调度其下的链接账户（Linked Account）
+3. **状态收敛**：所有子同步完成后才收敛到 Family 同步状态
 
 ### 5.2 同步主流程的异常处理
 
@@ -1134,7 +1161,7 @@ end
                           └──────────────────┘
 ```
 
-## 10. 关键组件速查表
+## 13. 关键组件速查表
 
 | 组件 | 文件位置 | 职责 |
 |------|----------|------|
@@ -1142,6 +1169,7 @@ end
 | Syncable | `app/models/concerns/syncable.rb` | 同步能力混入 |
 | Sync | `app/models/sync.rb` | 同步记录与状态管理 |
 | SyncJob | `app/jobs/sync_job.rb` | 后台执行同步 |
+| SyncCleanerJob | `app/jobs/sync_cleaner_job.rb` | 清理stale同步记录 |
 | Account::Syncer | `app/models/account/syncer.rb` | 账户级同步执行器 |
 | Family::Syncer | `app/models/family/syncer.rb` | 家庭级同步执行器 |
 | Balance::Materializer | `app/models/balance/materializer.rb` | 余额物化核心 |
@@ -1153,7 +1181,7 @@ end
 | Account::SyncCompleteEvent | `app/models/account/sync_complete_event.rb` | 账户同步完成广播 |
 | Family::SyncCompleteEvent | `app/models/family/sync_complete_event.rb` | 家庭同步完成广播 |
 
-## 11. 设计要点总结
+## 14. 设计要点总结
 
 1. **异步化**：所有余额计算都通过 Sidekiq 后台 Job 异步执行，不阻塞用户操作
 2. **窗口扩展**：避免重复 Job，优化频繁流水场景
@@ -1165,3 +1193,5 @@ end
    - `Rails.cache`：图表数据缓存（依赖家庭缓存键失效）
 7. **分层广播**：账户级广播 → 家庭级广播，精确控制更新范围
 8. **事务保护**：整个物化过程在数据库事务中执行，确保数据一致性
+9. **失败收敛**：父子同步状态自动传播，失败后仍广播更新
+10. **Stale恢复**：通过新流水触发自动创建新同步，无需人工干预
