@@ -2,11 +2,12 @@
 
 ## 概述
 
-本文档详细分析了 Maybe Finance 应用中外部银行通过 Plaid 接入到本地账户挂载的完整链路，包括：
+本文档详细分析了 Maybe Finance 应用中外部银行通过 Plaid 接入到本地账户挂载的完整链路，特别关注：
 - 初次授权与 Token 交换流程
 - 账户清单拉取
 - 数据落库与同步机制
-- 错误处理与回滚机制
+- **ITEM_NOT_FOUND 在各阶段的处理链路**
+- **事务边界与回滚机制**
 
 ---
 
@@ -39,6 +40,7 @@ Family
   │       ├── access_token (加密存储)
   │       ├── plaid_id (Plaid 侧唯一标识)
   │       ├── next_cursor (交易同步游标)
+  │       ├── status (good / requires_update)
   │       │
   │       └── PlaidAccount (1:N)
   │               │
@@ -58,10 +60,10 @@ Family
           └── status (active/draft/disabled/pending_deletion)
 ```
 
-**关键文件位置：
-- 模型定义: `app/models/plaid_item.rb` (L1-L120`
-- 账户模型: `app/models/plaid_account.rb` (L1-L54`)
-- 主账户模型: `app/models/account.rb` (L1-L163`)
+**关键文件位置：**
+- PlaidItem 模型: `app/models/plaid_item.rb` (L1-L120)
+- PlaidAccount 模型: `app/models/plaid_account.rb` (L1-L54)
+- Account 模型: `app/models/account.rb` (L1-L163)
 
 ---
 
@@ -101,7 +103,7 @@ Family
 
 #### 第一步：获取 Link Token
 
-**入口：`app/controllers/plaid_items_controller.rb` (L4-L14`)
+**控制器入口** `app/controllers/plaid_items_controller.rb` (L4-L14)
 
 ```ruby
 def new
@@ -117,7 +119,7 @@ def new
 end
 ```
 
-**核心实现：`app/models/family/plaid_connectable.rb` (L32-L42`)
+**核心实现** `app/models/family/plaid_connectable.rb` (L32-L42)
 
 ```ruby
 def get_link_token(webhooks_url:, redirect_url:, accountable_type: nil, region: :us, access_token: nil)
@@ -133,7 +135,7 @@ def get_link_token(webhooks_url:, redirect_url:, accountable_type: nil, region: 
 end
 ```
 
-**Plaid 提供者实现：`app/models/provider/plaid.rb` (L45-L66`)
+**Plaid 提供者实现** `app/models/provider/plaid.rb` (L45-L66)
 
 ```ruby
 def get_link_token(user_id:, webhooks_url:, redirect_url:, accountable_type: nil, access_token: nil)
@@ -159,7 +161,7 @@ def get_link_token(user_id:, webhooks_url:, redirect_url:, accountable_type: nil
 end
 ```
 
-**产品选择逻辑** (`app/models/provider/plaid.rb` L182-L199`)
+**产品选择逻辑** `app/models/provider/plaid.rb` (L182-L199)
 
 | 账户类型 | 主产品 | 附加同意产品 |
 |---------|--------|-------------|
@@ -169,7 +171,7 @@ end
 
 #### 第二步：前端 Plaid Link 初始化
 
-**视图模板：`app/views/plaid_items/new.html.erb` (L1-L8`)
+**视图模板** `app/views/plaid_items/new.html.erb` (L1-L8)
 
 ```erb
 <%= turbo_frame_tag "modal" do %>
@@ -181,7 +183,7 @@ end
 <% end %>
 ```
 
-**Stimulus 控制器：`app/javascript/controllers/plaid_controller.js` (L1-L80`)
+**Stimulus 控制器** `app/javascript/controllers/plaid_controller.js` (L1-L80)
 
 ```javascript
 connect() {
@@ -202,7 +204,7 @@ open() {
 
 #### 第三步：Token 交换
 
-**成功回调处理** (`app/javascript/controllers/plaid_controller.js` L28-L64`)
+**成功回调处理** `app/javascript/controllers/plaid_controller.js` (L28-L64)
 
 ```javascript
 handleSuccess = (public_token, metadata) => {
@@ -230,7 +232,7 @@ handleSuccess = (public_token, metadata) => {
 
 #### 第四步：后端 Token 交换与 PlaidItem 创建
 
-**控制器** (`app/controllers/plaid_items_controller.rb` L25-L33`)
+**控制器** `app/controllers/plaid_items_controller.rb` (L25-L33)
 
 ```ruby
 def create
@@ -243,7 +245,7 @@ def create
 end
 ```
 
-**核心创建逻辑** (`app/models/family/plaid_connectable.rb` L17-L30`)
+**核心创建逻辑** `app/models/family/plaid_connectable.rb` (L17-L30)
 
 ```ruby
 def create_plaid_item!(public_token:, item_name:, region:)
@@ -265,7 +267,7 @@ def create_plaid_item!(public_token:, item_name:, region:)
 end
 ```
 
-**Token 交换 API** (`app/models/provider/plaid.rb` L68-L74`)
+**Token 交换 API** `app/models/provider/plaid.rb` (L68-L74)
 
 ```ruby
 def exchange_public_token(token)
@@ -276,7 +278,7 @@ def exchange_public_token(token)
 end
 ```
 
-**Plaid 配置** (`config/initializers/plaid.rb` L1-L18`)
+**Plaid 配置** `config/initializers/plaid.rb` (L1-L18)
 
 - 支持 US 和 EU 两个区域
 - Access Token 采用 Active Record 加密存储
@@ -288,7 +290,7 @@ end
 
 ### 4.1 同步触发机制
 
-**同步入口** (`app/models/concerns/syncable.rb` L14-L35`)
+**同步入口** `app/models/concerns/syncable.rb` (L14-L35)
 
 ```ruby
 def sync_later(parent_sync: nil, window_start_date: nil, window_end_date: nil)
@@ -313,7 +315,7 @@ def sync_later(parent_sync: nil, window_start_date: nil, window_end_date: nil)
 end
 ```
 
-**同步执行** (`app/models/sync.rb` L60-L80`)
+**同步执行** `app/models/sync.rb` (L60-L80)
 
 ```ruby
 def perform
@@ -340,7 +342,7 @@ end
 
 ### 4.2 PlaidItem 同步流程
 
-**PlaidItem Syncer** (`app/models/plaid_item/syncer.rb` L1-L26`)
+**PlaidItem Syncer** `app/models/plaid_item/syncer.rb` (L1-L26)
 
 ```ruby
 class PlaidItem::Syncer
@@ -365,7 +367,7 @@ end
 
 ### 4.3 阶段一：数据导入（Import）
 
-**导入器入口** (`app/models/plaid_item/importer.rb` L1-L57`)
+**导入器入口** `app/models/plaid_item/importer.rb` (L1-L57)
 
 ```ruby
 class PlaidItem::Importer
@@ -406,13 +408,14 @@ class PlaidItem::Importer
         ).import
       end
 
+      # 所有数据导入成功后才更新 cursor
       plaid_item.update!(next_cursor: snapshot.transactions_cursor)
     end
   end
 end
 ```
 
-**PlaidItem 快照更新** (`app/models/plaid_item.rb` L73-L94`)
+**PlaidItem 快照更新** `app/models/plaid_item.rb` (L73-L94)
 
 ```ruby
 def upsert_plaid_snapshot!(item_snapshot)
@@ -437,7 +440,7 @@ end
 
 ### 4.4 账户数据快照（AccountsSnapshot）
 
-**快照类** (`app/models/plaid_item/accounts_snapshot.rb` L1-L105`)
+**快照类** `app/models/plaid_item/accounts_snapshot.rb` (L1-L105)
 
 ```ruby
 class PlaidItem::AccountsSnapshot
@@ -510,7 +513,7 @@ end
 
 ### 4.5 PlaidAccount 导入器
 
-**PlaidAccount::Importer** (`app/models/plaid_account/importer.rb` L1-L32`)
+**PlaidAccount::Importer** `app/models/plaid_account/importer.rb` (L1-L32)
 
 ```ruby
 class PlaidAccount::Importer
@@ -546,7 +549,7 @@ class PlaidAccount::Importer
 end
 ```
 
-**PlaidAccount 快照更新** (`app/models/plaid_account.rb` L9-L46`)
+**PlaidAccount 快照更新** `app/models/plaid_account.rb` (L9-L46)
 
 ```ruby
 def upsert_plaid_snapshot!(account_snapshot)
@@ -573,7 +576,7 @@ end
 
 ### 4.6 阶段二：数据处理（Process）
 
-**PlaidItem 处理入口** (`app/models/plaid_item.rb` L56-L60`)
+**PlaidItem 处理入口** `app/models/plaid_item.rb` (L56-L60)
 
 ```ruby
 def process_accounts
@@ -583,7 +586,7 @@ def process_accounts
 end
 ```
 
-**PlaidAccount::Processor** (`app/models/plaid_account/processor.rb` L1-L109`)
+**PlaidAccount::Processor** `app/models/plaid_account/processor.rb` (L1-L109)
 
 ```ruby
 class PlaidAccount::Processor
@@ -657,7 +660,7 @@ class PlaidAccount::Processor
 end
 ```
 
-**类型映射** (`app/models/plaid_account/type_mappable.rb` L1-L77`)
+**类型映射** `app/models/plaid_account/type_mappable.rb` (L1-L77)
 
 | Plaid Type | 本地 Accountable | 示例 Subtypes |
 |-----------|----------------|--------------|
@@ -669,7 +672,7 @@ end
 
 ### 4.7 阶段三：账户级同步调度
 
-**调度账户同步** (`app/models/plaid_item.rb` L63-L71`)
+**调度账户同步** `app/models/plaid_item.rb` (L63-L71)
 
 ```ruby
 def schedule_account_syncs(parent_sync: nil, window_start_date: nil, window_end_date: nil)
@@ -703,7 +706,7 @@ create_table "plaid_items", id: :uuid do |t|
   t.string "institution_url"
   t.string "institution_id"
   t.string "institution_color"
-  t.string "status", default: "good", null: false
+  t.string "status", default: "good", null: false  # good / requires_update
   t.jsonb "raw_payload", default: {}
   t.jsonb "raw_institution_payload", default: {}
 end
@@ -729,7 +732,7 @@ create_table "plaid_accounts", id: :uuid do |t|
 end
 ```
 
-### 5.3 accounts 表（关联字段
+### 5.3 accounts 表（关联字段）
 
 ```ruby
 create_table "accounts", id: :uuid do |t|
@@ -749,11 +752,36 @@ end
 
 ---
 
-## 六、错误处理与回滚机制
+## 六、ITEM_NOT_FOUND 处理链路详解
 
-### 6.1 Token 级错误处理
+### 6.1 背景说明
 
-**Plaid API 错误分类** (`app/models/plaid_item/importer.rb` L19-L28`)
+`ITEM_NOT_FOUND` 是 Plaid API 返回的错误码，表示该 item 在 Plaid 侧已不存在。
+
+**触发场景：**
+- 用户在 Plaid 门户手动删除了该银行连接
+- Plaid 管理员主动删除了该 item
+- access_token 对应的 item 已过期/失效
+
+### 6.2 阶段一：导入阶段（数据拉取）
+
+**触发场景：** 定时同步或手动触发同步时，`SyncJob` 执行导入流程
+
+**调用链路：**
+```
+SyncJob#perform
+  └── Sync#perform
+        └── PlaidItem#perform_sync
+              └── PlaidItem::Syncer#perform_sync
+                    └── PlaidItem#import_latest_plaid_data
+                          └── PlaidItem::Importer#import
+                                ├── fetch_and_import_item_data
+                                │     └── plaid_provider.get_item(access_token)
+                                │           └── Plaid::ApiError (ITEM_NOT_FOUND)
+                                └── handle_plaid_error(e)
+```
+
+**代码实现** `app/models/plaid_item/importer.rb` (L17-L28)
 
 ```ruby
 def handle_plaid_error(error)
@@ -763,71 +791,206 @@ def handle_plaid_error(error)
   when "ITEM_LOGIN_REQUIRED"
     plaid_item.update!(status: :requires_update)
   else
+    # ITEM_NOT_FOUND 会走到这里，被重新抛出
     raise error
   end
 end
 ```
 
-**错误码处理总结：
+**处理方式：异常上抛**
 
-| 错误码 | 处理方式 | 说明 |
-|--------|---------|------|
-| ITEM_LOGIN_REQUIRED | 标记为 requires_update | 需要用户重新授权 |
-| ITEM_NOT_FOUND | 标记为 requires_update | Plaid 端已删除 |
-| 其他错误 | 重新抛出 | 同步标记为失败 |
+| 行为 | 说明 |
+|-----|------|
+| ITEM_NOT_FOUND 是否被特殊处理 | ❌ 否 |
+| 处理方式 | `raise error` 重新抛出异常 |
+| 上层捕获位置 | `Sync#perform` 的 `rescue => e` |
+| Sync 状态变化 | `syncing` → `failed` |
+| 数据库事务回滚 | ❌ 此阶段无事务（导入阶段在事务边界之外抛错） |
+| PlaidItem.status 变化 | ❌ 无变化（仍为 `good`） |
+| 错误信息记录 | `sync.update(error: e.message)` |
 
-### 6.2 同步状态机
+**注意：** 导入阶段的 `fetch_and_import_item_data` 和 `fetch_and_import_accounts_data` 中调用的 Plaid API（`get_item`, `get_item_accounts`, `get_transactions` 等）都在事务外执行。只有 `fetch_and_import_accounts_data` 内部有一个 `PlaidItem.transaction` 包裹数据库写入操作。
 
-**Sync 状态机** (`app/models/sync.rb` L26-L52`)
+### 6.3 阶段二：更新 Token 阶段（重新授权）
 
+**触发场景：** 用户点击"更新银行连接"，系统尝试用旧的 access_token 生成 update mode 的 link_token
+
+**调用链路：**
 ```
-pending ──start──▶ syncing ──complete──▶ completed
-                      │
-                      └──fail──▶ failed
-                      │
-                      └──mark_stale──▶ stale
+PlaidItemsController#edit
+  └── PlaidItem#get_update_link_token
+        └── family.get_link_token(access_token: access_token)
+              └── plaid_provider.get_link_token(..., access_token: access_token)
+                    └── Plaid::ApiError (ITEM_NOT_FOUND)
+                          └── rescue 捕获
 ```
 
-**状态说明：
-- **pending**: 等待执行
-- **syncing**: 正在执行中
-- **completed**: 成功完成
-- **failed**: 执行失败
-- **stale**: 超时未完成（24小时）
-
-**状态转换处理** (`app/models/sync.rb` L82-L104`)
+**代码实现** `app/models/plaid_item.rb` (L25-L42)
 
 ```ruby
-def finalize_if_all_children_finalized
-  Sync.transaction do
-    lock!
+def get_update_link_token(webhooks_url:, redirect_url:)
+  family.get_link_token(
+    webhooks_url: webhooks_url,
+    redirect_url: redirect_url,
+    region: plaid_region,
+    access_token: access_token
+  )
+rescue Plaid::ApiError => e
+  error_body = JSON.parse(e.response_body)
 
-    return unless all_children_finalized?
-
-    if syncing?
-      if has_failed_children?
-        fail!
-      else
-        complete!
-      end
-    end
-
-    perform_post_sync
+  if error_body["error_code"] == "ITEM_NOT_FOUND"
+    # Mark the connection as invalid but don't auto-delete
+    update!(status: :requires_update)
   end
 
-  parent&.finalize_if_all_children_finalized
+  Sentry.capture_exception(e)
+  nil
 end
 ```
 
-### 6.3 事务与原子性
+**处理方式：状态标记 + 返回 nil**
 
-**账户数据导入事务** (`app/models/plaid_item/importer.rb` L38-L56`)
+| 行为 | 说明 |
+|-----|------|
+| ITEM_NOT_FOUND 是否被特殊处理 | ✅ 是 |
+| 处理方式 | `update!(status: :requires_update)` + 上报 Sentry + `return nil` |
+| 异常是否上抛 | ❌ 否（已在 rescue 中处理） |
+| PlaidItem.status 变化 | `good` → `requires_update` |
+| 数据库事务回滚 | ❌ 无数据库写入事务（只有 `update!` 独立执行） |
+| 返回值 | `nil` |
+| 前端表现 | 视图使用 `@link_token`（可能为 nil），Plaid Link 无法初始化 |
+
+### 6.4 阶段三：删除阶段
+
+**触发场景：** 用户点击"删除银行连接"
+
+**调用链路：**
+```
+PlaidItemsController#destroy
+  └── PlaidItem#destroy_later
+        ├── update!(scheduled_for_deletion: true)
+        └── DestroyJob.perform_later
+              └── DestroyJob#perform
+                    └── PlaidItem#destroy
+                          ├── before_destroy :remove_plaid_item
+                          │     └── plaid_provider.remove_item(access_token)
+                          │           └── Plaid::ApiError (ITEM_NOT_FOUND)
+                          │                 └── rescue 静默吞掉
+                          └── 继续执行本地删除（级联删除）
+```
+
+**代码实现** `app/models/plaid_item.rb` (L100-L112)
+
+```ruby
+def remove_plaid_item
+  plaid_provider.remove_item(access_token)
+rescue Plaid::ApiError => e
+  json_response = JSON.parse(e.response_body)
+
+  # If the item is not found, that means it was already deleted by the user on their
+  # Plaid portal OR by Plaid support.  Either way, we're not being billed, so continue
+  # with the deletion of our internal record.
+  unless json_response["error_code"] == "ITEM_NOT_FOUND"
+    raise e
+  end
+end
+```
+
+**处理方式：静默吞掉 + 继续本地删除**
+
+| 行为 | 说明 |
+|-----|------|
+| ITEM_NOT_FOUND 是否被特殊处理 | ✅ 是 |
+| 处理方式 | 静默忽略，不抛异常 |
+| 其他错误码处理 | `raise e` 继续抛出 |
+| 级联删除是否执行 | ✅ 是 |
+| 数据库事务回滚 | ❌ 无回滚（删除成功） |
+| PlaidItem 及关联数据 | 被永久删除 |
+| DestroyJob 异常处理 | 如果删除过程中发生其他错误：`model.update!(scheduled_for_deletion: false)` 重置状态 |
+
+### 6.5 ITEM_NOT_FOUND 三阶段对比总结表
+
+| 维度 | 导入阶段 (Import) | 更新 Token 阶段 (Edit) | 删除阶段 (Destroy) |
+|-----|------------------|---------------------|-------------------|
+| **触发时机** | 定时/手动同步 | 用户点击"更新连接" | 用户点击"删除" |
+| **调用入口** | `PlaidItem::Importer#import` | `PlaidItem#get_update_link_token` | `PlaidItem#remove_plaid_item` |
+| **ITEM_NOT_FOUND 处理** | ❌ 无特殊处理 | ✅ 标记 `requires_update` | ✅ 静默忽略 |
+| **异常上抛** | ✅ `raise error` | ❌ 不抛，返回 nil | ❌ 不抛，继续删除 |
+| **Sync 状态变化** | `syncing` → `failed` | 无 Sync 参与 | 无 Sync 参与 |
+| **PlaidItem.status** | ❌ 不变（仍为 good） | `good` → `requires_update` | N/A（已删除） |
+| **错误信息记录** | `sync.error = e.message` | Sentry 上报 | 不记录 |
+| **数据库事务回滚** | ❌ 无（API 调用在事务外） | ❌ 无 | ❌ 无 |
+| **用户可见反馈** | 同步失败，显示错误 | UI 提示需要更新 | 静默成功删除 |
+
+---
+
+## 七、事务边界与回滚机制详解
+
+### 7.1 同步流程中的事务分布图
+
+```
+SyncJob#perform (无事务)
+│
+├── Sync#start! (单独事务)
+│
+├── syncable.perform_sync(self)
+│     │
+│     ├── 阶段一: import_latest_plaid_data
+│     │     │
+│     │     ├── fetch_and_import_item_data (无事务)
+│     │     │     ├── get_item API 调用
+│     │     │     ├── get_institution API 调用
+│     │     │     └── 2 次独立的 .save! (各有自己的隐式事务)
+│     │     │
+│     │     └── fetch_and_import_accounts_data
+│     │           │
+│     │           ├── get_item_accounts API 调用 (无事务)
+│     │           ├── get_transactions API 调用 (无事务)
+│     │           ├── get_investments API 调用 (无事务)
+│     │           ├── get_liabilities API 调用 (无事务)
+│     │           │
+│     │           └── PlaidItem.transaction do ──────────────┐
+│     │                 ├── N 次 PlaidAccount::Importer#import  │ 事务 T1
+│     │                 │     └── .save! / .update!            │
+│     │                 └── plaid_item.update!(next_cursor)    │
+│     │           └────────────────────────────────────────────┘
+│     │
+│     └── 阶段二: process_accounts (遍历每个 PlaidAccount)
+│           │
+│           └── 每个 PlaidAccount:
+│                 │
+│                 ├── process_account!
+│                 │     └── PlaidAccount.transaction do ─────┐
+│                 │           ├── find_or_initialize_by     │ 事务 T2n
+│                 │           ├── enrich_attributes          │
+│                 │           ├── assign_attributes          │
+│                 │           ├── account.save!              │
+│                 │           └── set_current_balance        │
+│                 └──────────────────────────────────────────┘
+│                 │
+│                 ├── process_transactions (无事务, rescue 捕获)
+│                 ├── process_investments (无事务, rescue 捕获)
+│                 └── process_liabilities (无事务, rescue 捕获)
+│
+├── rescue => e (捕获阶段一/二抛出的异常)
+│     ├── Sync#fail! (单独事务)
+│     ├── sync.update(error: e.message) (单独事务)
+│     └── report_error (Sentry)
+│
+└── ensure: finalize_if_all_children_finalized (Sync.transaction)
+```
+
+### 7.2 各事务边界详解
+
+#### 事务 T1：账户数据导入事务
+
+**位置** `app/models/plaid_item/importer.rb` (L38-L56)
 
 ```ruby
 def fetch_and_import_accounts_data
   snapshot = PlaidItem::AccountsSnapshot.new(plaid_item, plaid_provider: plaid_provider)
 
-  PlaidItem.transaction do
+  PlaidItem.transaction do  # ← 事务 T1 开始
     snapshot.accounts.each do |raw_account|
       plaid_account = plaid_item.plaid_accounts.find_or_initialize_by(
         plaid_id: raw_account.account_id
@@ -836,25 +999,43 @@ def fetch_and_import_accounts_data
       PlaidAccount::Importer.new(
         plaid_account,
         account_snapshot: snapshot.get_account_data(raw_account.account_id)
-      ).import
+      ).import  # 内部调用 .save!
     end
 
-    # 所有数据导入成功后才更新 cursor
     plaid_item.update!(next_cursor: snapshot.transactions_cursor)
-  end
+  end  # ← 事务 T1 结束（commit 或 rollback）
 end
 ```
 
-**关键设计要点：
-1. 所有账户导入在一个事务内完成
-2. cursor 只在所有账户都成功导入后才更新
-3. 任何一个账户导入失败，整个事务回滚，cursor 不更新
+**事务 T1 包含的操作：**
+| 操作 | 说明 |
+|-----|------|
+| `find_or_initialize_by` | 查找或初始化 PlaidAccount（纯读） |
+| `PlaidAccount::Importer#import` | 内部调用 `.save!` / `.update!`（写） |
+| `plaid_item.update!(next_cursor)` | 更新游标（写） |
 
-**账户处理事务** (`app/models/plaid_account/processor.rb` L31-L62`)
+**事务 T1 回滚条件：**
+- 任何一次 `.save!` 失败（验证失败等）
+- `plaid_item.update!` 失败
+- 事务内任何其他异常
+
+**事务 T1 不包含的操作（在事务外执行）：**
+| 操作 | 说明 |
+|-----|------|
+| `get_item_accounts` | Plaid API 调用 |
+| `get_transactions` | Plaid API 调用 |
+| `get_investments` | Plaid API 调用 |
+| `get_liabilities` | Plaid API 调用 |
+
+**⚠️ 重要：** Plaid API 调用在事务外执行。如果 API 调用抛 `ITEM_NOT_FOUND`，**不会触发事务回滚**（因为事务还没开始，或者已经在异常抛出点之前）。
+
+#### 事务 T2n：单个账户处理事务（每个 PlaidAccount 一个独立事务）
+
+**位置** `app/models/plaid_account/processor.rb` (L31-L62)
 
 ```ruby
 def process_account!
-  PlaidAccount.transaction do
+  PlaidAccount.transaction do  # ← 事务 T2n 开始
     account = family.accounts.find_or_initialize_by(
       plaid_account_id: plaid_account.id
     )
@@ -877,97 +1058,228 @@ def process_account!
     account.save!
 
     account.set_current_balance(balance_calculator.balance)
-  end
+  end  # ← 事务 T2n 结束
 end
 ```
 
-### 6.4 级联删除与软删除机制
+**事务 T2n 包含的操作：**
+| 操作 | 说明 |
+|-----|------|
+| `find_or_initialize_by` | 查找或创建 Account（读/可能写） |
+| `enrich_attributes` | 设置属性（内存操作） |
+| `assign_attributes` | 设置属性（内存操作） |
+| `account.save!` | 保存 Account（写） |
+| `set_current_balance` | 创建/更新估值锚点（可能写） |
 
-**PlaidItem 销毁流程**
+**事务 T2n 回滚条件：**
+- `account.save!` 失败
+- `set_current_balance` 内部抛异常
+- 映射类型时抛 `UnknownAccountTypeError`
 
-1. **软删除标记** (`app/models/plaid_item.rb` L44-L47`)
+**事务 T2n 失败后的影响：**
+| 行为 | 说明 |
+|-----|------|
+| 当前 Account | 回滚（不会创建/更新） |
+| 其他 PlaidAccount 的事务 | ❌ 不受影响（各自独立） |
+| 同步整体状态 | ❌ 会失败（异常上抛到 Sync#perform） |
+
+**⚠️ 注意：** `process_account!` 没有 `rescue`，异常会直接向上传播，导致整个同步失败。但由于每个账户的事务是独立的，**已成功提交的其他账户事务不会回滚**。
+
+#### 事务 T3：Sync 状态变更事务
+
+**位置** `app/models/sync.rb` (L68-L79)
+
 ```ruby
-def destroy_later
-  update!(scheduled_for_deletion: true)
-  DestroyJob.perform_later(self)
+start!  # 单独事务
+
+begin
+  syncable.perform_sync(self)
+rescue => e
+  fail!  # 单独事务
+  update(error: e.message)  # 单独事务
+  report_error(e)
+ensure
+  finalize_if_all_children_finalized  # Sync.transaction
 end
 ```
 
-2. **实际销毁** (`app/models/plaid_item.rb` L101-L112`)
-```ruby
-def remove_plaid_item
-  plaid_provider.remove_item(access_token)
-rescue Plaid::ApiError => e
-  json_response = JSON.parse(e.response_body)
+### 7.3 异常传播与回滚矩阵
 
-  unless json_response["error_code"] == "ITEM_NOT_FOUND"
-    raise e
-  end
-end
+#### 阶段一（Import）异常传播
+
+| 异常来源 | 捕获位置 | 处理方式 | 回滚范围 |
+|---------|---------|---------|---------|
+| `fetch_and_import_item_data` 中 API 报错 | `handle_plaid_error` | `ITEM_LOGIN_REQUIRED` → 状态标记<br>其他 → `raise` | ❌ 无（在事务外） |
+| 事务 T1 内 `.save!` 失败 | 无（直接上抛） | 异常上抛 | ✅ 事务 T1 内所有操作回滚 |
+| 事务 T1 外 API 报错（如 `ITEM_NOT_FOUND`） | `handle_plaid_error` → `raise` | 异常上抛 | ❌ 无（API 调用在事务外） |
+
+#### 阶段二（Process）异常传播
+
+| 异常来源 | 捕获位置 | 处理方式 | 回滚范围 |
+|---------|---------|---------|---------|
+| `process_account!` 内事务 T2n 失败 | 无（直接上抛） | 异常上抛 | ✅ 当前事务 T2n 回滚<br>❌ 其他已提交的 T2n 不回滚 |
+| `process_transactions` 内部异常 | `rescue => e` | Sentry 上报，继续 | ❌ 无回滚 |
+| `process_investments` 内部异常 | `rescue => e` | Sentry 上报，继续 | ❌ 无回滚 |
+| `process_liabilities` 内部异常 | `rescue => e` | Sentry 上报，继续 | ❌ 无回滚 |
+
+### 7.4 错误处理策略分类
+
+#### 分类 A：必须成功 → 异常上抛 → Sync 失败
+
+**特征：** 没有 `rescue` 或 `rescue` 后重新 `raise`
+
+**包含：**
+| 位置 | 行为 |
+|-----|------|
+| `PlaidItem::Importer#fetch_and_import_item_data` | 无 rescue，异常直接上抛 |
+| `PlaidItem::Importer#fetch_and_import_accounts_data` | 事务内 `.save!` 失败上抛 |
+| `PlaidItem::Importer#handle_plaid_error` | 非 `ITEM_LOGIN_REQUIRED` 的错误 `raise` |
+| `PlaidAccount::Processor#process_account!` | 无 rescue，事务内失败上抛 |
+| `Sync#perform` | `rescue` 后 `fail!` 并记录错误 |
+
+**结果：**
+- Sync 状态：`syncing` → `failed`
+- 错误信息：`sync.error = e.message`
+- 已提交的独立事务：不会回滚
+
+#### 分类 B：状态标记 → 不上抛 → 同步继续
+
+**特征：** `rescue` 后更新数据库状态，不抛异常
+
+**包含：**
+| 位置 | 行为 |
+|-----|------|
+| `PlaidItem::Importer#handle_plaid_error` | `ITEM_LOGIN_REQUIRED` → `update!(status: :requires_update)` |
+| `PlaidItem#get_update_link_token` | `ITEM_NOT_FOUND` → `update!(status: :requires_update)` + Sentry + return nil |
+
+**结果：**
+- PlaidItem.status: `good` → `requires_update`
+- 同步流程：可能继续或终止（取决于具体位置）
+- 无事务回滚
+
+#### 分类 C：静默吞掉 → 仅 Sentry 上报 → 继续执行
+
+**特征：** `rescue => e` + `report_exception` 或无操作
+
+**包含：**
+| 位置 | 行为 |
+|-----|------|
+| `PlaidAccount::Processor#process_transactions` | `rescue => e` + `report_exception(e)` |
+| `PlaidAccount::Processor#process_investments` | `rescue => e` + `report_exception(e)` |
+| `PlaidAccount::Processor#process_liabilities` | `rescue => e` + `report_exception(e)` |
+| `PlaidItem#remove_plaid_item` | `ITEM_NOT_FOUND` 时不抛异常，继续删除 |
+| `PlaidItem::WebhookProcessor#process` | `rescue => e` + `Sentry.capture_exception` |
+
+**结果：**
+- 单个步骤失败不影响整体流程
+- 错误仅记录到 Sentry
+- 无事务回滚
+
+#### 分类 D：删除失败 → 状态重置 → 允许重试
+
+**特征：** `rescue` 后重置状态标记
+
+**包含：**
+| 位置 | 行为 |
+|-----|------|
+| `DestroyJob#perform` | `rescue => e` + `update!(scheduled_for_deletion: false)` |
+
+**结果：**
+- 数据库记录保留
+- `scheduled_for_deletion` 重置为 `false`
+- 用户可重新触发删除
+
+### 7.5 事务边界总结图
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        SyncJob#perform (无外层事务)                        │
+└──────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  start! (独立事务 A)                                                      │
+│  └── Sync: pending → syncing                                              │
+└──────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  阶段一: import_latest_plaid_data                                         │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  fetch_and_import_item_data (无事务)                               │  │
+│  │  ├── get_item API (事务外) ← ITEM_NOT_FOUND 在此抛异常              │  │
+│  │  ├── get_institution API (事务外)                                  │  │
+│  │  ├── .save! (独立事务 B1: 更新 plaid_item)                          │  │
+│  │  └── .save! (独立事务 B2: 更新 institution)                         │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  fetch_and_import_accounts_data                                    │  │
+│  │  ├── get_item_accounts API (事务外)                                │  │
+│  │  ├── get_transactions API (事务外)                                 │  │
+│  │  ├── get_investments API (事务外)                                  │  │
+│  │  ├── get_liabilities API (事务外)                                  │  │
+│  │  │                                                                  │  │
+│  │  └── 事务 T1 (PlaidItem.transaction)                                │  │
+│  │      ├── PlaidAccount1 导入 ← 失败 → T1 回滚 → 异常上抛             │  │
+│  │      ├── PlaidAccount2 导入                                         │  │
+│  │      ├── PlaidAccount3 导入                                         │  │
+│  │      └── update!(next_cursor) ← 全部成功才执行                      │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  阶段二: process_accounts                                                 │
+│                                                                          │
+│  遍历每个 PlaidAccount:                                                  │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  PlaidAccount1                                                      │  │
+│  │  ├── 事务 T2_1 (PlaidAccount.transaction)                            │  │
+│  │  │   ├── Account find_or_create                                     │  │
+│  │  │   ├── account.save!                                              │  │
+│  │  │   └── set_current_balance                                        │  │
+│  │  └── 若失败 → T2_1 回滚 → 异常上抛 → 整个同步失败                     │  │
+│  │                                                                      │  │
+│  │  ├── process_transactions ← rescue 吞掉 → 仅 Sentry 上报            │  │
+│  │  ├── process_investments ← rescue 吞掉 → 仅 Sentry 上报            │  │
+│  │  └── process_liabilities ← rescue 吞掉 → 仅 Sentry 上报            │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  PlaidAccount2 (同上，独立事务 T2_2)                                │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ⚠️ 注意：T2_1、T2_2 是独立事务。若 T2_2 失败，T2_1 已提交的数据不会回滚  │
+└──────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  异常处理 (rescue => e)                                                   │
+│  ├── fail! (独立事务 C: Sync syncing → failed)                           │
+│  ├── update(error: e.message) (独立事务 D)                                │
+│  └── Sentry.capture_exception                                             │
+└──────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ensure: finalize_if_all_children_finalized                              │
+│  └── Sync.transaction (事务 E)                                            │
+│      ├── 若 all_children_finalized?                                       │
+│      │   ├── 有 failed 子同步 → fail!                                     │
+│      │   └── 无 failed 子同步 → complete!                                 │
+│      └── perform_post_sync                                                │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-3. **级联关系** (`app/models/plaid_item.rb` L18-L19`)
-```ruby
-has_many :plaid_accounts, dependent: :destroy
-has_many :accounts, through: :plaid_accounts
-```
+---
 
-4. **账户级联** (`app/models/plaid_account.rb` L4`)
-```ruby
-has_one :account, dependent: :destroy
-```
+## 八、Webhook 处理
 
-5. **DestroyJob** (`app/jobs/destroy_job.rb` L1-L9`)
-```ruby
-class DestroyJob < ApplicationJob
-  queue_as :low_priority
+### 8.1 Webhook 验证
 
-  def perform(model)
-    model.destroy
-  rescue => e
-    model.update!(scheduled_for_deletion: false) # 重置状态，允许用户重试
-  end
-end
-```
-
-**删除链：
-```
-PlaidItem.destroy_later
-  │
-  ├── update!(scheduled_for_deletion: true)
-  │
-  └── DestroyJob.perform_later
-           │
-           └── PlaidItem.destroy
-                    │
-                    ├── before_destroy: remove_plaid_item (调用 Plaid API)
-                    │
-                    └── has_many :plaid_accounts, dependent: :destroy
-                             │
-                             └── has_one :account, dependent: :destroy
-```
-
-### 6.5 分步错误隔离
-
-**PlaidAccount::Processor 错误隔离** (`app/models/plaid_account/processor.rb` L64-L88`)
-
-```ruby
-def process
-  process_account!           # 必须成功，失败则整个处理中断
-  process_transactions    # 失败不影响其他步骤，仅记录到 Sentry
-  process_investments    # 同上
-  process_liabilities      # 同上
-end
-```
-
-**设计意图：
-- `process_account!` 用 `!` 表示必须成功
-- 其他步骤用 `rescue` 捕获异常并上报 Sentry
-- 单个账户的交易/投资/负债处理失败不会影响其他账户或主账户创建
-
-### 6.6 Webhook 错误处理
-
-**Webhook 验证** (`app/models/provider/plaid.rb` L14-L43`)
+**位置** `app/models/provider/plaid.rb` (L14-L43)
 
 ```ruby
 def validate_webhook!(verification_header, raw_body)
@@ -999,7 +1311,14 @@ def validate_webhook!(verification_header, raw_body)
 end
 ```
 
-**Webhook 处理** (`app/models/plaid_item/webhook_processor.rb` L1-L56`)
+**三重验证：**
+1. JWT 签名验证（ES256）
+2. 时间戳检查（5 分钟内）
+3. 请求体哈希验证
+
+### 8.2 Webhook 处理器
+
+**位置** `app/models/plaid_item/webhook_processor.rb` (L1-L56)
 
 ```ruby
 class PlaidItem::WebhookProcessor
@@ -1030,9 +1349,148 @@ class PlaidItem::WebhookProcessor
 end
 ```
 
+**Webhook 类型处理：**
+
+| Webhook 类型 | Code | 处理方式 |
+|-------------|------|---------|
+| TRANSACTIONS | SYNC_UPDATES_AVAILABLE | 触发同步 |
+| INVESTMENTS_TRANSACTIONS | DEFAULT_UPDATE | 触发同步 |
+| HOLDINGS | DEFAULT_UPDATE | 触发同步 |
+| ITEM | ERROR + ITEM_LOGIN_REQUIRED | 标记 requires_update |
+
+**⚠️ 注意：** Webhook 中的 `ITEM.ERROR` 事件只处理 `ITEM_LOGIN_REQUIRED`，**不处理 `ITEM_NOT_FOUND`**。如果 Plaid 发送了 `ITEM_NOT_FOUND` 的错误 webhook，系统只会记录一条 warn 日志，不会做任何状态变更。
+
+### 8.3 Webhook 中的"缺失 Item"场景
+
+**位置** `app/models/plaid_item/webhook_processor.rb` (L44-L55)
+
+```ruby
+def handle_missing_item
+  return if plaid_item.present?
+
+  # If we cannot find an item in our DB, that means we've reached an invalid data state where
+  # the Plaid Item (upstream) still exists (and is being billed), but doesn't exist internally.
+  #
+  # Since we don't have the item which has the access token, there is nothing we can do programmatically
+  # here, so we just need to report it to Sentry and manually handle it.
+  Sentry.capture_exception(MissingItemError.new("Received Plaid webhook for item no longer in our DB.  Manual action required to resolve.")) do |scope|
+    scope.set_tags(plaid_item_id: item_id)
+  end
+end
+```
+
+**场景说明：**
+- 这是 **反向的** `ITEM_NOT_FOUND`：Plaid 侧的 item 还在，但本地数据库已删除
+- 系统无法自动处理（没有 access_token 无法调用 Plaid API）
+- 仅上报 Sentry，等待人工处理
+
 ---
 
-## 七、完整时序图
+## 九、删除流程详解
+
+### 9.1 删除调用链
+
+```
+用户点击删除
+    │
+    ▼
+PlaidItemsController#destroy
+    │
+    └── @plaid_item.destroy_later
+          │
+          ├── update!(scheduled_for_deletion: true)  ← 独立事务
+          │
+          └── DestroyJob.perform_later
+                │
+                ▼
+          DestroyJob#perform
+                │
+                └── PlaidItem#destroy
+                      │
+                      ├── before_destroy :remove_plaid_item
+                      │     │
+                      │     └── plaid_provider.remove_item(access_token)
+                      │           │
+                      │           ├── 成功 → 继续
+                      │           │
+                      │           └── Plaid::ApiError
+                      │                 │
+                      │                 ├── ITEM_NOT_FOUND → 静默忽略
+                      │                 │
+                      │                 └── 其他错误 → raise e → 删除中断
+                      │
+                      └── 级联删除 (dependent: :destroy)
+                            │
+                            ├── PlaidAccount.destroy_all
+                            │     │
+                            │     └── Account.destroy (每个 PlaidAccount has_one :account)
+                            │
+                            └── 其他关联数据删除
+```
+
+### 9.2 删除相关代码
+
+**软删除标记** `app/models/plaid_item.rb` (L44-L47)
+
+```ruby
+def destroy_later
+  update!(scheduled_for_deletion: true)
+  DestroyJob.perform_later(self)
+end
+```
+
+**Plaid 侧删除** `app/models/plaid_item.rb` (L100-L112)
+
+```ruby
+def remove_plaid_item
+  plaid_provider.remove_item(access_token)
+rescue Plaid::ApiError => e
+  json_response = JSON.parse(e.response_body)
+
+  unless json_response["error_code"] == "ITEM_NOT_FOUND"
+    raise e
+  end
+end
+```
+
+**级联关系** `app/models/plaid_item.rb` (L18-L19)
+
+```ruby
+has_many :plaid_accounts, dependent: :destroy
+has_many :accounts, through: :plaid_accounts
+```
+
+**PlaidAccount 级联** `app/models/plaid_account.rb` (L4)
+
+```ruby
+has_one :account, dependent: :destroy
+```
+
+**DestroyJob 异常处理** `app/jobs/destroy_job.rb` (L1-L9)
+
+```ruby
+class DestroyJob < ApplicationJob
+  queue_as :low_priority
+
+  def perform(model)
+    model.destroy
+  rescue => e
+    model.update!(scheduled_for_deletion: false) # 重置状态，允许用户重试
+  end
+end
+```
+
+### 9.3 删除失败场景
+
+| 失败原因 | 处理方式 | 结果 |
+|---------|---------|------|
+| Plaid API 返回 `ITEM_NOT_FOUND` | 静默忽略 | 本地删除继续执行，成功 |
+| Plaid API 返回其他错误 | `raise e` | 删除中断，`scheduled_for_deletion` 重置为 false |
+| 数据库删除失败 | `rescue => e` | `scheduled_for_deletion` 重置为 false |
+
+---
+
+## 十、完整时序图
 
 ```
 用户                    前端                     后端                    Plaid API                数据库
@@ -1057,7 +1515,6 @@ end
  │                       │                        │                        │
  │◀──redirect /accounts──│                        │                        │
  │                       │                        │                        │
- │                       │                        │                        │
  │                       │  ──SyncJob 执行──▶│                        │
  │                       │                        │──get_item──▶│
  │                       │                        │◀──item_data───│
@@ -1071,14 +1528,20 @@ end
  │                       │                        │──get_transactions──▶│
  │                       │                        │◀──transactions───│
  │                       │                        │                        │
+ │                       │                        │──事务 T1 开始──▶│
  │                       │                        │──INSERT/UPDATE plaid_accounts──▶│
  │                       │                        │──UPDATE next_cursor──▶│
+ │                       │                        │──事务 T1 提交──▶│
  │                       │                        │                        │
  │                       │                        │                        │
  │                       │                        │──process_accounts──▶│
  │                       │                        │                        │
+ │                       │                        │──事务 T2_1 (Account1)──▶│
  │                       │                        │──find_or_create accounts──▶│
- │                       │                        │──INSERT/UPDATE accounts──▶│
+ │                       │                        │──事务 T2_1 提交──▶│
+ │                       │                        │                        │
+ │                       │                        │──事务 T2_2 (Account2)──▶│
+ │                       │                        │──事务 T2_2 提交──▶│
  │                       │                        │                        │
  │                       │                        │──schedule_account_syncs──▶│
  │                       │                        │                        │
@@ -1086,9 +1549,9 @@ end
 
 ---
 
-## 八、关键设计亮点
+## 十一、关键设计亮点
 
-### 8.1 三层数据存储策略
+### 11.1 三层数据存储策略
 
 1. **原始数据保留**
    - `raw_payload` 系列字段完整保存 Plaid 原始响应
@@ -1103,23 +1566,28 @@ end
    - Plaid 类型 → 本地 Accountable 类型
    - 支持多种账户类型抽象
 
-### 8.2 同步机制
+### 11.2 事务策略
 
-1. **父子同步树**
-   - PlaidItem 同步作为父同步
-   - 每个 Account 同步作为子同步
-   - 父同步等待所有子同步完成后才完成
+| 策略 | 应用场景 | 目的 |
+|-----|---------|------|
+| **大事务 T1** | 账户批量导入 | 保证所有 PlaidAccount 导入和 cursor 更新的原子性 |
+| **独立小事务 T2n** | 每个账户的领域模型转换 | 账户间隔离，一个失败不影响其他已提交的 |
+| **无事务 API 调用** | 所有 Plaid API 调用 | 避免持有数据库锁等待外部 IO |
+| **状态标记而非回滚** | 错误恢复场景 | 允许用户手动干预和重试 |
 
-2. **幂等性设计**
-   - `find_or_initialize_by(plaid_id: ...)`
-   - 重复调用不会创建重复记录
+### 11.3 错误处理分层
 
-3. **事务边界清晰
+| 层级 | 处理方式 | 示例 |
+|-----|---------|------|
+| **必须成功层** | 异常上抛，Sync 失败 | 账户基础信息导入、类型映射 |
+| **优雅降级层** | 状态标记，等待用户 | ITEM_LOGIN_REQUIRED → requires_update |
+| **静默忽略层** | Sentry 上报，继续执行 | 交易/投资/负债处理失败 |
+| **预期容错层** | 特殊错误码处理 | ITEM_NOT_FOUND 在删除时的处理 |
 
-### 8.3 安全措施
+### 11.4 安全措施
 
 1. **Token 加密**
-   - `encrypts :access_token, deterministic: true
+   - `encrypts :access_token, deterministic: true`
 
 2. **Webhook 验证**
    - JWT 签名验证
@@ -1132,24 +1600,24 @@ end
 
 ---
 
-## 九、相关文件索引
+## 十二、相关文件索引
 
 | 文件路径 | 说明 |
 |---------|------|
 | `app/controllers/plaid_items_controller.rb` | Plaid 项目控制器 |
 | `app/models/family/plaid_connectable.rb` | Family 与 Plaid 连接模块 |
 | `app/models/provider/plaid.rb` | Plaid API 提供者 |
-| `app/models/plaid_item.rb` | PlaidItem 主模型 |
-| `app/models/plaid_item/importer.rb` | PlaidItem 数据导入器 |
+| `app/models/plaid_item.rb` | PlaidItem 主模型（含 ITEM_NOT_FOUND 处理） |
+| `app/models/plaid_item/importer.rb` | PlaidItem 数据导入器（事务 T1） |
 | `app/models/plaid_item/syncer.rb` | PlaidItem 同步器 |
 | `app/models/plaid_item/accounts_snapshot.rb` | 账户数据快照 |
 | `app/models/plaid_item/webhook_processor.rb` | Webhook 处理器 |
 | `app/models/plaid_account.rb` | PlaidAccount 模型 |
 | `app/models/plaid_account/importer.rb` | PlaidAccount 数据导入器 |
-| `app/models/plaid_account/processor.rb` | PlaidAccount 处理器 |
+| `app/models/plaid_account/processor.rb` | PlaidAccount 处理器（事务 T2n） |
 | `app/models/plaid_account/type_mappable.rb` | 类型映射模块 |
 | `app/models/concerns/syncable.rb` | 同步通用模块 |
-| `app/models/sync.rb` | Sync 记录模型 |
+| `app/models/sync.rb` | Sync 记录模型（状态机） |
 | `app/jobs/sync_job.rb` | 同步作业 |
 | `app/jobs/destroy_job.rb` | 销毁作业 |
 | `app/javascript/controllers/plaid_controller.js` | 前端 Plaid 控制器 |
@@ -1159,9 +1627,9 @@ end
 
 ---
 
-## 十、附录：主要流程总结
+## 十三、附录：主要流程总结
 
-### 10.1 新建银行连接
+### 13.1 新建银行连接
 
 1. 用户点击"连接银行"
 2. 后端生成 Link Token
@@ -1172,23 +1640,37 @@ end
 7. 创建 PlaidItem 记录
 8. 触发第一次同步
 
-### 10.2 同步流程
+### 13.2 同步流程
 
-1. 拉取 Item 和 Institution 数据
-2. 拉取账户列表
-3. 根据产品支持情况拉取交易/投资/负债数据
-4. 事务内更新所有 PlaidAccount
-5. 更新 cursor
-6. 处理每个账户 → 创建/更新本地 Account
-7. 处理交易、投资、负债
-8. 调度账户级同步
+1. 拉取 Item 和 Institution 数据（无事务）
+2. 拉取账户列表（无事务）
+3. 根据产品支持情况拉取交易/投资/负债数据（无事务）
+4. **事务 T1** 内更新所有 PlaidAccount + cursor
+5. 遍历每个账户，**事务 T2n** 内创建/更新本地 Account
+6. 处理交易、投资、负债（独立 rescue，不影响整体）
+7. 调度账户级同步
 
-### 10.3 错误场景
+### 13.3 ITEM_NOT_FOUND 在各阶段
 
-| 场景 | 处理方式 |
-|-----|---------|
-| ITEM_LOGIN_REQUIRED | 标记 requires_update，等待用户重新授权 |
-| 同步失败 | Sync 标记为 failed，记录错误信息 |
-| 部分步骤失败 | 上报 Sentry，继续其他步骤 |
-| Webhook 验证失败 | 返回 400，上报 Sentry |
-| 删除时 Plaid 已删除 | 忽略错误，继续本地删除 |
+| 阶段 | 处理方式 | 事务回滚 |
+|-----|---------|---------|
+| 导入阶段 | 异常上抛 → Sync failed | ❌ API 在事务外 |
+| 更新 Token 阶段 | 标记 requires_update + Sentry | ❌ 无 |
+| 删除阶段 | 静默忽略 → 继续本地删除 | ❌ 无 |
+
+### 13.4 事务回滚边界
+
+| 事务 | 回滚触发条件 | 回滚范围 |
+|-----|-------------|---------|
+| **T1** (账户导入) | 事务内任何 `.save!` 失败 | T1 内所有 PlaidAccount 操作 + cursor 更新 |
+| **T2n** (单个账户处理) | `account.save!` 失败或映射异常 | 当前 T2n 内 Account 操作 |
+| **无事务** (API 调用) | 任何 API 错误 | ❌ 无（异常上抛导致 Sync 失败，但已提交的事务不回滚） |
+
+### 13.5 错误处理分类
+
+| 分类 | 处理方式 | 示例错误码/场景 |
+|-----|---------|----------------|
+| **必须成功** | 异常上抛 → Sync failed | 类型映射错误、`save!` 验证失败 |
+| **状态标记** | 更新 status，不抛异常 | `ITEM_LOGIN_REQUIRED`、更新时的 `ITEM_NOT_FOUND` |
+| **静默忽略** | Sentry 上报，继续执行 | 交易/投资/负债处理失败、删除时的 `ITEM_NOT_FOUND` |
+| **状态重置** | 重置标记，允许重试 | 删除失败时 `scheduled_for_deletion = false` |
