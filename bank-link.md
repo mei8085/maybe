@@ -1698,13 +1698,29 @@ end
 | 导入阶段 | 异常上抛 → Sync failed | `sync.error = e.message` | PlaidItem.status 不变 |
 | 更新 Token 阶段 | 标记 requires_update + Sentry | Sentry.capture_exception | `good` → `requires_update` |
 | 删除阶段 | 静默忽略 → 继续本地删除 | 无 | N/A（已删除） |
-| **Webhook 阶段** | **静默跳过**（在 ITEM.ERROR 分支内） | ❌ 无 warn，❌ 无 Sentry | ❌ 无 |
+| **Webhook 阶段（有 error 字段）** | **静默跳过**（在 ITEM.ERROR 分支内） | ❌ 无 warn，❌ 无 Sentry | ❌ 无 |
 
-**⚠️ Webhook 阶段注意事项：**
-- `ITEM.ERROR` + `ITEM_NOT_FOUND`：静默跳过，没有任何日志
-- `ITEM.ERROR` + 其他错误码：同样静默跳过
-- `error` 字段为 `nil`：同样静默跳过
-- 只有**未匹配** `case/when` 分支的 webhook 类型才会打 warn 日志
+### 13.3.1 Webhook 阶段细分
+
+Webhook 的 `ITEM.ERROR` 事件有两种不同的处理路径：
+
+| 场景 | 处理方式 | 日志/上报 |
+|-----|---------|---------|
+| `ITEM.ERROR` + 有 `error` 字段 + 任意 error_code | 静默跳过 | ❌ 无 |
+| `ITEM.ERROR` + **error 为 `nil`**（Plaid 未传 error 字段） | `nil["error_code"]` → `NoMethodError` → `rescue` 捕获 | ✅ `Sentry.capture_exception(e)` |
+| 未匹配 `case/when` 的 webhook 类型/代码 | 走 `else` 分支 | ✅ `Rails.logger.warn(...)` |
+
+**调用链分析：**
+```ruby
+when [ "ITEM", "ERROR" ]
+  if error["error_code"] == "ITEM_LOGIN_REQUIRED"
+    # error 有值：静默跳过或标记 requires_update
+    # error 为 nil：nil["error_code"] 抛 NoMethodError
+  end
+rescue => e  # 捕获 NoMethodError
+  Sentry.capture_exception(e)
+end
+```
 
 ### 13.4 事务回滚边界
 
