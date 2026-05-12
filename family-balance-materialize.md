@@ -1,5 +1,24 @@
 # 家庭账户余额物化流程报告
 
+## 目录
+
+1. [概述](#1-概述)
+2. [核心流程总览](#2-核心流程总览)
+3. [流水触发同步机制](#3-流水触发同步机制)
+4. [后台 Job 调度系统](#4-后台-job-调度系统)
+5. [同步失败与子同步失败状态收敛及广播行为](#5-同步失败与子同步失败状态收敛及广播行为)
+6. [并发提交时同步窗口扩展机制](#6-并发提交时同步窗口扩展机制)
+7. [stale 标记后的重跑路径](#7-stale-标记后的重跑路径)
+8. [余额计算与物化核心](#8-余额计算与物化核心)
+9. [数据物化到 balances 表](#9-数据物化到-balances-表)
+10. [同步完成与 UI 广播](#10-同步完成与-ui-广播)
+11. [图表数据消费](#11-图表数据消费)
+12. [完整时序图](#12-完整时序图)
+13. [关键组件速查表](#13-关键组件速查表)
+14. [设计要点总结](#14-设计要点总结)
+
+---
+
 ## 1. 概述
 
 本报告详细说明家庭账户在新流水（Entry）进来之后，余额是如何重新计算并物化到列表与图表的完整流程。这个过程涉及多个后台 Job 与计算器的协作，最终实现数据下沉到 UI 层。
@@ -772,7 +791,7 @@ def perform_post_sync
 end
 ```
 
-### 5.2 Balance::Materializer
+### 8.2 Balance::Materializer
 
 `app/models/balance/materializer.rb` 是余额物化的核心组件：
 
@@ -833,9 +852,9 @@ account.balances.upsert_all(
 
 仅在正向计算时更新 `account.balance` 和 `account.cash_balance` 字段。
 
-### 5.3 两种计算策略
+### 8.3 两种计算策略
 
-#### 5.3.1 正向计算 (Forward Calculator)
+#### 8.3.1 正向计算 (Forward Calculator)
 
 适用于**手动账户**，从期初余额开始向前计算：
 
@@ -865,7 +884,7 @@ end
 4. 计算调整项（差异）
 5. 构建余额对象
 
-#### 5.3.2 反向计算 (Reverse Calculator)
+#### 8.3.2 反向计算 (Reverse Calculator)
 
 适用于**Plaid 连接账户**，从最新余额倒推历史余额：
 
@@ -886,7 +905,7 @@ end
 
 **适用场景**：Plaid 提供的是当前账户余额，但历史流水完整，需要从当前倒推。
 
-### 5.4 BaseCalculator 核心方法
+### 8.4 BaseCalculator 核心方法
 
 `app/models/balance/base_calculator.rb` 提供了基础计算能力：
 
@@ -914,7 +933,7 @@ end
 - `net_market_flows`：市场价值变化
 - `flows_factor`：资产(+1) / 负债(-1) 方向
 
-### 5.5 Balance::SyncCache
+### 8.5 Balance::SyncCache
 
 `app/models/balance/sync_cache.rb` 提供计算所需的缓存数据：
 
@@ -928,9 +947,9 @@ def get_entries(date)      # 获取当日流水
 - 自动处理货币转换
 - 使用内存缓存避免重复查询
 
-## 6. 数据物化到 balances 表
+## 9. 数据物化到 balances 表
 
-### 6.1 Balance 模型结构
+### 9.1 Balance 模型结构
 
 `app/models/balance.rb`：
 
@@ -949,12 +968,12 @@ end
 
 **注意**：`end_balance`、`start_balance` 等字段可能是数据库生成列。
 
-### 6.2 唯一索引
+### 9.2 唯一索引
 
 持久化时使用 `unique_by: %i[account_id date currency]` 确保：
 - 每个账户、每天、每种货币只有一条余额记录
 
-## 7. 同步完成与 UI 广播
+## 10. 同步完成与 UI 广播
 
 ### 10.1 同步完成后的事件链
 
@@ -967,7 +986,7 @@ def perform_post_sync
 end
 ```
 
-### 7.2 Account::SyncCompleteEvent
+### 10.2 Account::SyncCompleteEvent
 
 `app/models/account/sync_complete_event.rb` 处理账户级别的广播：
 
@@ -996,7 +1015,7 @@ def broadcast
 end
 ```
 
-### 7.3 Family::SyncCompleteEvent
+### 10.3 Family::SyncCompleteEvent
 
 `app/models/family/sync_complete_event.rb` 处理家庭级别的广播：
 
@@ -1018,9 +1037,9 @@ def broadcast
 end
 ```
 
-## 8. 图表数据消费
+## 11. 图表数据消费
 
-### 8.1 账户级图表
+### 11.1 账户级图表
 
 `app/models/account/chartable.rb`：
 
@@ -1037,7 +1056,7 @@ def balance_series(period: Period.last_30_days, view: :balance, interval: nil)
 end
 ```
 
-### 8.2 家庭净值图表
+### 11.2 家庭净值图表
 
 `app/models/balance_sheet/net_worth_series_builder.rb`：
 
@@ -1055,7 +1074,7 @@ def net_worth_series(period: Period.last_30_days)
 end
 ```
 
-### 8.3 Balance::ChartSeriesBuilder
+### 11.3 Balance::ChartSeriesBuilder
 
 `app/models/balance/chart_series_builder.rb` 是连接余额数据和图表的桥梁：
 
@@ -1086,7 +1105,7 @@ end
 - 处理货币转换
 - 聚合多个账户的余额
 
-## 9. 完整时序图
+## 12. 完整时序图
 
 ```
 用户操作
