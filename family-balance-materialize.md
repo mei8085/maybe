@@ -729,7 +729,7 @@ end
 
 ## 8. 余额计算与物化核心
 
-### 5.1 Account::Syncer
+### 8.1 Account::Syncer
 
 `app/models/account/syncer.rb` 是账户级别的同步器：
 
@@ -929,7 +929,7 @@ end
 
 ## 7. 同步完成与 UI 广播
 
-### 7.1 同步完成后的事件链
+### 10.1 同步完成后的事件链
 
 ```ruby
 # app/models/sync.rb:142-149
