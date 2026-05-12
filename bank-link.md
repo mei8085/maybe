@@ -1357,8 +1357,31 @@ end
 | INVESTMENTS_TRANSACTIONS | DEFAULT_UPDATE | 触发同步 |
 | HOLDINGS | DEFAULT_UPDATE | 触发同步 |
 | ITEM | ERROR + ITEM_LOGIN_REQUIRED | 标记 requires_update |
+| ITEM | ERROR + 其他 error_code | **静默忽略**（不打 warn，不报错，不更新状态） |
 
-**⚠️ 注意：** Webhook 中的 `ITEM.ERROR` 事件只处理 `ITEM_LOGIN_REQUIRED`，**不处理 `ITEM_NOT_FOUND`**。如果 Plaid 发送了 `ITEM_NOT_FOUND` 的错误 webhook，系统只会记录一条 warn 日志，不会做任何状态变更。
+**⚠️ 注意：** Webhook 中的 `ITEM.ERROR` 事件处理逻辑如下：
+
+```ruby
+when [ "ITEM", "ERROR" ]
+  if error["error_code"] == "ITEM_LOGIN_REQUIRED"
+    plaid_item.update!(status: :requires_update)
+  end
+  # 其他 error_code（如 ITEM_NOT_FOUND）：什么都不做，直接跳过
+```
+
+**各种场景的实际表现：**
+
+| 场景 | 处理方式 | 日志/上报 | 状态变化 |
+|-----|---------|---------|---------|
+| `ITEM.ERROR` + `error_code = ITEM_LOGIN_REQUIRED` | `update!(status: :requires_update)` | 无 | `good` → `requires_update` |
+| `ITEM.ERROR` + `error_code = ITEM_NOT_FOUND` | **静默跳过** | ❌ 无 warn，❌ 无 Sentry | ❌ 无 |
+| `ITEM.ERROR` + `error` 为 `nil`（Plaid 未传 error 字段） | 静默跳过 | ❌ 无 warn，❌ 无 Sentry | ❌ 无 |
+| `ITEM.ERROR` + 其他错误码 | 静默跳过 | ❌ 无 warn，❌ 无 Sentry | ❌ 无 |
+| **未匹配的 webhook_type/code**（如 `ITEM.WEBHOOK_UPDATE_ACKNOWLEDGED`） | 走 `else` 分支 | ✅ `Rails.logger.warn("Unhandled Plaid webhook type: ...")` | ❌ 无 |
+
+**关键区别：**
+- `ITEM.ERROR` 分支内的非 ITEM_LOGIN_REQUIRED 情况：**静默忽略**，没有任何日志
+- 其他未匹配的 webhook 类型/代码组合：**会打 warn 日志**
 
 ### 8.3 Webhook 中的"缺失 Item"场景
 
