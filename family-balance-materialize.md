@@ -127,12 +127,607 @@ pending → syncing → completed
             stale (超时24小时)
 ```
 
+**关键状态定义** (`app/models/sync.rb:18-20`)：
+```ruby
+scope :ordered, -> { order(created_at: :desc) }
+scope :incomplete, -> { where("syncs.status IN (?)", %w[pending syncing]) }
+scope :visible, -> { incomplete.where("syncs.created_at > ?", VISIBLE_FOR.ago) }
+```
+
+**重要**：`incomplete` 作用域**仅包含** `pending` 和 `syncing` 状态，**不包含** `failed` 和 `stale` 状态。这意味着：
+- `failed` 和 `stale` 的同步记录不会被 `syncs.incomplete.first` 找到
+- 后续的 `sync_later` 调用会创建**全新**的同步记录
+
 **关键方法**：
 - `perform` (第60-80行)：执行同步主流程
 - `finalize_if_all_children_finalized` (第83-104行)：处理父子同步关系
 - `perform_post_sync` (第142-149行)：同步完成后的后置处理
 
-## 5. 余额计算与物化核心
+## 5. 同步失败与子同步失败状态收敛及广播行为
+
+### 5.1 父子同步层级结构
+
+家庭账户同步采用三级树形结构：
+
+```
+Family（家庭级）
+  └── PlaidItem（银行连接级）
+        └── Account（账户级）
+```
+
+**代码位置**：
+- `app/models/family/syncer.rb:17-20`：家庭同步创建子同步
+- `app/models/plaid_item/syncer.rb`：PlaidItem同步创建子同步
+
+```ruby
+# app/models/family/syncer.rb
+def child_syncables
+  family.plaid_items + family.accounts.manual
+end
+
+def perform_sync(sync)
+  # Schedule child syncs
+  child_syncables.each do |syncable|
+    syncable.sync_later(parent_sync: sync, 
+                        window_start_date: sync.window_start_date, 
+                        window_end_date: sync.window_end_date)
+  end
+end
+```
+
+### 5.2 同步主流程的异常处理
+
+`app/models/sync.rb:60-80`：
+
+```ruby
+def perform
+  Rails.logger.tagged("Sync", id, syncable_type, syncable_id) do
+    # This can happen on server restarts or if Sidekiq enqueues a duplicate job
+    unless may_start?
+      Rails.logger.warn("Sync #{id} is not in a valid state (#{aasm.from_state}) to start.  Skipping sync.")
+      return
+    end
+
+    start!
+
+    begin
+      syncable.perform_sync(self)
+    rescue => e
+      fail!
+      update(error: e.message)
+      report_error(e)
+    ensure
+      finalize_if_all_children_finalized
+    end
+  end
+end
+```
+
+**异常处理要点**：
+1. **状态检查**：`may_start?` 确保只有 `pending` 状态的同步能开始执行
+2. **异常捕获**：`begin-rescue-ensure` 结构确保即使同步失败也会执行收尾
+3. **失败标记**：`fail!` 立即标记同步为 `failed` 状态
+4. **错误记录**：`update(error: e.message)` 保存错误信息
+5. **保证收尾**：`ensure` 块确保 `finalize_if_all_children_finalized` 总是执行
+
+### 5.3 父子同步状态收敛机制
+
+`app/models/sync.rb:82-104`：
+
+```ruby
+def finalize_if_all_children_finalized
+  Sync.transaction do
+    lock!
+
+    # If this is the "parent" and there are still children running, don't finalize.
+    return unless all_children_finalized?
+
+    if syncing?
+      if has_failed_children?
+        fail!
+      else
+        complete!
+      end
+    end
+
+    # If we make it here, the sync is finalized.  Run post-sync, regardless of failure/success.
+    perform_post_sync
+  end
+
+  # If this sync has a parent, try to finalize it so the child status propagates up the chain.
+  parent&.finalize_if_all_children_finalized
+end
+```
+
+**关键辅助方法** (`app/models/sync.rb:134-140`)：
+
+```ruby
+def has_failed_children?
+  children.failed.any?
+end
+
+def all_children_finalized?
+  children.incomplete.empty?
+end
+```
+
+**状态收敛规则**：
+
+| 条件 | 父同步状态 | 说明 |
+|------|-----------|------|
+| `all_children_finalized?` 为 false | 保持 `syncing` | 仍有子同步在执行，等待 |
+| `all_children_finalized?` 为 true 且 `has_failed_children?` 为 true | `fail!` | 任一子同步失败，父同步也失败 |
+| `all_children_finalized?` 为 true 且 `has_failed_children?` 为 false | `complete!` | 所有子同步成功，父同步成功 |
+
+**递归传播**：`parent&.finalize_if_all_children_finalized` 确保状态向上传播整个层级。
+
+### 5.4 测试场景验证
+
+根据 `test/models/sync_test.rb` 的三个关键测试：
+
+**场景1：全链路成功** (`test "can run nested syncs that alert the parent when complete"`)：
+```
+Family:syncing ──→ PlaidItem:syncing ──→ Account:syncing
+     ↓                    ↓                    ↓
+Family:completed ←─ PlaidItem:completed ←─ Account:completed
+```
+
+**场景2：子同步失败向上传播** (`test "failures propagate up the chain"`)：
+```
+Family:syncing ──→ PlaidItem:syncing ──→ Account:fail!
+     ↓                    ↓                    ↓
+Family:failed  ←── PlaidItem:failed  ←── Account:failed
+```
+
+**场景3：父已失败，子成功不改变父状态** (`test "parent failure should not change status if child succeeds"`)：
+```
+Family:fail! ──→ PlaidItem:fail! ──→ Account:complete!
+     ↓                 ↓                    ↓
+Family:failed    PlaidItem:failed    Account:completed
+(状态不变)      (状态不变)
+```
+
+### 5.5 失败后的广播行为
+
+`app/models/sync.rb:142-149`：
+
+```ruby
+def perform_post_sync
+  Rails.logger.info("Performing post-sync for #{syncable_type} (#{syncable.id})")
+  syncable.perform_post_sync
+  syncable.broadcast_sync_complete
+rescue => e
+  Rails.logger.error("Error performing post-sync for #{syncable_type} (#{syncable.id}): #{e.message}")
+  report_error(e)
+end
+```
+
+**关键设计**：
+1. **无论成功或失败都执行**：`perform_post_sync` 在 `finalize_if_all_children_finalized` 中无条件调用
+2. **广播总是触发**：`broadcast_sync_complete` 在失败后仍然执行
+3. **异常隔离**：post-sync 内部异常被捕获，不影响状态机流程
+
+**测试验证** (`test/models/sync_test.rb:121-127`)：
+```ruby
+# 即使 Account 同步失败，仍然会执行广播：
+Account.any_instance.expects(:perform_post_sync).once
+PlaidItem.any_instance.expects(:perform_post_sync).once
+Family.any_instance.expects(:perform_post_sync).once
+
+Account.any_instance.expects(:broadcast_sync_complete).once
+PlaidItem.any_instance.expects(:broadcast_sync_complete).once
+Family.any_instance.expects(:broadcast_sync_complete).once
+```
+
+**广播层级**：
+
+| 层级 | 广播组件 | 广播内容 |
+|------|---------|---------|
+| Account | `Account::SyncCompleteEvent` | 账户列表行、侧边栏分组、账户详情页 |
+| PlaidItem | `PlaidItem::SyncCompleteEvent` | 触发各账户广播 → 最终触发家庭广播 |
+| Family | `Family::SyncCompleteEvent` | 资产负债表、净值图表 |
+
+**失败场景下的广播策略**：
+- 即使同步失败，UI 仍然会被刷新，让用户看到最新的可用数据
+- 失败信息通过 `sync.error` 字段存储，可在 UI 中展示
+- `sync_error` 方法 (`app/models/concerns/syncable.rb:49-51`) 用于获取同步错误：
+  ```ruby
+  def sync_error
+    latest_sync&.error || latest_sync&.children&.map(&:error)&.compact&.first
+  end
+  ```
+
+## 6. 并发提交时同步窗口扩展机制
+
+### 6.1 并发控制的原子性保障
+
+`app/models/concerns/syncable.rb:14-35`：
+
+```ruby
+def sync_later(parent_sync: nil, window_start_date: nil, window_end_date: nil)
+  Sync.transaction do
+    with_lock do
+      sync = self.syncs.incomplete.first
+
+      if sync
+        Rails.logger.info("There is an existing sync, expanding window if needed (#{sync.id})")
+        sync.expand_window_if_needed(window_start_date, window_end_date)
+      else
+        sync = self.syncs.create!(
+          parent: parent_sync,
+          window_start_date: window_start_date,
+          window_end_date: window_end_date
+        )
+
+        SyncJob.perform_later(sync)
+      end
+
+      sync
+    end
+  end
+end
+```
+
+**并发控制三重保障**：
+1. **数据库事务** (`Sync.transaction do`)：整个操作在一个事务中
+2. **行级锁** (`with_lock do`)：对 syncable 记录加锁，防止并发创建
+3. **状态检查** (`self.syncs.incomplete.first`)：仅查找 `pending` 或 `syncing` 状态
+
+**并发场景示意**：
+
+```
+请求A: 创建流水1 (日期: 2026-05-01)
+请求B: 创建流水2 (日期: 2026-05-10)
+请求C: 创建流水3 (日期: 2026-05-05)
+
+时间线：
+─────────────────────────────────────────────────→
+  │         │         │
+  ▼         ▼         ▼
+请求A     请求B     请求C
+开始      开始      开始
+  │         │         │
+  │        with_lock  │
+  │         │         │
+  │      查找incomplete
+  │      (nil)        │
+  │      创建Sync1    │
+  │      window: [2026-05-10]
+  │         │         │
+  │      释放锁       │
+  ▼         │         ▼
+with_lock              with_lock
+  │                    查找incomplete
+  │                    (找到Sync1: pending)
+  │                    expand_window_if_needed
+  │                    window: [2026-05-05, 2026-05-10]
+  │                    释放锁
+查找incomplete
+(找到Sync1: pending)
+expand_window_if_needed
+window: [2026-05-01, 2026-05-10]
+释放锁
+  │
+  ▼
+最终: 只有一个SyncJob被调度
+      window覆盖所有三个日期 [2026-05-01 ~ 2026-05-10]
+```
+
+### 6.2 窗口扩展算法
+
+`app/models/sync.rb:106-127`：
+
+```ruby
+def expand_window_if_needed(new_window_start_date, new_window_end_date)
+  return unless pending?
+  return if self.window_start_date.nil? && self.window_end_date.nil? # already as wide as possible
+
+  earliest_start_date = if self.window_start_date && new_window_start_date
+    [ self.window_start_date, new_window_start_date ].min
+  else
+    nil
+  end
+
+  latest_end_date = if self.window_end_date && new_window_end_date
+    [ self.window_end_date, new_window_end_date ].max
+  else
+    nil
+  end
+
+  update(
+    window_start_date: earliest_start_date,
+    window_end_date: latest_end_date
+  )
+end
+```
+
+**扩展规则**：
+
+| 条件 | 行为 |
+|------|------|
+| 同步状态不是 `pending` | **直接返回**，不扩展（正在执行的同步不修改窗口） |
+| `window_start_date` 和 `window_end_date` 都为 `nil` | **直接返回**（`nil` 表示全量同步，已最宽） |
+| 新窗口开始日期更早 | `window_start_date = min(old_start, new_start)` |
+| 新窗口结束日期更晚 | `window_end_date = max(old_end, new_end)` |
+
+**窗口含义**：
+- `window_start_date = nil, window_end_date = nil`：**全量同步**（重新计算所有历史）
+- 有具体日期：**增量同步**（仅计算该窗口内的变化）
+
+### 6.3 避免漏算的关键设计
+
+**1. 窗口扩展仅在 pending 状态**：
+```ruby
+return unless pending?
+```
+- 如果同步已经 `syncing`，不再扩展窗口
+- 避免正在执行的同步中途改变计算范围
+
+**2. 完整时间覆盖**：
+- `Entry#sync_account_later` 传递 `window_start_date` 为最早受影响日期
+- 扩展算法取 `min`/`max` 确保所有日期都被覆盖
+
+**3. 多次触发只调度一次**：
+```ruby
+sync = self.syncs.incomplete.first
+
+if sync
+  # 已有incomplete同步，仅扩展窗口，不创建新Job
+  sync.expand_window_if_needed(window_start_date, window_end_date)
+else
+  # 没有incomplete同步，创建新记录并调度
+  sync = self.syncs.create!(...)
+  SyncJob.perform_later(sync)
+end
+```
+
+**测试验证** (`test/models/sync_test.rb:203-221`)：
+```ruby
+test "expand_window_if_needed widens start and end dates on a pending sync" do
+  initial_start = 1.day.ago.to_date
+  initial_end   = 1.day.ago.to_date
+
+  sync = Sync.create!(
+    syncable: accounts(:depository),
+    window_start_date: initial_start,
+    window_end_date: initial_end
+  )
+
+  new_start = 5.days.ago.to_date
+  new_end   = Date.current
+
+  sync.expand_window_if_needed(new_start, new_end)
+
+  assert_equal new_start, sync.window_start_date  # 取更早的
+  assert_equal new_end,   sync.window_end_date    # 取更晚的
+end
+```
+
+### 6.4 特殊场景：流水日期修改
+
+`app/models/entry.rb:46-49`：
+
+```ruby
+def sync_account_later
+  sync_start_date = [ date_previously_was, date ].compact.min unless destroyed?
+  account.sync_later(window_start_date: sync_start_date)
+end
+```
+
+**设计意图**：
+- 如果流水日期从 `2026-05-10` 改为 `2026-05-01`
+- `date_previously_was = 2026-05-10`，`date = 2026-05-01`
+- `min = 2026-05-01`，确保从最早的日期开始重算
+
+**测试验证** (`test/models/account/entry_test.rb:29-43`)：
+```ruby
+test "triggers sync with correct start date when transaction date changed to prior" do
+  prior_date = @entry.date - 1
+  @entry.update! date: prior_date
+  
+  @entry.account.expects(:sync_later).with(window_start_date: prior_date)
+  @entry.sync_account_later
+end
+
+test "triggers sync with correct start date when transaction date changed to later" do
+  prior_date = @entry.date
+  @entry.update! date: @entry.date + 1
+  
+  @entry.account.expects(:sync_later).with(window_start_date: prior_date)
+  @entry.sync_account_later
+end
+```
+
+**关键点**：无论日期改早还是改晚，`sync_start_date` 都取 `min(旧日期, 新日期)`，确保覆盖所有受影响的日期。
+
+## 7. stale 标记后的重跑路径
+
+### 7.1 stale 状态的产生
+
+`app/models/sync.rb:2-4`：
+
+```ruby
+# We run a cron that marks any syncs that have not been resolved in 24 hours as "stale"
+# Syncs often become stale when new code is deployed and the worker restarts
+STALE_AFTER = 24.hours
+```
+
+**stale 标记条件**：
+- 同步状态为 `pending` 或 `syncing`
+- `created_at` 超过 24 小时
+
+**标记执行** (`app/models/sync.rb:54-58`)：
+
+```ruby
+class << self
+  def clean
+    incomplete.where("syncs.created_at < ?", STALE_AFTER.ago).find_each(&:mark_stale!)
+  end
+end
+```
+
+**定时调度** (`config/schedule.yml:10-14`)：
+
+```yaml
+clean_syncs:
+  cron: "0 * * * *" # every hour
+  class: "SyncCleanerJob"
+  queue: "scheduled"
+  description: "Cleans up stale syncs"
+```
+
+**触发场景**：
+1. Sidekiq worker 重启（部署时常见）
+2. 同步执行过程中进程崩溃
+3. 同步执行时间异常长（超过24小时）
+
+### 7.2 stale 状态的关键特性
+
+**1. incomplete 作用域不包含 stale** (`app/models/sync.rb:19`)：
+```ruby
+scope :incomplete, -> { where("syncs.status IN (?)", %w[pending syncing]) }
+```
+
+**影响**：
+- `syncs.incomplete.first` 不会返回 stale 同步
+- 后续 `sync_later` 调用会创建**全新**的同步记录
+
+**2. 状态机转换** (`app/models/sync.rb:48-51`)：
+```ruby
+# Marks a sync that never completed within the expected time window
+event :mark_stale do
+  transitions from: %i[pending syncing], to: :stale
+end
+```
+
+**3. 无法从 stale 重新开始**：
+- 没有定义从 `stale` 到其他状态的转换事件
+- stale 同步记录仅作为历史记录保留
+
+### 7.3 重跑路径：新流水触发
+
+**重跑机制完全依赖新的 `sync_later` 调用**：
+
+```
+现有场景：
+─────────────────────────────────────────────────
+SyncA: pending → syncing → (24小时后) → stale
+                        (worker重启中断)
+
+用户创建新流水：
+─────────────────────────────────────────────────
+entry.save! → entry.sync_account_later
+                    ↓
+              account.sync_later
+                    ↓
+              syncs.incomplete.first 
+              (返回 nil，因为 stale 不在 incomplete)
+                    ↓
+              创建 SyncB: pending
+              SyncJob.perform_later(SyncB)
+                    ↓
+              SyncB 正常执行 → completed
+```
+
+**关键代码路径**：
+
+```ruby
+# app/models/concerns/syncable.rb:14-35
+def sync_later(parent_sync: nil, window_start_date: nil, window_end_date: nil)
+  Sync.transaction do
+    with_lock do
+      sync = self.syncs.incomplete.first  # ← 不会找到 stale
+
+      if sync
+        # 只有 pending/syncing 才会走这里
+        sync.expand_window_if_needed(...)
+      else
+        # stale 存在时会走这里，创建新同步
+        sync = self.syncs.create!(...)
+        SyncJob.perform_later(sync)
+      end
+    end
+  end
+end
+```
+
+### 7.4 测试验证
+
+`test/models/sync_test.rb:182-201`：
+
+```ruby
+test "clean marks stale incomplete rows" do
+  stale_pending = Sync.create!(
+    syncable: accounts(:depository),
+    status: :pending,
+    created_at: 25.hours.ago  # 超过24小时
+  )
+
+  stale_syncing = Sync.create!(
+    syncable: accounts(:depository),
+    status: :syncing,
+    created_at: 25.hours.ago,
+    pending_at: 24.hours.ago,
+    syncing_at: 23.hours.ago
+  )
+
+  Sync.clean
+
+  assert_equal "stale", stale_pending.reload.status
+  assert_equal "stale", stale_syncing.reload.status
+end
+```
+
+### 7.5 设计权衡分析
+
+**优点**：
+1. **自动恢复**：不需要人工干预，新的操作自然触发重跑
+2. **避免无限重试**：stale 记录不会被自动重试，防止死循环
+3. **历史可追溯**：stale 记录保留，可用于问题排查
+
+**潜在风险**：
+1. **数据延迟**：如果没有新流水触发，余额可能长时间不更新
+2. **窗口丢失**：stale 同步的 window 信息不会被新同步继承
+3. **需要外部触发**：完全依赖新的 `sync_later` 调用
+
+**缓解措施**：
+- 定时同步（Plaid 自动刷新）
+- 用户手动触发同步（UI 中的刷新按钮）
+- 下次任何流水操作都会自然触发
+
+### 7.6 完整状态流转图
+
+```
+                    ┌─────────────────────────────────┐
+                    │                                 │
+                    ▼                                 │
+    entry.save → sync_later → 查找incomplete → 创建pending
+                    │                                 │
+                    │  找到incomplete?                 │
+                    │    │                             │
+                    │    ├─ Yes → 扩展窗口             │
+                    │    │                             │
+                    │    └─ No  → 创建新 Sync          │
+                    │                                 │
+                    ▼                                 │
+               SyncJob执行                            │
+                    │                                 │
+                    ├─ perform_sync 成功               │
+                    │      │                          │
+                    │      └─→ completed              │
+                    │                                 │
+                    ├─ perform_sync 异常               │
+                    │      │                          │
+                    │      └─→ failed                 │
+                    │                                 │
+                    └─ 24小时未完成                    │
+                           │                          │
+                           └─ Sync.clean → stale ────┘
+                                              (不会被incomplete找到)
+                                              (新sync_later创建新记录)
+```
+
+## 8. 余额计算与物化核心
 
 ### 5.1 Account::Syncer
 
