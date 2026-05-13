@@ -116,47 +116,250 @@ scope :enrichable, ->(attrs) {
 3. **无论成功失败，最后都会锁定**：`transaction.lock_attr!(:category_id)`
 4. 锁定后，后续规则和 AI 都无法再自动修改
 
-### 3.3 规则执行顺序
+### 3.3 执行时序模型
 
-**全局执行触发**（app/models/family/syncer.rb:12-15）：
+#### 同步层：单条规则内的动作链
+
+**单规则内动作执行**（app/models/rule.rb:42-46）：
+```ruby
+def apply(ignore_attribute_locks: false)
+  actions.each do |action|
+    action.apply(matching_resources_scope, ignore_attribute_locks: ignore_attribute_locks)
+  end
+end
+```
+
+**关键特性**：
+- 动作按创建顺序**同步依次执行**
+- 前一个动作完成后才执行下一个
+- `auto_categorize` 动作只是**触发异步任务**（`AutoCategorizeJob.perform_later`），不会等待 AI 完成
+
+#### 异步层：跨任务的竞争关系
+
+**全局规则触发**（app/models/family/syncer.rb:12-15）：
 ```ruby
 family.rules.each do |rule|
-  rule.apply_later
+  rule.apply_later  # RuleJob.perform_later
 end
 ```
 
-**关键注意：异步执行**
-- `apply_later` 通过 `RuleJob` 异步执行（app/models/rule.rb:48-49）
-- 任务队列执行顺序**不确定**，不保证按创建顺序执行
-- 如果规则包含 `auto_categorize` 动作，会进一步触发 `AutoCategorizeJob`（app/models/family.rb:44-46）
+**任务类型**：
+| 任务 | 触发时机 | 执行内容 |
+|------|---------|---------|
+| `RuleJob` | 同步触发时入队 | 执行规则的所有动作（同步链） |
+| `AutoCategorizeJob` | 规则的 `auto_categorize` 动作触发 | 调用 AI 进行分类 |
 
-**单规则内动作顺序**（app/models/rule.rb:42-46）：
-```ruby
-actions.each do |action|
-  action.apply(matching_resources_scope, ignore_attribute_locks: ignore_attribute_locks)
-end
+**关键特性**：
+- 任务队列执行顺序**不确定**，不保证按入队顺序执行
+- 不同 `RuleJob` 之间可能竞争同一交易
+- `AutoCategorizeJob` 与后续 `RuleJob` 之间也可能竞争
+
+### 3.4 优先级冲突场景与时序分析
+
+#### 场景 1：同一条规则内的"规则 + AI"动作链
+
+**规则配置**：
+- 条件：交易名称包含 "Starbucks"
+- 动作 1：`set_transaction_category` → "餐饮"
+- 动作 2：`auto_categorize` → AI 分类
+
+**执行时序（同步链，确定顺序）**：
+
 ```
-动作按创建顺序依次执行（同步执行）。
+RuleJob 开始执行
+    │
+    ▼
+动作 1：set_transaction_category
+    │
+    ├─► 检查：属性未锁定 ✓
+    │
+    ├─► 设置 category_id = "餐饮"（source: "rule"）
+    │
+    └─► 不锁定（规则从不锁定）
+    │
+    ▼
+动作 2：auto_categorize
+    │
+    ├─► 检查：属性未锁定 ✓（因为动作 1 没锁定）
+    │
+    ├─► 筛选 enrichable 交易（仍可处理）
+    │
+    ├─► 触发 AutoCategorizeJob.perform_later
+    │       │
+    │       └─► 立即返回，不等待
+    │
+    └─► RuleJob 结束
+    │
+    ▼
+（稍后）AutoCategorizeJob 执行
+    │
+    ├─► scope 筛选：
+    │       ├─► category_id: nil? ──► 否（已被动作 1 设置）
+    │       └─► enrichable? ──► 是（未锁定）
+    │
+    └─► 结果：交易不在 scope 中，被 AI 跳过
+```
 
-### 3.4 优先级冲突场景分析
+**结论**：同一条规则内，**先设置的分类会生效，AI 会跳过已分类的交易**。
 
-**场景 1：多个规则设置分类**
-- 规则 A：将交易名称包含 "Starbucks" 的交易分类为 "餐饮"
-- 规则 B：将金额 > $100 的交易分类为 "大额支出"
-- 结果：最后执行的规则生效（因为规则不锁定）
+---
 
-**场景 2：规则 + AI 混合**
-- 规则包含 `set_transaction_category` 和 `auto_categorize` 两个动作
-- 执行顺序：先设置分类（不锁定），再触发 AI 分类（异步）
-- 实际结果取决于任务队列执行顺序：
-  - 如果规则先执行完成：AI 可能跳过（因为已分类）
-  - 如果 AI 先执行：无论 AI 是否成功，都会锁定，规则设置会被跳过
+#### 场景 2：不同规则之间的竞争（均为规则分类）
 
-**场景 3：AI 分类失败**
-- AI 因置信度不足返回 null
-- 交易保持 `category_id: nil`
-- 但**属性已被锁定**
-- 后续规则和 AI 都无法再自动处理该交易
+**规则配置**：
+- 规则 A：名称包含 "Starbucks" → 分类 "餐饮"
+- 规则 B：金额 > $5 → 分类 "小额支出"
+- 交易：$6 的 Starbucks 咖啡（同时匹配两个规则）
+
+**执行时序（异步竞争，顺序不确定）**：
+
+**可能性 A：规则 A 先执行**
+```
+RuleJob A（规则 A）执行
+    │
+    ├─► 设置 category_id = "餐饮"
+    │
+    └─► 不锁定
+    │
+RuleJob B（规则 B）执行（稍后）
+    │
+    ├─► 检查：属性未锁定 ✓
+    │
+    ├─► 设置 category_id = "小额支出"（覆盖）
+    │
+    └─► 不锁定
+    │
+    ▼
+最终结果："小额支出"（规则 B 覆盖规则 A）
+```
+
+**可能性 B：规则 B 先执行**
+```
+RuleJob B（规则 B）执行
+    │
+    ├─► 设置 category_id = "小额支出"
+    │
+    └─► 不锁定
+    │
+RuleJob A（规则 A）执行（稍后）
+    │
+    ├─► 检查：属性未锁定 ✓
+    │
+    ├─► 设置 category_id = "餐饮"（覆盖）
+    │
+    └─► 不锁定
+    │
+    ▼
+最终结果："餐饮"（规则 A 覆盖规则 B）
+```
+
+**结论**：不同规则之间是**异步竞争关系**，**最后执行的规则生效**（因为规则不锁定）。
+
+---
+
+#### 场景 3：不同规则之间的竞争（规则分类 vs AI 分类）
+
+**规则配置**：
+- 规则 A：名称包含 "Starbucks" → `set_transaction_category` "餐饮"
+- 规则 B：金额 > $0 → `auto_categorize`（AI 分类）
+- 交易：$6 的 Starbucks 咖啡（同时匹配两个规则）
+
+**执行时序（异步竞争，顺序不确定）**：
+
+**可能性 A：规则 A 先执行完成，然后 AI 执行**
+```
+RuleJob A（规则 A）执行
+    │
+    ├─► 设置 category_id = "餐饮"
+    │
+    └─► 不锁定
+    │
+RuleJob B（规则 B）执行
+    │
+    └─► 触发 AutoCategorizeJob
+    │
+AutoCategorizeJob 执行
+    │
+    ├─► scope 筛选：category_id: nil? ──► 否
+    │
+    └─► 被 AI 跳过
+    │
+    ▼
+最终结果："餐饮"（规则 A 生效，AI 跳过）
+```
+
+**可能性 B：AI 先执行，然后规则 A 执行**
+```
+RuleJob B（规则 B）先入队并执行
+    │
+    └─► 触发 AutoCategorizeJob
+    │
+AutoCategorizeJob 先执行（队列顺序不确定）
+    │
+    ├─► scope 筛选：category_id: nil? ✓，enrichable? ✓
+    │
+    ├─► AI 分类（假设成功或失败）
+    │
+    └─► 锁定属性（无论成功失败）
+    │
+RuleJob A（规则 A）执行（稍后）
+    │
+    ├─► 检查：属性已锁定 ✗
+    │
+    └─► enrichable 过滤排除该交易，规则设置被跳过
+    │
+    ▼
+最终结果：AI 的分类结果（或未分类但已锁定），规则 A 被跳过
+```
+
+**结论**：
+- **如果规则 A 先执行**：规则分类生效，AI 跳过（因为已分类）
+- **如果 AI 先执行**：AI 锁定属性，规则 A 被跳过（因为已锁定）
+- 这是**异步竞争**，结果取决于任务队列的实际执行顺序
+
+---
+
+#### 场景 4：AI 分类失败后的锁定影响
+
+**执行流程**：
+```
+AutoCategorizeJob 执行
+    │
+    ├─► scope 筛选：category_id: nil? ✓，enrichable? ✓
+    │
+    ├─► AI 分析，置信度 50% < 60%
+    │
+    ├─► 返回 null，不设置分类
+    │
+    └─► 无条件锁定：lock_attr!(:category_id)
+    │
+    ▼
+交易状态：
+    ├─► category_id = nil（未分类）
+    └─► locked_attributes = { category_id: "2026-05-13T10:00:00Z" }
+    │
+后续任何自动处理：
+    ├─► 规则的 enrichable(:category_id) ──► 排除
+    └─► AI 的 scope 筛选 ──► 排除
+    │
+    ▼
+只有用户手动解锁才能重新允许自动处理
+```
+
+**结论**：AI 分类失败后，**交易保持未分类但属性被锁定，后续所有自动处理（规则和 AI）都无法再处理该交易**。
+
+### 3.5 统一结论：时序与优先级的关系
+
+| 层级 | 执行方式 | 顺序确定性 | 竞争关系 |
+|------|---------|-----------|---------|
+| **同一条规则内的动作** | 同步 | 确定（按创建顺序） | 前序动作影响后序动作 |
+| **不同 RuleJob 之间** | 异步 | 不确定（队列顺序） | 后执行的规则可覆盖先执行的 |
+| **AutoCategorizeJob 与 RuleJob 之间** | 异步 | 不确定 | 谁先执行谁"获胜" |
+
+**核心原则**：
+1. **同步层（同规则内）**：前序动作设置的分类会被后序的 AI 跳过（因为 AI 只处理未分类交易）
+2. **异步层（跨任务）**：谁先执行谁"抢占"，AI 一旦执行就会锁定，规则一旦执行就可能被覆盖
+3. **锁定是终止信号**：一旦属性被锁定（用户或 AI），所有自动处理终止
 
 ## 4. 兜底策略
 
