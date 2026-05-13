@@ -5,7 +5,9 @@
 本报告详细阐述了 Maybe 金融应用中的证券（Security）健康检查系统，包括：
 - 后台定时任务调度机制
 - 健康检查覆盖的核心维度
-- 检查失败时的数据流转和前端反馈链路
+- Provider 调用抛异常时的处理分支
+- 各状态字段（failed_fetch_count、offline、last_health_check_at）的变化逻辑
+- 从状态变化 → 价格读取 → 页面展示的完整前端反馈链路
 
 ---
 
@@ -124,46 +126,122 @@ HealthChecker.run_check
 
 ---
 
-## 5. 检查结果处理
+## 5. 检查结果处理（含异常分支）
 
-### 5.1 成功处理
+### 5.1 run_check 完整执行流程
 
-**位置**: `app/models/security/health_checker.rb:87-93`
+**位置**: `app/models/security/health_checker.rb:49-63`
 
-检查成功时执行以下操作：
+```ruby
+def run_check
+  Rails.logger.info("Running health check for #{security.ticker}")
 
+  if latest_provider_price
+    handle_success
+  else
+    handle_failure
+  end
+rescue => e
+  Sentry.capture_exception(e) do |scope|
+    scope.set_tags(security_id: @security.id)
+  end
+ensure
+  security.update!(last_health_check_at: Time.current)
+end
+```
+
+**关键观察**:
+- `ensure` 块**始终执行**，无论成功、失败还是异常
+- `last_health_check_at` **始终被更新**为当前时间
+
+### 5.2 四种执行路径与状态字段变化
+
+#### 路径 1：检查成功（Provider 返回有效价格）
+
+**触发条件**:
+- `provider.fetch_security_price` 调用成功
+- `response.success? == true`
+- `response.data.price` 存在
+
+**执行路径**:
+```
+latest_provider_price 返回非 nil
+  → handle_success
+  → ensure: last_health_check_at 更新
+```
+
+**状态字段变化**:
+
+| 字段 | 变化 |
+|------|------|
+| `offline` | `true` → `false`（被重置） |
+| `failed_fetch_count` | 任意值 → `0`（被重置） |
+| `failed_fetch_at` | 任意值 → `nil`（被清空） |
+| `last_health_check_at` | 任意值 → 当前时间（**始终更新**） |
+
+**handle_success 代码** (`app/models/security/health_checker.rb:87-93`):
 ```ruby
 def handle_success
   security.update!(
-    offline: false,          # 标记为在线
-    failed_fetch_count: 0,   # 重置失败计数器
-    failed_fetch_at: nil     # 清空失败时间
+    offline: false,
+    failed_fetch_count: 0,
+    failed_fetch_at: nil
   )
 end
 ```
 
-**影响**:
-- 之前被标记为 offline 的证券会被恢复
-- 该证券会重新纳入 `MarketDataImporter` 的每日价格导入
+---
 
-### 5.2 失败处理（渐进式）
+#### 路径 2：检查失败（Provider 返回空价格或响应失败）
 
-**位置**: `app/models/security/health_checker.rb:95-119`
+**触发条件**（二选一）:
+- `response.success? == false`（Provider 返回错误响应）
+- `response.data.price` 为 `nil`（响应成功但无价格数据）
 
-失败处理采用**渐进式降级策略**：
-
-#### 阶段 1：累计失败计数（1-5 次）
-```ruby
-security.update!(
-  failed_fetch_count: new_failure_count,  # 递增计数
-  failed_fetch_at: Time.current           # 记录失败时间
-)
+**执行路径**:
 ```
-- 证券仍保持 `offline: false` 状态
-- 价格数据不会被删除
+latest_provider_price 返回 nil
+  → handle_failure
+  → ensure: last_health_check_at 更新
+```
 
-#### 阶段 2：标记离线（第 6 次失败）
+**状态字段变化（分阶段）**:
+
+**阶段 A：1-5 次连续失败** (`failed_fetch_count` < 5)
+
+| 字段 | 变化 |
+|------|------|
+| `offline` | 保持不变（仍为 `false`） |
+| `failed_fetch_count` | `n` → `n + 1`（递增） |
+| `failed_fetch_at` | 任意值 → 当前时间（更新） |
+| `last_health_check_at` | 任意值 → 当前时间（**始终更新**） |
+
+**阶段 B：第 6 次及以上连续失败** (`failed_fetch_count` >= 5)
+
+| 字段 | 变化 |
+|------|------|
+| `offline` | `false` → `true`（标记离线） |
+| `failed_fetch_count` | `5` → `6`（设置为 MAX+1） |
+| `failed_fetch_at` | 任意值 → 当前时间（更新） |
+| `last_health_check_at` | 任意值 → 当前时间（**始终更新**） |
+| `security_prices` 表 | **所有记录被删除** |
+
+**handle_failure 代码** (`app/models/security/health_checker.rb:95-119`):
 ```ruby
+def handle_failure
+  new_failure_count = security.failed_fetch_count.to_i + 1
+  new_failure_at = Time.current
+
+  if new_failure_count > MAX_CONSECUTIVE_FAILURES
+    convert_to_offline_security!
+  else
+    security.update!(
+      failed_fetch_count: new_failure_count,
+      failed_fetch_at: new_failure_at
+    )
+  end
+end
+
 def convert_to_offline_security!
   Security.transaction do
     security.update!(
@@ -176,10 +254,89 @@ def convert_to_offline_security!
 end
 ```
 
-**离线状态的影响**:
-- `MarketDataImporter` 会跳过该证券（不再导入价格）
-- 所有历史价格数据被清空（视为不可信数据）
-- 证券状态变为 `offline: true`
+---
+
+#### 路径 3：Provider 调用抛异常
+
+**触发条件**:
+- `provider.fetch_security_price` 内部抛出异常（网络超时、API 限流、连接错误等）
+- 异常在 `rescue => e` 块被捕获
+
+**执行路径**:
+```
+latest_provider_price 执行中抛出异常
+  → rescue: Sentry 上报异常
+  → ensure: last_health_check_at 更新
+  → handle_success 和 handle_failure 都**不执行**
+```
+
+**状态字段变化（关键！）**:
+
+| 字段 | 变化 | 说明 |
+|------|------|------|
+| `offline` | **保持不变** | `handle_failure` 未执行 |
+| `failed_fetch_count` | **保持不变** | **异常不计入失败计数** |
+| `failed_fetch_at` | **保持不变** | 不更新 |
+| `last_health_check_at` | **更新为当前时间** | `ensure` 块始终执行 |
+
+**代码说明**:
+```ruby
+def run_check
+  # ... 业务逻辑 ...
+rescue => e
+  # 只上报异常，不更新状态字段
+  Sentry.capture_exception(e) do |scope|
+    scope.set_tags(security_id: @security.id)
+  end
+ensure
+  # 无论如何，都更新 last_health_check_at
+  security.update!(last_health_check_at: Time.current)
+end
+```
+
+**异常路径的重要特性**:
+1. **异常不会导致 `failed_fetch_count` 递增**
+2. **异常不会导致证券标记为 `offline`**
+3. **异常不会删除历史价格**
+4. **异常会重置 7 天检查周期**（因为 `last_health_check_at` 被更新）
+
+---
+
+#### 路径 4：Provider 未配置
+
+**触发条件**:
+- `provider.present? == false`（没有配置证券数据提供商）
+
+**执行路径**:
+```
+latest_provider_price 中 provider 为 nil
+  → 直接返回 nil（不调用 Provider）
+  → handle_failure
+  → ensure: last_health_check_at 更新
+```
+
+**状态字段变化**:
+与 **路径 2（检查失败）** 完全相同。
+
+**代码** (`app/models/security/health_checker.rb:72-74`):
+```ruby
+def latest_provider_price
+  return nil unless provider.present?  # 直接返回 nil，进入 handle_failure
+  # ...
+end
+```
+
+---
+
+### 5.3 四条路径对比汇总
+
+| 路径 | 触发条件 | `offline` | `failed_fetch_count` | `failed_fetch_at` | `last_health_check_at` | 价格数据 |
+|------|----------|-----------|---------------------|-------------------|-----------------------|---------|
+| **1. 成功** | Provider 返回有效价格 | 设为 false | 设为 0 | 设为 nil | 更新为当前时间 | 保留 |
+| **2. 失败(1-5次)** | Provider 返回空/错误 | 不变 | +1 | 更新 | 更新为当前时间 | 保留 |
+| **2. 失败(≥6次)** | Provider 返回空/错误 | 设为 true | 设为 6 | 更新 | 更新为当前时间 | **删除** |
+| **3. 异常** | Provider 调用抛异常 | **不变** | **不变** | **不变** | **更新为当前时间** | **保留** |
+| **4. 无Provider** | 未配置数据提供商 | 同路径2 | 同路径2 | 同路径2 | 更新为当前时间 | 同路径2 |
 
 ---
 
@@ -203,12 +360,12 @@ end
 
 ### 6.2 关键状态字段说明
 
-| 字段 | 类型 | 默认值 | 用途 |
-|------|------|--------|------|
-| `offline` | boolean | false | 核心状态标识，决定是否纳入价格导入 |
-| `failed_fetch_count` | integer | 0 | 连续失败计数，用于渐进式降级 |
-| `failed_fetch_at` | datetime | null | 最后一次失败时间，用于追踪 |
-| `last_health_check_at` | datetime | null | 最后检查时间，用于调度优先级 |
+| 字段 | 类型 | 默认值 | 用途 | 更新时机 |
+|------|------|--------|------|---------|
+| `offline` | boolean | false | 核心状态标识，决定是否纳入价格导入 | 成功时设为 false，连续失败 6 次设为 true |
+| `failed_fetch_count` | integer | 0 | 连续失败计数，用于渐进式降级 | 成功时设为 0，失败时 +1，**异常时不变** |
+| `failed_fetch_at` | datetime | null | 最后一次失败时间，用于追踪 | 成功时设为 nil，失败时更新 |
+| `last_health_check_at` | datetime | null | 最后检查时间，用于调度优先级 | **无论成功/失败/异常，始终更新** |
 
 ### 6.3 在线状态 Scope
 
@@ -222,7 +379,7 @@ scope :online, -> { where(offline: false) }
 
 ---
 
-## 7. 前端反馈链路
+## 7. 前端反馈完整链路
 
 健康检查的结果**不是通过主动推送**给前端的，而是通过**被动读取数据库状态**的方式体现。
 
@@ -233,14 +390,24 @@ scope :online, -> { where(offline: false) }
     ↓
 更新 securities 表状态字段
     ↓
-前端页面渲染时读取这些状态
+影响 MarketDataImporter（价格导入）
     ↓
-通过价格缺失间接反馈给用户
+影响 security_prices 表数据
+    ↓
+影响 current_price 方法返回值
+    ↓
+影响 Holding/Trade 业务计算
+    ↓
+前端页面展示
 ```
 
-### 7.2 关键影响点
+### 7.2 从状态到页面的完整链路
 
-#### 影响点 1：市场数据导入
+#### 第 1 层：健康检查 → 状态字段
+
+如上一章所述，四条路径产生不同的状态组合。
+
+#### 第 2 层：状态字段 → 价格导入
 
 **位置**: `app/models/market_data_importer.rb:25-34`
 
@@ -254,109 +421,212 @@ def import_security_prices
 end
 ```
 
-**效果**:
-- 离线证券不会被导入新价格
-- 价格数据会逐渐过时（或已被清空）
+**影响**:
+| `offline` 状态 | MarketDataImporter 行为 |
+|----------------|-------------------------|
+| `false` | 被纳入导入列表，尝试导入新价格 |
+| `true` | **被跳过**，不导入新价格 |
 
-#### 影响点 2：证券解析器
+**价格导入逻辑** (`app/models/security/price/importer.rb:15-66`):
+- 调用 `provider.fetch_security_prices` 获取价格区间数据
+- 若 Provider 返回错误，记录警告到 Sentry，返回空哈希 `{}`
+- 使用 LOCF（Last Observation Carried Forward）填补价格缺口
+- 结果 upsert 到 `security_prices` 表
 
-**位置**: `app/models/security/resolver.rb:30-44`
+#### 第 3 层：价格导入 → security_prices 表
 
-当用户输入一个无法在数据库或提供商找到的证券代码时：
+| 场景 | security_prices 表变化 |
+|------|---------------------|
+| 健康检查成功 + 价格导入成功 | 新增/更新价格记录 |
+| 健康检查失败 (1-5次) + 价格导入 | 仍在线，可能有新价格 |
+| 健康检查失败 (≥6次) | **所有历史价格被删除** |
+| 健康检查异常 | 价格数据**保留**（异常不删除价格） |
 
-```ruby
-def offline_security
-  security = Security.find_or_initialize_by(
-    ticker: symbol,
-    exchange_operating_mic: exchange_operating_mic,
-  )
+#### 第 4 层：security_prices → current_price 方法
 
-  security.assign_attributes(
-    country_code: country_code,
-    offline: true  # 直接标记为离线
-  )
-
-  security.save!
-  security
-end
-```
-
-#### 影响点 3：交易表单
-
-**位置**: `app/models/trade/create_form.rb:22-29`
-
-用户创建交易时，系统会尝试解析证券：
+**位置**: `app/models/security.rb:14-18` 和 `app/models/security/provided.rb:39-62`
 
 ```ruby
-def security
-  ticker_symbol, exchange_operating_mic = ticker.present? ? ticker.split("|") : [ manual_ticker, nil ]
-
-  Security::Resolver.new(
-    ticker_symbol,
-    exchange_operating_mic: exchange_operating_mic
-  ).resolve
-end
-```
-
-**可能的结果**:
-- 如果证券已存在且被标记为 offline，用户可能无法获取最新价格
-- 如果证券无法被解析，会创建一个 offline 证券
-
-### 7.3 前端显示效果
-
-前端页面通过**价格是否存在**来间接体现健康状态：
-
-#### 持仓详情页
-
-**位置**: `app/views/holdings/show.html.erb:22-25`
-
-```erb
-<div class="flex items-center justify-between text-sm">
-  <dt class="text-secondary"><%= t(".current_market_price_label") %></dt>
-  <dd class="text-primary">
-    <%= @holding.security.current_price ? format_money(@holding.security.current_price) : t(".unknown") %>
-  </dd>
-</div>
-```
-
-**效果**:
-- 如果证券 offline 且无价格 → 显示 `"Unknown"`
-- 用户感知："当前市价未知"
-
-#### 交易详情页
-
-**位置**: `app/views/trades/_header.html.erb:55-60`
-
-```erb
-<% if trade.security.current_price.present? %>
-  <div class="flex items-center justify-between text-sm">
-    <dt class="text-secondary"><%= t(".current_market_price_label") %></dt>
-    <dd class="text-primary"><%= format_money trade.security.current_price %></dd>
-  </div>
-<% end %>
-```
-
-**效果**:
-- 如果无当前价格 → 整个价格区块不显示
-- 用户感知：界面缺少关键信息
-
-### 7.4 当前价格获取逻辑
-
-**位置**: `app/models/security.rb:14-18`
-
-```ruby
+# app/models/security.rb
 def current_price
   @current_price ||= find_or_fetch_price
   return nil if @current_price.nil?
   Money.new(@current_price.price, @current_price.currency)
 end
+
+# app/models/security/provided.rb
+def find_or_fetch_price(date: Date.current, cache: true)
+  price = prices.find_by(date: date)  # 先查数据库
+
+  return price if price.present?
+
+  # 数据库没有，尝试从 Provider 获取
+  return nil unless provider.present?
+  response = provider.fetch_security_price(...)
+
+  return nil unless response.success?
+
+  price = response.data
+  Security::Price.find_or_create_by!(...) if cache
+  price
+end
 ```
 
-如果 `find_or_fetch_price` 返回 nil（离线证券没有价格记录），前端就会看到"Unknown"或价格区块消失。
+**current_price 返回逻辑**:
+
+| 场景 | `prices.find_by(date: today)` | Provider 可获取 | `current_price` 返回 |
+|------|------------------------------|-----------------|---------------------|
+| 数据库有今日价格 | 非 nil | 不调用 | 返回数据库价格 |
+| 数据库无今日价格 | nil | 成功 | 返回 Provider 价格并缓存 |
+| 数据库无今日价格 | nil | 失败/异常 | 返回 `nil` |
+| 证券被标记 offline 且价格已删除 | nil | 不调用（被导入器跳过） | 返回 `nil` |
+
+#### 第 5 层：current_price → 业务计算
+
+##### Holding（持仓）
+**位置**: `app/views/holdings/show.html.erb` 和 `app/models/holding.rb`
+
+| 计算项 | 依赖 `current_price` |
+|--------|---------------------|
+| 当前市价 | **依赖**（直接显示） |
+| 投资组合权重 | 不依赖（基于 `amount`/`account.balance`） |
+| 平均成本 | 不依赖（基于历史交易） |
+| 总收益趋势 | 不依赖（基于 `amount` vs `start_amount`） |
+
+##### Trade（交易）
+**位置**: `app/models/trade.rb:18-27`
+
+```ruby
+def unrealized_gain_loss
+  return nil if qty.negative?
+  current_price = security.current_price
+  return nil if current_price.nil?  # 无价格则无法计算
+
+  current_value = current_price * qty.abs
+  cost_basis = price_money * qty.abs
+
+  Trend.new(current: current_value, previous: cost_basis)
+end
+```
+
+| 计算项 | 依赖 `current_price` |
+|--------|---------------------|
+| 当前市价 | **依赖** |
+| 未实现盈亏 | **依赖**（无价格则返回 nil） |
+
+#### 第 6 层：业务计算 → 页面展示
+
+##### 场景 A：证券在线，有价格数据
+
+```
+健康检查成功
+  → offline=false
+  → 价格导入正常
+  → security_prices 有今日价格
+  → current_price 返回 Money 对象
+```
+
+**持仓详情页** (`app/views/holdings/show.html.erb:22-25`):
+```erb
+<dd class="text-primary"><%= format_money(@holding.security.current_price) %></dd>
+```
+→ **显示**: `$100.00`（具体价格）
+
+**交易详情页** (`app/views/trades/_header.html.erb:55-69`):
+```erb
+<% if trade.security.current_price.present? %>
+  <div>当前市价: <%= format_money trade.security.current_price %></div>
+  <% if trade.unrealized_gain_loss.present? %>
+    <div>总收益: <%= render "shared/trend_change", trend: ... %></div>
+  <% end %>
+<% end %>
+```
+→ **显示**:
+  - 当前市价: `$105.00`
+  - 总收益: `+5.00 (+5.00%)`（绿色/红色趋势）
 
 ---
 
-## 8. 健康检查流程图
+##### 场景 B：证券离线（连续失败 ≥6 次）
+
+```
+健康检查连续失败 6 次
+  → offline=true
+  → prices.delete_all（所有价格被删除）
+  → 价格导入被跳过
+  → security_prices 无记录
+  → current_price 返回 nil
+```
+
+**持仓详情页**:
+```erb
+<dd class="text-primary"><%= t(".unknown") %></dd>
+```
+→ **显示**: `Unknown`（国际化文本）
+
+**交易详情页**:
+```erb
+<% if trade.security.current_price.present? %>
+  # 整个区块不渲染
+<% end %>
+```
+→ **显示**: 当前市价和总收益区块**完全消失**
+
+**用户感知**:
+- 持仓详情：市价显示为 "Unknown"
+- 交易详情：缺少当前市价和收益信息
+- 投资组合估值：可能不准确（依赖其他计算方式）
+
+---
+
+##### 场景 C：Provider 调用异常（关键差异）
+
+```
+健康检查时 Provider 抛异常
+  → rescue 块捕获，Sentry 上报
+  → offline 保持不变（假设之前是 false）
+  → failed_fetch_count 保持不变（不递增）
+  → last_health_check_at 更新（7 天周期重置）
+  → 价格数据**保留**
+```
+
+**价格导入行为**:
+- 由于 `offline=false`，MarketDataImporter **仍然会尝试导入**
+- 如果导入时 Provider 也异常，则无新价格
+- 但**旧价格数据保留**
+
+**current_price 行为**:
+| 情况 | 返回值 |
+|------|--------|
+| 数据库有历史价格 | 返回**旧价格**（可能已过时） |
+| 数据库无价格但 Provider 可获取 | 尝试获取，可能成功或失败 |
+| 数据库无价格且 Provider 异常 | 返回 `nil` |
+
+**页面展示**:
+- **如果有历史价格缓存**: 显示**过时的价格**（用户可能不知道数据已过期）
+- **如果无价格缓存**: 显示 `Unknown` 或区块消失
+
+**异常路径的隐蔽问题**:
+1. **失败计数不递增**: 连续多次异常不会触发离线保护
+2. **检查周期被重置**: 7 天后才会再次检查，但问题可能持续存在
+3. **可能展示过时价格**: 历史价格仍在显示，但 Provider 已不可用
+4. **仅 Sentry 告警**: 开发人员知道问题，但用户无感知
+
+---
+
+### 7.3 前端展示影响汇总表
+
+| 健康检查结果 | `offline` | 价格数据 | `current_price` | 持仓详情 | 交易详情 |
+|-------------|-----------|---------|-----------------|---------|---------|
+| **成功** | false | 有 | Money 对象 | 显示价格 | 显示价格+收益 |
+| **失败(1-5次)** | false | 可能有 | Money 对象 或 nil | 显示价格 或 Unknown | 显示 或 消失 |
+| **失败(≥6次)** | true | 被删除 | nil | 显示 Unknown | 区块消失 |
+| **异常** | 不变 | 保留 | 旧价格 或 nil | 显示过时价格 或 Unknown | 显示 或 消失 |
+| **无 Provider** | 同失败路径 | 同失败路径 | 同失败路径 | 同失败路径 | 同失败路径 |
+
+---
+
+## 8. 健康检查流程图（完整版）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -375,38 +645,78 @@ end
 └─────────────────────────┬───────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    run_check: 调用 Provider 验证价格可获取性           │
+│                      run_check: 调用 Provider                         │
+│                                                                      │
+│   if latest_provider_price                                           │
+│     → handle_success                                                 │
+│   else                                                               │
+│     → handle_failure                                                 │
+│                                                                      │
+│   rescue => e                                                        │
+│     → Sentry.capture_exception (仅上报，不更新状态)                   │
+│                                                                      │
+│   ensure                                                             │
+│     → last_health_check_at = Time.current (始终执行)                 │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
-              ┌───────────┴───────────┐
-              ↓                       ↓
-        ┌───────────┐           ┌───────────┐
-        │  成功     │           │  失败     │
-        └─────┬─────┘           └─────┬─────┘
-              ↓                       ↓
-    ┌─────────────────┐     ┌────────────────────────┐
-    │ 更新状态:       │     │ 检查失败次数:          │
-    │ offline: false  │     │                       │
-    │ failed_fetch: 0 │     │ 1-5 次 → 只计数       │
-    │                 │     │                       │
-    │ 恢复价格导入     │     │ >=6 次 → 标记离线     │
-    └─────────────────┘     │ 并删除所有历史价格     │
-                            └───────────┬────────────┘
-                                        ↓
-                            ┌───────────────────────┐
-                            │  持久化到数据库        │
-                            │  securities 表         │
-                            │  - offline=true       │
-                            │  - 价格记录被清空      │
-                            └───────────┬───────────┘
-                                        ↓
+          ┌───────────────┼───────────────┐
+          ↓               ↓               ↓
+    ┌─────────┐     ┌─────────┐     ┌─────────┐
+    │ 成功    │     │ 失败    │     │ 异常    │
+    │ (有价格)│     │ (无价格)│     │ (抛异常)│
+    └────┬────┘     └────┬────┘     └────┬────┘
+         ↓               ↓               ↓
+┌─────────────────┐ ┌───────────────┐ ┌──────────────────┐
+│ handle_success  │ │ handle_failure│ │ rescue + ensure  │
+│                 │ │               │ │                  │
+│ offline=false   │ │ 1-5次:        │ │ offline 不变     │
+│ failed_count=0  │ │   仅计数       │ │ failed_count 不变│
+│ failed_at=nil   │ │               │ │ failed_at 不变   │
+│                 │ │ ≥6次:         │ │                  │
+│ 价格保留        │ │   offline=true │ │ 价格保留         │
+│                 │ │   删除价格     │ │                  │
+└────────┬────────┘ └───────┬───────┘ └────────┬─────────┘
+         │                 │                   │
+         └─────────────────┼───────────────────┘
+                           ↓
+                   ┌───────────────┐
+                   │ 持久化到数据库  │
+                   │ securities 表  │
+                   └───────┬───────┘
+                           ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         前端反馈链路                                  │
-│                                                                      │
-│  1. MarketDataImporter 跳过 offline 证券 → 无新价格                  │
-│  2. current_price 方法返回 nil                                      │
-│  3. 前端页面显示 "Unknown" 或价格区块消失                            │
-│  4. 用户感知：价格信息缺失，投资组合估值可能不准确                    │
+│                        MarketDataImporter                           │
+│                                                                     │
+│   Security.online.find_each  ← 只导入 offline=false 的证券           │
+│     ↓                                                               │
+│   import_provider_prices                                             │
+│     ↓                                                               │
+│   upsert 到 security_prices 表                                       │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                        current_price 方法                            │
+│                                                                     │
+│   prices.find_by(date: today)  → 有则返回                            │
+│     ↓ 无                                                             │
+│   provider.fetch_security_price  → 成功则缓存并返回                    │
+│     ↓ 失败/异常                                                       │
+│   返回 nil                                                           │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                         前端页面展示                                  │
+│                                                                     │
+│   current_price != nil                                              │
+│     → 持仓详情: 显示具体价格 ($100.00)                               │
+│     → 交易详情: 显示价格 + 未实现收益趋势                             │
+│                                                                     │
+│   current_price == nil                                              │
+│     → 持仓详情: 显示 "Unknown"                                      │
+│     → 交易详情: 价格区块完全不渲染                                    │
+│                                                                     │
+│   异常路径特殊情况:                                                  │
+│   → 若有历史价格缓存，显示过时价格（用户无感知）                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -426,6 +736,8 @@ end
 | `failure incrementor increases for each health check failure` | 失败计数器正确递增 |
 | `failure incrementor resets to 0 when health check succeeds` | 成功后计数器重置 |
 
+**注意**: 当前测试**未覆盖 Provider 抛异常的场景**（路径 3）。
+
 ---
 
 ## 10. 设计特点总结
@@ -435,12 +747,36 @@ end
 2. **数据保护**: 标记离线时删除历史价格，防止错误数据影响估值
 3. **优先级调度**: 未检查过的证券优先处理，确保新数据及时验证
 4. **批量控制**: 每日 1000 个限制，避免性能瓶颈
+5. **异常隔离**: Provider 异常不影响状态，保留历史数据
 
 ### 潜在改进点
-1. **前端反馈不直观**: 用户看到"Unknown"价格，但不知道原因是健康检查失败
-2. **无通知机制**: 证券离线时没有主动通知用户或管理员
-3. **离线恢复机制**: 离线证券恢复在线后，需要手动触发价格重新导入
-4. **检查维度单一**: 仅验证价格可获取性，未检查数据质量、波动性等
+
+#### 1. 异常路径的隐蔽问题
+- **问题**: Provider 抛异常时，`failed_fetch_count` 不递增，但 `last_health_check_at` 被更新
+- **影响**: 
+  - 连续异常不会触发离线保护
+  - 7 天检查周期被重置，问题可能被掩盖
+  - 用户可能看到过时的价格数据
+- **建议**: 
+  - 区分"Provider 返回错误"和"Provider 抛异常"两种失败类型
+  - 异常场景也应该递增某种失败计数（如 `exception_count`）
+  - 或考虑异常场景不更新 `last_health_check_at`，让证券尽快重新检查
+
+#### 2. 前端反馈不直观
+- **问题**: 用户看到"Unknown"价格，但不知道原因是健康检查失败
+- **建议**: 前端可展示 `offline` 状态，提示用户"该证券当前不可用"
+
+#### 3. 无通知机制
+- **问题**: 证券离线时没有主动通知用户或管理员
+- **建议**: 重要证券离线时发送邮件/系统通知
+
+#### 4. 离线恢复机制
+- **问题**: 离线证券恢复在线后，历史价格已被删除，需要重新导入
+- **建议**: 恢复在线时自动触发一次完整的价格导入
+
+#### 5. 测试覆盖不足
+- **问题**: 缺少 Provider 抛异常场景的测试
+- **建议**: 添加异常路径的单元测试
 
 ---
 
@@ -450,9 +786,15 @@ end
 |----------|------|
 | `config/schedule.yml` | 定时任务配置 |
 | `app/jobs/security_health_check_job.rb` | 任务入口 |
-| `app/models/security/health_checker.rb` | 健康检查核心逻辑 |
-| `app/models/security.rb` | Security 模型定义 |
+| `app/models/security/health_checker.rb` | 健康检查核心逻辑（含异常处理） |
+| `app/models/security.rb` | Security 模型定义，current_price 方法 |
+| `app/models/security/provided.rb` | find_or_fetch_price 实现 |
 | `app/models/security/resolver.rb` | 证券解析与离线标记 |
-| `app/models/market_data_importer.rb` | 价格导入（受 offline 状态影响） |
+| `app/models/security/price/importer.rb` | 价格导入逻辑 |
+| `app/models/market_data_importer.rb` | 批量价格导入（受 offline 状态影响） |
+| `app/models/holding.rb` | 持仓模型 |
+| `app/models/trade.rb` | 交易模型（unrealized_gain_loss） |
+| `app/views/holdings/show.html.erb` | 持仓详情页面 |
+| `app/views/trades/_header.html.erb` | 交易详情页面 |
 | `db/schema.rb` | 数据库表结构 |
 | `test/models/security/health_checker_test.rb` | 测试用例 |
