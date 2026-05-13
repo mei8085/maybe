@@ -2,97 +2,21 @@
 
 ## 1. 概述
 
-本报告详细阐述了 Maybe 金融应用中的证券（Security）健康检查系统，重点关注：
-- "调用异常"与"返回失败响应"两条链路的严格区分
-- 各状态字段在不同场景下的真实变化
-- 从状态变化 → 价格读取 → 页面展示的完整前端反馈链路
-- 按"显示旧价格 / Unknown / 直接报错"三种结果分类的触发条件
+本报告基于代码精确分析了 Maybe 金融应用中的证券健康检查系统，重点区分：
+- **健康检查任务**（后台定时任务）中的异常处理逻辑
+- **页面请求**（用户访问时）中 `current_price` 实时取价的执行路径
+- 两条路径的异常处理差异
+- "直接报错"的精确触发条件
 
 ---
 
-## 2. 关键概念澄清
+## 2. 两条执行路径的核心区分
 
-### 2.1 什么是"调用异常"？
+### 2.1 路径一：健康检查任务（后台定时任务）
 
-**定义**: Provider 调用过程中抛出未捕获的 Ruby 异常
+**执行时机**: 每周一至周五 凌晨 2:00 AM EST
 
-**触发场景**:
-- 网络超时 (`Net::ReadTimeout`)
-- DNS 解析失败 (`SocketError`)
-- API 限流/认证失败 (`Faraday::ClientError`)
-- Provider 内部抛出 `StandardError` 或其子类
-
-**代码捕获点** (`app/models/security/health_checker.rb:57-60`):
-```ruby
-rescue => e
-  Sentry.capture_exception(e) do |scope|
-    scope.set_tags(security_id: @security.id)
-  end
-end
-```
-
----
-
-### 2.2 什么是"返回失败响应"？
-
-**定义**: Provider 调用成功完成（无异常抛出），但返回的响应对象 `success? == false`
-
-**触发场景**:
-- Provider 正常返回错误响应（如 HTTP 404、429）
-- Provider 响应成功但价格数据为空 (`response.data.price.nil?`)
-
-**代码处理点** (`app/models/security/health_checker.rb:52-56`, `72-84`):
-```ruby
-if latest_provider_price
-  handle_success
-else
-  handle_failure
-end
-
-def latest_provider_price
-  return nil unless provider.present?
-
-  response = provider.fetch_security_price(...)
-  return nil unless response.success?  # 失败响应 → 返回 nil
-
-  response.data.price  # 价格为空 → 也返回 nil
-end
-```
-
----
-
-## 3. 定时任务调度
-
-### 3.1 调度配置
-
-**位置**: `config/schedule.yml:16-20`
-
-**调度规则**:
-- **Cron 表达式**: `0 2 * * 1-5`
-- **执行时间**: 每周一至周五 凌晨 2:00 AM EST / 3:00 AM EDT
-- **任务类**: `SecurityHealthCheckJob`
-
-### 3.2 批量处理策略
-
-**位置**: `app/models/security/health_checker.rb:18-42`
-
-| 配置项 | 值 | 说明 |
-|--------|-----|------|
-| `DAILY_BATCH_SIZE` | 1000 | 每天最多检查 1000 个已检查过的证券 |
-| `HEALTH_CHECK_INTERVAL` | 7 天 | 已检查过的证券 7 天后才需要重新检查 |
-| `MAX_CONSECUTIVE_FAILURES` | 5 次 | 连续失败 5 次标记为离线 |
-
-**优先级排序**:
-1. **从未检查过的证券** (`last_health_check_at: nil`) → 无数量限制
-2. **到期检查的证券** (超过 7 天未检查) → 每日最多 1000 个
-
----
-
-## 4. 健康检查两条链路的严格对比
-
-### 4.1 run_check 完整执行流程
-
-**位置**: `app/models/security/health_checker.rb:49-63`
+**入口文件**: `app/models/security/health_checker.rb:49-63`
 
 ```ruby
 def run_check
@@ -104,462 +28,62 @@ def run_check
     handle_failure
   end
 rescue => e
-  # ── 路径 A：调用异常 ──
-  # 只上报 Sentry，不更新状态字段
+  # ── 异常被捕获 ──
   Sentry.capture_exception(e) do |scope|
     scope.set_tags(security_id: @security.id)
   end
 ensure
   # ── 始终执行 ──
-  # 无论成功/失败/异常，last_health_check_at 都会更新
   security.update!(last_health_check_at: Time.current)
 end
 ```
 
-**核心区分点**:
-- `latest_provider_price` 返回 `nil` → 进入 **`handle_failure`**（路径 B）
-- `latest_provider_price` 执行中抛异常 → 进入 **`rescue`**（路径 A）
-- 两条路径都会执行 `ensure` 块
+**关键特征**:
+- `rescue => e` 块捕获所有异常
+- 异常不会冒泡到任务上层
+- `ensure` 块确保 `last_health_check_at` 始终更新
 
 ---
 
-### 4.2 路径 A：Provider 调用异常
+### 2.2 路径二：页面请求时的 `current_price`（用户访问时）
 
-**触发条件**:
-- `provider.fetch_security_price` 内部抛出异常（网络超时、DNS 失败等）
-- 异常在 `rescue => e` 块被捕获
+**执行时机**: 用户访问持仓详情页、交易详情页等页面时
 
-**执行流程**:
+**入口链条**:
 ```
-latest_provider_price 执行中抛出异常
-  → rescue: Sentry.capture_exception（仅上报）
-  → ensure: last_health_check_at = Time.current
-  → handle_success 和 handle_failure 都 不执行
-```
-
-**状态字段变化**（关键！）:
-
-| 字段 | 变化 | 原因 |
-|------|------|------|
-| `offline` | **保持不变** | `handle_failure` 未执行 |
-| `failed_fetch_count` | **保持不变** | `handle_failure` 未执行 |
-| `failed_fetch_at` | **保持不变** | `handle_failure` 未执行 |
-| `last_health_check_at` | **更新为当前时间** | `ensure` 块始终执行 |
-
-**异常路径的隐蔽特性**:
-1. **异常不计入失败计数**: `failed_fetch_count` 不递增
-2. **异常不会触发离线保护**: `offline` 保持不变
-3. **异常不会删除价格**: 历史价格数据保留
-4. **异常重置检查周期**: `last_health_check_at` 更新，7 天后才会再次检查
-
----
-
-### 4.3 路径 B：Provider 返回失败响应
-
-**触发条件**（二选一）:
-- `response.success? == false`（Provider 正常返回错误响应）
-- `response.data.price.nil?`（响应成功但无价格数据）
-
-**执行流程**:
-```
-latest_provider_price 返回 nil（无异常抛出）
-  → handle_failure
-  → ensure: last_health_check_at = Time.current
+app/views/holdings/show.html.erb
+  → @holding.security.current_price
+    → app/models/security.rb:14-18
+      → find_or_fetch_price (Provided 模块)
+        → app/models/security/provided.rb:39-62
 ```
 
-**状态字段变化**（分阶段）:
+**关键代码**:
 
-**阶段 B1：1-5 次连续失败** (`failed_fetch_count < 5`)
-
-| 字段 | 变化 |
-|------|------|
-| `offline` | 保持不变（仍为 `false`） |
-| `failed_fetch_count` | `n` → `n + 1`（递增） |
-| `failed_fetch_at` | 更新为当前时间 |
-| `last_health_check_at` | 更新为当前时间 |
-
-**阶段 B2：第 6 次及以上连续失败** (`failed_fetch_count >= 5`)
-
-| 字段 | 变化 |
-|------|------|
-| `offline` | `false` → `true`（标记离线） |
-| `failed_fetch_count` | `5` → `6`（设置为 MAX+1） |
-| `failed_fetch_at` | 更新为当前时间 |
-| `last_health_check_at` | 更新为当前时间 |
-| `security_prices` 表 | **所有记录被删除** |
-
-**handle_failure 代码**:
+`app/models/security.rb:14-18`:
 ```ruby
-def handle_failure
-  new_failure_count = security.failed_fetch_count.to_i + 1
-  new_failure_at = Time.current
-
-  if new_failure_count > MAX_CONSECUTIVE_FAILURES
-    convert_to_offline_security!
-  else
-    security.update!(
-      failed_fetch_count: new_failure_count,
-      failed_fetch_at: new_failure_at
-    )
-  end
-end
-
-def convert_to_offline_security!
-  Security.transaction do
-    security.update!(
-      offline: true,
-      failed_fetch_count: MAX_CONSECUTIVE_FAILURES + 1,
-      failed_fetch_at: Time.current
-    )
-    security.prices.delete_all  # 删除所有历史价格
-  end
-end
-```
-
----
-
-### 4.4 两条链路状态字段对比表
-
-| 字段 | 路径 A（调用异常） | 路径 B（失败响应 1-5 次） | 路径 B（失败响应 ≥6 次） |
-|------|-------------------|------------------------|-----------------------|
-| `offline` | **不变** | 不变 | `false → true` |
-| `failed_fetch_count` | **不变** | `n → n+1` | `5 → 6` |
-| `failed_fetch_at` | **不变** | 更新 | 更新 |
-| `last_health_check_at` | 更新 | 更新 | 更新 |
-| 价格数据 | **保留** | 保留 | **删除** |
-| 下次检查时间 | 7 天后 | 7 天后 | 7 天后（但 offline 可能被跳过） |
-
----
-
-## 5. 从状态字段到价格读取的真实行为差异
-
-### 5.1 影响层 1：MarketDataImporter 价格导入
-
-**位置**: `app/models/market_data_importer.rb:25-34`
-
-```ruby
-def import_security_prices
-  Security.online.find_each do |security|  # 只导入 offline=false 的证券
-    security.import_provider_prices(...)
-  end
-end
-```
-
-**关键影响**:
-- 两条链路都执行在健康检查任务（凌晨 2:00 AM）
-- 价格导入任务执行在**晚些时候**（凌晨 10:00 PM），见 `config/schedule.yml:1-5`
-- `offline` 状态决定是否被纳入导入列表
-
-**路径 A（异常）的影响**:
-- `offline` 保持不变（假设为 `false`）
-- **仍然会被** `MarketDataImporter` 尝试导入新价格
-- 历史价格数据保留
-
-**路径 B（失败响应 ≥6 次）的影响**:
-- `offline` 被设为 `true`
-- **被跳过**，不会被导入新价格
-- 历史价格数据已被删除
-
----
-
-### 5.2 影响层 2：价格导入器行为
-
-**位置**: `app/models/security/price/importer.rb:71-94`
-
-```ruby
-def provider_prices
-  @provider_prices ||= begin
-    response = security_provider.fetch_security_prices(...)
-
-    if response.success?
-      response.data.index_by(&:date)
-    else
-      # 失败响应：记录警告，返回空哈希
-      Rails.logger.warn(...)
-      Sentry.capture_exception(...)
-      {}  # 返回空，不抛异常
-    end
-  end
-end
-```
-
-**注意**: 价格导入器**没有 `rescue` 块**捕获异常。如果调用抛异常，会导致整个导入任务失败（可能影响其他证券）。
-
----
-
-### 5.3 影响层 3：current_price 方法
-
-**位置**: `app/models/security.rb:14-18` 和 `app/models/security/provided.rb:39-62`
-
-```ruby
-# app/models/security.rb
 def current_price
   @current_price ||= find_or_fetch_price
   return nil if @current_price.nil?
   Money.new(@current_price.price, @current_price.currency)
 end
-
-# app/models/security/provided.rb
-def find_or_fetch_price(date: Date.current, cache: true)
-  price = prices.find_by(date: date)  # 第一步：查数据库
-
-  return price if price.present?      # 有缓存则直接返回
-
-  # 第二步：数据库没有，尝试从 Provider 获取
-  return nil unless provider.present?
-  response = provider.fetch_security_price(...)
-
-  return nil unless response.success?  # 失败响应 → 返回 nil
-
-  # 成功则缓存并返回
-  price = response.data
-  Security::Price.find_or_create_by!(...) if cache
-  price
-end
 ```
-
-**current_price 返回决策树**:
-
-```
-current_price 被调用
-  ↓
-find_or_fetch_price
-  ↓
-┌─────────────────────────────────────┐
-│ 1. prices.find_by(date: today)      │
-│    数据库有今日价格？                 │
-└──────┬──────────────────────────────┘
-       │ 是                          │ 否
-       ↓                            ↓
-┌─────────────┐            ┌─────────────────────────────┐
-│ 返回数据库  │            │ 2. provider.present?        │
-│ 价格（旧或新）│            │    Provider 已配置？         │
-└─────────────┘            └──────┬──────────────────────┘
-                                 │ 是                     │ 否
-                                 ↓                        ↓
-                      ┌─────────────────────┐       ┌─────────┐
-                      │ 3. 调用 Provider     │       │ 返回 nil│
-                      │ fetch_security_price│       └─────────┘
-                      └──────────┬──────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │ 调用是否抛异常？          │
-                    └─────┬──────────────────┬─┘
-                          │ 是               │ 否
-                          ↓                  ↓
-                   ┌───────────┐    ┌────────────────────────┐
-                   │ 异常上冒泡 │    │ 4. response.success?    │
-                   │ 到上层    │    │    返回成功？            │
-                   └───────────┘    └──────────┬─────────────┘
-                                                │ 是      │ 否
-                                                ↓        ↓
-                                         ┌─────────┐ ┌─────────┐
-                                         │缓存并返回│ │ 返回 nil│
-                                         │新价格   │ │         │
-                                         └─────────┘ └─────────┘
-```
-
-**关键发现**:
-1. `find_or_fetch_price` **没有 `rescue` 块**
-2. 如果 Provider 调用抛异常，异常会**向上冒泡**到上层
-3. 只有"返回失败响应"（`response.success? == false`）才会优雅地返回 `nil`
-
----
-
-## 6. 前端三种可见结果的触发条件
-
-### 6.1 结果一：显示旧价格
-
-**定义**: 前端页面显示价格数据，但该价格可能已过时
-
-**触发条件矩阵**:
-
-| 条件层 | 路径 A（调用异常） | 路径 B（失败响应 1-5 次） | 路径 B（失败响应 ≥6 次） |
-|--------|-------------------|------------------------|-----------------------|
-| 健康检查阶段 | `offline` 保持 `false` | `offline` 保持 `false` | `offline` 设为 `true` |
-| 健康检查阶段 | 价格数据**保留** | 价格数据**保留** | 价格数据**被删除** |
-| 价格导入阶段 | 可能被导入（若 `offline=false`） | 可能被导入（若 `offline=false`） | **被跳过** |
-| `security_prices` 表 | 有历史价格 | 有历史价格 | **无价格** |
-| `find_or_fetch_price` | 第一步命中缓存 → 返回旧价格 | 第一步命中缓存 → 返回旧价格 | 第一步无缓存 |
-
-**完整链路（以路径 A 为例）**:
-
-```
-健康检查时 Provider 抛异常
-  ↓
-offline 保持 false
-failed_fetch_count 不变
-last_health_check_at 更新
-价格数据保留（关键！）
-  ↓
-MarketDataImporter 运行（晚上 10:00 PM）
-  由于 offline=false，该证券仍在导入列表中
-  若导入时 Provider 也异常 → 无新价格
-  但旧价格数据仍在 security_prices 表中
-  ↓
-用户访问持仓详情页
-  ↓
-current_price 被调用
-  ↓
-find_or_fetch_price
-  ↓
-prices.find_by(date: today) → 命中旧价格缓存
-  ↓
-返回旧价格（可能已过时多天）
-  ↓
-前端显示: "$98.50"（用户不知道这是旧价格）
-```
-
-**前端页面展示**:
-- **持仓详情页**: 显示具体价格（如 `$98.50`）
-- **交易详情页**: 显示价格 + 未实现收益趋势
-
-**用户感知**:
-- 价格看起来正常
-- 但实际上可能已过时（Provider 已不可用多天）
-- 收益计算基于过时价格，可能不准确
-
----
-
-### 6.2 结果二：显示 "Unknown"
-
-**定义**: 前端页面显示国际化文本 "Unknown" 或相关区块消失
-
-**国际化来源** (`config/locales/views/holdings/en.yml:37`):
-```yaml
-en:
-  holdings:
-    show:
-      unknown: Unknown
-```
-
-**触发条件矩阵**:
-
-| 条件层 | 路径 B（失败响应 ≥6 次） | 路径 A（无历史价格） | 其他路径（数据库无缓存） |
-|--------|-----------------------|---------------------|----------------------|
-| 健康检查阶段 | `offline` 设为 `true` | `offline` 保持不变 | - |
-| 健康检查阶段 | 价格**被删除** | 价格数据**保留**（但可能无今日数据） | - |
-| 价格导入阶段 | **被跳过**（offline=true） | 可能被导入 | - |
-| `security_prices` 表 | **无任何价格** | 可能有旧数据但无今日数据 | 无今日数据 |
-| `find_or_fetch_price` | 第一步无缓存 → 尝试 Provider | 第一步无今日缓存 → 尝试 Provider | 第一步无今日缓存 |
-| Provider 尝试 | 返回失败响应 → `nil` | 返回失败响应或抛异常 | 返回失败响应 → `nil` |
-
-**完整链路（以路径 B2 为例）**:
-
-```
-健康检查连续失败 6 次
-  ↓
-offline 设为 true
-failed_fetch_count 设为 6
-prices.delete_all（所有历史价格被删除！）
-last_health_check_at 更新
-  ↓
-MarketDataImporter 运行
-  由于 offline=true，该证券被跳过
-  无新价格导入
-  security_prices 表仍为空
-  ↓
-用户访问持仓详情页
-  ↓
-current_price 被调用
-  ↓
-find_or_fetch_price
-  ↓
-prices.find_by(date: today) → nil（无任何价格）
-  ↓
-调用 provider.fetch_security_price
-  ↓
-response.success? == false → 返回 nil
-  ↓
-current_price 返回 nil
-  ↓
-前端处理:
-  持仓详情页: <%= t(".unknown") %> → 显示 "Unknown"
-  交易详情页: <% if current_price.present? %> → 条件不满足，区块不渲染
-```
-
-**前端页面展示**:
-
-**持仓详情页** (`app/views/holdings/show.html.erb:22-25`):
-```erb
-<dd class="text-primary">
-  <%= @holding.security.current_price ? format_money(@holding.security.current_price) : t(".unknown") %>
-</dd>
-```
-→ **显示**: `Unknown`
-
-**交易详情页** (`app/views/trades/_header.html.erb:55-69`):
-```erb
-<% if trade.security.current_price.present? %>
-  <div>当前市价: ...</div>
-  <% if trade.unrealized_gain_loss.present? %>
-    <div>总收益: ...</div>
-  <% end %>
-<% end %>
-```
-→ **显示**: 当前市价和总收益区块**完全不渲染**
-
-**用户感知**:
-- 持仓详情：市价显示为 "Unknown"
-- 交易详情：缺少当前市价和收益信息
-- 投资组合估值可能不准确（依赖其他计算方式）
-
----
-
-### 6.3 结果三：直接报错
-
-**定义**: 用户访问页面时，应用抛出未处理的异常，显示错误页面
-
-**触发条件（关键！）**:
-
-`find_or_fetch_price` **没有 `rescue` 块**。如果用户访问页面时 Provider 调用抛异常，异常会向上冒泡到 Rails 框架，导致：
-- 开发环境：显示异常堆栈和错误信息
-- 生产环境：显示通用 500 错误页面
-
-**触发链路**:
-
-```
-用户访问持仓详情页
-  ↓
-控制器查询 @holding 和相关数据
-  ↓
-视图渲染时调用 @holding.security.current_price
-  ↓
-find_or_fetch_price(date: today)
-  ↓
-prices.find_by(date: today) → nil（数据库无今日缓存）
-  ↓
-调用 provider.fetch_security_price(...)
-  ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ Provider 调用抛异常（网络超时、DNS 失败等）                        │
-│                                                                 │
-│ 注意：find_or_fetch_price 没有 rescue 块！                        │
-│                                                                 │
-│ 异常向上冒泡 → 上层 → Rails 框架 → 错误页面                       │
-└─────────────────────────────────────────────────────────────────┘
-  ↓
-用户看到：
-  开发环境: 异常堆栈页面（红色错误页面）
-  生产环境: "Something went wrong" 500 错误页面
-```
-
-**代码证据**:
 
 `app/models/security/provided.rb:39-62`:
 ```ruby
 def find_or_fetch_price(date: Date.current, cache: true)
   price = prices.find_by(date: date)
+
   return price if price.present?
 
+  # Make sure we have a data provider before fetching
   return nil unless provider.present?
-  
-  # ⚠️ 下面这行调用如果抛异常，没有 rescue 保护！
   response = provider.fetch_security_price(
     symbol: ticker,
     exchange_operating_mic: exchange_operating_mic,
     date: date
   )
+  # ⚠️ 关键：这里没有 rescue 块！
 
   return nil unless response.success?
 
@@ -569,220 +93,611 @@ def find_or_fetch_price(date: Date.current, cache: true)
 end
 ```
 
-**对比：健康检查器有 rescue，视图层没有**
-
-| 位置 | 是否有 `rescue` 块 | 异常行为 |
-|------|------------------|---------|
-| `HealthChecker.run_check` | **有** | 捕获异常，上报 Sentry，继续执行 |
-| `find_or_fetch_price` | **没有** | 异常向上冒泡，导致页面报错 |
+**关键特征**:
+- **没有** `rescue` 块
+- 如果 `provider.fetch_security_price` 抛异常，异常会**向上冒泡**
+- 最终可能导致页面渲染错误（500）
 
 ---
 
-### 6.4 三种结果对比汇总
+## 3. 健康检查任务的异常处理
 
-| 结果 | 健康检查阶段 | 价格数据状态 | current_price 返回 | 前端展示 |
-|------|------------|-------------|-------------------|---------|
-| **显示旧价格** | 路径 A 或 路径 B1 | 有历史价格缓存 | Money 对象（旧价格） | `$98.50`（正常显示） |
-| **显示 Unknown** | 路径 B2 或 无缓存 | 无今日价格 | `nil` | `Unknown` 或 区块消失 |
-| **直接报错** | 任意路径（视图层调用时异常） | 无今日缓存 | **异常上冒泡** | 500 错误页面 |
+### 3.1 健康检查任务中的两条子路径
 
-| 结果 | 用户感知 | 实际问题严重程度 |
-|------|---------|----------------|
-| **显示旧价格** | 看起来正常 | **隐蔽严重**（数据已过时） |
-| **显示 Unknown** | 知道有问题 | 中度（用户知道数据不可用） |
-| **直接报错** | 页面崩溃 | 严重（影响用户体验） |
+#### 子路径 1A：Provider 返回失败响应
+
+**定义**: `provider.fetch_security_price` 正常返回（无异常），但 `response.success? == false`
+
+**代码证据** (`health_checker.rb:72-84`):
+```ruby
+def latest_provider_price
+  return nil unless provider.present?
+
+  response = provider.fetch_security_price(...)
+
+  return nil unless response.success?  # ← 返回 nil，不抛异常
+
+  response.data.price
+end
+```
+
+**测试证据** (`test/support/provider_test_helper.rb:10-16`):
+```ruby
+def provider_error_response(error)
+  Provider::Response.new(
+    success?: false,  # ← 成功响应对象，只是 success? 为 false
+    data: nil,
+    error: error
+  )
+end
+```
+
+**状态变化**:
+| 字段 | 变化 |
+|------|------|
+| `offline` | 1-5次失败：不变；≥6次：`false → true` |
+| `failed_fetch_count` | `+1`，≥6次设为 `6` |
+| `failed_fetch_at` | 更新为当前时间 |
+| `last_health_check_at` | 更新为当前时间 |
+| 价格数据 | ≥6次时被删除 |
 
 ---
 
-## 7. 端到端流程图（完整版）
+#### 子路径 1B：Provider 调用抛异常
+
+**定义**: `provider.fetch_security_price` 执行过程中抛出 Ruby 异常
+
+**代码证据** (`health_checker.rb:57-63`):
+```ruby
+rescue => e
+  Sentry.capture_exception(e) do |scope|
+    scope.set_tags(security_id: @security.id)
+  end
+ensure
+  security.update!(last_health_check_at: Time.current)
+end
+```
+
+**状态变化**:
+| 字段 | 变化 | 原因 |
+|------|------|------|
+| `offline` | **不变** | `handle_failure` 未执行 |
+| `failed_fetch_count` | **不变** | `handle_failure` 未执行 |
+| `failed_fetch_at` | **不变** | `handle_failure` 未执行 |
+| `last_health_check_at` | **更新** | `ensure` 块执行 |
+| 价格数据 | **保留** | `convert_to_offline_security!` 未执行 |
+
+---
+
+### 3.2 健康检查任务状态对比汇总
+
+| 字段 | 子路径 1A（失败响应）1-5次 | 子路径 1A（失败响应）≥6次 | 子路径 1B（调用异常） | 成功 |
+|------|------------------------|-----------------------|---------------------|------|
+| `offline` | 不变 | `false → true` | **不变** | 设为 `false` |
+| `failed_fetch_count` | `+1` | 设为 `6` | **不变** | 设为 `0` |
+| `failed_fetch_at` | 更新 | 更新 | **不变** | 设为 `nil` |
+| `last_health_check_at` | 更新 | 更新 | 更新 | 更新 |
+| 价格数据 | 保留 | **删除** | **保留** | 保留 |
+
+---
+
+## 4. 页面请求时 `current_price` 的执行路径
+
+### 4.1 执行流程图
+
+```
+用户访问页面
+  ↓
+视图渲染调用 @holding.security.current_price
+  ↓
+app/models/security.rb:14-18
+def current_price
+  @current_price ||= find_or_fetch_price
+  return nil if @current_price.nil?
+  Money.new(...)
+end
+  ↓
+app/models/security/provided.rb:39-62
+def find_or_fetch_price(date: Date.current, cache: true)
+  price = prices.find_by(date: date)  ← 第一步：查数据库
+
+  return price if price.present?      ← 有缓存则直接返回
+
+  # 第二步：数据库没有，尝试 Provider
+  return nil unless provider.present?
+
+  # ⚠️ 没有 rescue！
+  response = provider.fetch_security_price(...)
+
+  return nil unless response.success?  ← 失败响应返回 nil
+
+  # 成功则缓存并返回
+  ...
+end
+```
+
+### 4.2 三条子路径
+
+#### 子路径 2A：数据库有今日价格缓存
+
+**触发条件**: `prices.find_by(date: today)` 找到记录
+
+**代码位置**: `provided.rb:40-42`
+
+**执行结果**:
+- 直接返回数据库中的价格
+- 不调用 Provider
+- 页面正常显示价格
+
+---
+
+#### 子路径 2B：数据库无缓存，Provider 返回失败响应
+
+**触发条件**:
+- `prices.find_by(date: today)` 返回 `nil`
+- `provider.fetch_security_price` 返回 `response.success? == false`
+
+**代码位置**: `provided.rb:46-52`
+
+**执行结果**:
+```ruby
+response = provider.fetch_security_price(...)
+return nil unless response.success?  # ← 返回 nil，不抛异常
+```
+
+**返回形态**: `find_or_fetch_price` 返回 `nil`
+
+**上游处理** (`security.rb:14-18`):
+```ruby
+def current_price
+  @current_price ||= find_or_fetch_price  # nil
+  return nil if @current_price.nil?       # 返回 nil
+  Money.new(...)
+end
+```
+
+**最终返回**: `current_price` 返回 `nil`
+
+---
+
+#### 子路径 2C：数据库无缓存，Provider 调用抛异常
+
+**触发条件**:
+- `prices.find_by(date: today)` 返回 `nil`
+- `provider.fetch_security_price` 执行中抛出异常
+
+**关键发现**: `find_or_fetch_price` **没有 `rescue` 块**
+
+**代码证据** (`provided.rb:39-62`):
+```ruby
+def find_or_fetch_price(date: Date.current, cache: true)
+  price = prices.find_by(date: date)
+  return price if price.present?
+
+  return nil unless provider.present?
+
+  # ⚠️ 这里没有 rescue 保护！
+  response = provider.fetch_security_price(
+    symbol: ticker,
+    exchange_operating_mic: exchange_operating_mic,
+    date: date
+  )
+  # 如果上面这行抛异常，异常会向上冒泡
+  ...
+end
+```
+
+**执行结果**:
+- 异常从 `provider.fetch_security_price` 抛出
+- `find_or_fetch_price` 没有捕获
+- `current_price` 没有捕获
+- 视图渲染时没有捕获
+- 异常向上冒泡到 Rails 框架
+- 生产环境：显示 500 错误页面
+- 开发环境：显示异常堆栈
+
+---
+
+## 5. 前端三种可见结果的精确触发条件
+
+### 5.1 结果一：显示价格（正常）
+
+**触发条件（满足任一即可）**:
+
+**条件 A**: 数据库有今日价格缓存
+```
+find_or_fetch_price
+  → prices.find_by(date: today) → 非 nil
+  → 直接返回数据库价格
+  → current_price → Money 对象
+  → 视图: format_money(price)
+  → 显示: "$100.00"
+```
+
+**条件 B**: 数据库无缓存，Provider 调用成功
+```
+find_or_fetch_price
+  → prices.find_by → nil
+  → provider.fetch_security_price → 成功响应
+  → response.success? == true
+  → 缓存并返回价格
+  → current_price → Money 对象
+  → 显示: "$100.00"
+```
+
+---
+
+### 5.2 结果二：显示 "Unknown"
+
+**触发条件（必须同时满足）**:
+
+1. 数据库无今日价格缓存
+2. Provider 调用**正常返回**（无异常抛出）
+3. `response.success? == false` 或价格数据为空
+
+**执行链路**:
+```
+视图: @holding.security.current_price
+  ↓
+current_price 方法
+  ↓
+find_or_fetch_price
+  ↓
+prices.find_by(date: today) → nil
+  ↓
+provider.fetch_security_price(...)
+  ↓
+┌────────────────────────────────────────────┐
+│ 正常返回（无异常）                          │
+│ response.success? == false                 │
+│                                            │
+│ 注意：这不是异常！                          │
+│ 这是 provider_error_response 的行为        │
+└────────────────────────────────────────────┘
+  ↓
+return nil unless response.success?  → 返回 nil
+  ↓
+find_or_fetch_price → nil
+  ↓
+current_price → nil
+  ↓
+视图处理:
+  持仓页: <%= current_price ? format_money(...) : t(".unknown") %>
+         → 显示 "Unknown"
+  交易页: <% if current_price.present? %> ... <% end %>
+         → 条件不满足，区块不渲染
+```
+
+**证据链** (`test/support/provider_test_helper.rb:10-16`):
+```ruby
+def provider_error_response(error)
+  Provider::Response.new(
+    success?: false,  # ← 正常的 Response 对象，只是 success? 为 false
+    data: nil,
+    error: error
+  )
+end
+```
+
+---
+
+### 5.3 结果三：直接报错（500 页面）
+
+**触发条件（必须同时满足）**:
+
+1. 数据库无今日价格缓存
+2. `provider.fetch_security_price` **抛出 Ruby 异常**
+3. 没有上层 `rescue` 块捕获
+
+**精确执行链路（可复核）**:
+
+#### 第一步：调用入口
+
+**文件**: `app/models/security/provided.rb:39-62`
+
+```ruby
+def find_or_fetch_price(date: Date.current, cache: true)
+  price = prices.find_by(date: date)  # ← 假设返回 nil
+
+  return price if price.present?      # ← 不执行
+
+  return nil unless provider.present? # ← 假设 provider 存在，不返回
+
+  # ── 关键行 ──
+  response = provider.fetch_security_price(
+    symbol: ticker,
+    exchange_operating_mic: exchange_operating_mic,
+    date: date
+  )
+  # ↑ 如果这行抛异常...
+
+  return nil unless response.success?  # ← 不会执行到这里
+  ...
+end
+```
+
+#### 第二步：关键分支
+
+| 分支条件 | 代码位置 | 结果 |
+|---------|---------|------|
+| `provider.present? == false` | `provided.rb:45` | 返回 `nil`，显示 "Unknown" |
+| `prices.find_by` 找到记录 | `provided.rb:40-42` | 返回缓存价格，正常显示 |
+| `fetch_security_price` 正常返回 | `provided.rb:46-52` | 根据 `success?` 返回价格或 `nil` |
+| `fetch_security_price` **抛异常** | `provided.rb:46-50` | **异常上冒泡** |
+
+#### 第三步：返回形态
+
+**异常场景**:
+- `provider.fetch_security_price` 抛出 `Net::ReadTimeout`、`SocketError`、`Faraday::ClientError` 等
+- `find_or_fetch_price` 没有 `rescue` 块
+- 异常向上冒泡
+
+#### 第四步：页面表现
+
+- **开发环境**: 显示异常堆栈页面（红色错误页面）
+- **生产环境**: 显示通用 500 错误页面
+
+---
+
+## 6. 最小证据链（可复核）
+
+### 6.1 证据链 A：健康检查任务有 `rescue`
+
+**调用入口**: `app/models/security/health_checker.rb:49`
+
+```ruby
+def run_check
+  # ... 业务逻辑 ...
+rescue => e          # ← 第 57 行：有 rescue
+  Sentry.capture_exception(e)
+ensure               # ← 第 61 行：有 ensure
+  security.update!(last_health_check_at: Time.current)
+end
+```
+
+**关键分支**:
+- 第 52-56 行：`if latest_provider_price ... else ... handle_failure`
+- 第 57-60 行：`rescue => e` 捕获异常
+- 第 61-63 行：`ensure` 始终执行
+
+**返回形态**:
+- 成功：`handle_success` 执行
+- 失败响应：`handle_failure` 执行
+- 异常：`rescue` 捕获，上报 Sentry，不执行 `handle_failure`
+
+**页面表现**:
+- 健康检查是后台任务，不直接影响页面
+- 间接影响：通过 `offline` 状态和价格数据影响后续页面渲染
+
+---
+
+### 6.2 证据链 B：页面请求无 `rescue`
+
+**调用入口**: `app/models/security/provided.rb:39`
+
+```ruby
+def find_or_fetch_price(date: Date.current, cache: true)
+  price = prices.find_by(date: date)
+  return price if price.present?
+
+  return nil unless provider.present?
+  response = provider.fetch_security_price(...)  # ← 第 46 行
+  # ⚠️ 这一行没有 rescue 保护！
+
+  return nil unless response.success?
+  ...
+end
+```
+
+**关键分支**（自上而下一步步检查）:
+
+| 步骤 | 代码位置 | 条件 | 结果 |
+|------|---------|------|------|
+| 1 | `provided.rb:40` | `price = prices.find_by(date: date)` | 有缓存 → 正常显示 |
+| 2 | `provided.rb:45` | `provider.present?` | 无 provider → 返回 `nil` |
+| 3 | `provided.rb:46-50` | `provider.fetch_security_price(...)` | **抛异常 → 500 页面** |
+| 4 | `provided.rb:52` | `response.success?` | false → 返回 `nil` → "Unknown" |
+| 5 | `provided.rb:54-61` | 成功 | 缓存并返回价格 → 正常显示 |
+
+**返回形态**:
+- 步骤 1、2、5：正常返回（价格或 `nil`）
+- 步骤 4：正常返回 `nil`（不抛异常）
+- **步骤 3**：**异常上冒泡**
+
+**页面表现**:
+- 步骤 1、5：显示价格（正常）
+- 步骤 2、4：显示 "Unknown"
+- **步骤 3**：显示 500 错误页面
+
+---
+
+## 7. 两条路径异常处理对比
+
+| 对比项 | 健康检查任务（路径一） | 页面请求（路径二） |
+|--------|---------------------|------------------|
+| **入口方法** | `HealthChecker#run_check` | `Security#current_price` → `find_or_fetch_price` |
+| **文件位置** | `app/models/security/health_checker.rb` | `app/models/security/provided.rb` |
+| **`rescue` 块** | ✅ 有 (`health_checker.rb:57-60`) | ❌ **无** |
+| **`ensure` 块** | ✅ 有 (`health_checker.rb:61-63`) | ❌ 无 |
+| **异常行为** | 捕获后上报 Sentry，继续执行 | **异常上冒泡到 Rails** |
+| **对用户影响** | 无直接影响（后台任务） | **可能导致 500 页面** |
+| **失败响应处理** | `handle_failure` 执行，状态更新 | 返回 `nil`，显示 "Unknown" |
+
+---
+
+## 8. 端到端完整流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     健康检查任务（凌晨 2:00 AM）                       │
+│                      app/models/security/health_checker.rb            │
 └─────────────────────────────────────────────────────────────────────┘
                           │
           ┌───────────────┴───────────────┐
           ↓                               ↓
     ┌─────────────┐                 ┌─────────────┐
-    │ 路径 A      │                 │ 路径 B      │
-    │ 调用异常    │                 │ 返回失败响应│
+    │ 失败响应    │                 │ 调用异常    │
+    │ success?=false│                │ 抛 Exception │
     └──────┬──────┘                 └──────┬──────┘
            ↓                               ↓
 ┌─────────────────────────────┐   ┌─────────────────────────────┐
-│ offline: 保持不变            │   │ 1-5次:                      │
-│ failed_fetch_count: 保持不变  │   │   offline: 保持 false       │
-│ failed_fetch_at: 保持不变     │   │   failed_fetch_count: +1    │
-│ last_health_check_at: 更新   │   │   failed_fetch_at: 更新      │
-│ 价格数据: 保留               │   │   价格数据: 保留             │
+│ handle_failure 执行          │   │ rescue 捕获                 │
 │                             │   │                             │
-│                             │   │ ≥6次:                       │
-│                             │   │   offline: true            │
-│                             │   │   failed_fetch_count: 6    │
-│                             │   │   价格数据: 删除            │
+│ offline: false→true (≥6次)  │   │ offline: 不变               │
+│ failed_count: +1            │   │ failed_count: 不变          │
+│ 价格: 删除 (≥6次)            │   │ 价格: 保留                 │
+│                             │   │                             │
+│ ensure: last_health_check   │   │ ensure: last_health_check   │
 └──────────────┬──────────────┘   └──────────────┬──────────────┘
                ↓                                  ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │                 价格导入任务（晚上 10:00 PM）                         │
+│                      app/models/market_data_importer.rb               │
 │                                                                     │
 │ Security.online.find_each                                           │
 │   → offline=false 的证券尝试导入新价格                               │
 │   → offline=true 的证券被跳过                                       │
 └─────────────────────────────────────────────────────────────────────┘
                           │
-          ┌───────────────┴───────────────┐
-          ↓                               ↓
-┌─────────────────────┐         ┌─────────────────────┐
-│ 路径 A:             │         │ 路径 B2:            │
-│ offline=false       │         │ offline=true        │
-│ 旧价格仍在数据库     │         │ 价格已被删除         │
-│ 可能尝试导入新价格   │         │ 被跳过，无新价格     │
-└──────────┬──────────┘         └──────────┬──────────┘
-           ↓                               ↓
+                          ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      用户访问页面（任意时间）                          │
 │                                                                     │
-│ current_price 被调用                                                 │
-│   → find_or_fetch_price                                              │
-│     → 第一步：查数据库缓存                                           │
-│     → 第二步：缓存不存在则调用 Provider                               │
+│ 视图: @holding.security.current_price                               │
+│   → app/models/security.rb:14-18                                    │
+│     → find_or_fetch_price                                           │
+│       → app/models/security/provided.rb:39-62                       │
 └─────────────────────────────────────────────────────────────────────┘
                           │
         ┌─────────────────┼─────────────────┐
         ↓                 ↓                 ↓
 ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-│ 第一步命中缓存 │ │ 第一步无缓存   │ │ 第一步无缓存   │
-│ 返回旧价格     │ │ 第二步成功    │ │ 第二步异常    │
+│ 有数据库缓存  │ │ 无缓存且      │ │ 无缓存且      │
+│ 返回价格      │ │ Provider失败响应│ │ Provider抛异常 │
 └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
         ↓                 ↓                 ↓
 ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
-│ 显示旧价格     │ │ 显示 Unknown  │ │ 直接报错      │
-│ $98.50        │ │ Unknown       │ │ 500 页面      │
+│ 显示价格      │ │ 显示 Unknown  │ │ 500 错误页面  │
+│ $100.00       │ │               │ │               │
 └───────────────┘ └───────────────┘ └───────────────┘
 ```
 
 ---
 
-## 8. 数据模型与状态字段
+## 9. 状态字段更新时机
 
-### 8.1 数据库表结构
+### 9.1 健康检查任务触发的状态更新
 
-**位置**: `db/schema.rb:623-640`
+| 场景 | `offline` | `failed_fetch_count` | `last_health_check_at` | 价格数据 |
+|------|-----------|---------------------|-----------------------|---------|
+| 成功响应 | `false` | `0` | 更新 | 保留 |
+| 失败响应 (1-5次) | 不变 | `+1` | 更新 | 保留 |
+| 失败响应 (≥6次) | `true` | `6` | 更新 | **删除** |
+| 调用异常 | **不变** | **不变** | **更新** | **保留** |
 
+### 9.2 页面请求触发的状态更新
+
+**页面请求中的 `find_or_fetch_price`**:
+- 不更新 `offline`、`failed_fetch_count`、`last_health_check_at`
+- 成功时可能更新 `security_prices` 表（缓存新价格）
+- 失败时不更新任何状态
+
+---
+
+## 10. 关键发现总结
+
+### 10.1 发现一：两条路径的异常处理不一致
+
+- **健康检查任务**: 有 `rescue` 块，异常被安全捕获
+- **页面请求**: 无 `rescue` 块，异常可能导致 500 错误
+
+### 10.2 发现二："失败响应"不等于"异常"
+
+- `provider_error_response` 返回的是正常的 `Response` 对象，只是 `success? == false`
+- 这种情况在两条路径中都被优雅处理（返回 `nil`）
+- 不会导致 500 错误
+
+### 10.3 发现三："直接报错"的精确条件
+
+**不是**所有 Provider 调用失败都会导致 500 错误。只有同时满足：
+1. 数据库无今日价格缓存
+2. `provider.fetch_security_price` **抛出 Ruby 异常**
+3. 没有上层 `rescue` 块捕获
+
+**才会导致 500 页面**。
+
+---
+
+## 11. 潜在改进建议
+
+### 建议 1：为 `find_or_fetch_price` 添加 `rescue` 保护
+
+**问题**: 用户页面可能因 Provider 异常而崩溃
+
+**建议修改**:
 ```ruby
-create_table "securities", force: :cascade do |t|
-  t.string "ticker", null: false
-  t.boolean "offline", default: false, null: false       # 核心状态
-  t.datetime "failed_fetch_at"                           # 最后失败时间
-  t.integer "failed_fetch_count", default: 0, null: false # 连续失败计数
-  t.datetime "last_health_check_at"                      # 最后检查时间
+def find_or_fetch_price(date: Date.current, cache: true)
+  price = prices.find_by(date: date)
+  return price if price.present?
+
+  return nil unless provider.present?
+
+  begin
+    response = provider.fetch_security_price(
+      symbol: ticker,
+      exchange_operating_mic: exchange_operating_mic,
+      date: date
+    )
+  rescue => e
+    Sentry.capture_exception(e)
+    return nil  # 优雅降级
+  end
+
+  return nil unless response.success?
+
+  price = response.data
+  Security::Price.find_or_create_by!(...) if cache
+  price
 end
 ```
 
-### 8.2 状态字段更新时机对照表
+### 建议 2：统一健康检查任务的异常处理
 
-| 字段 | 路径 A（异常） | 路径 B1（失败 1-5 次） | 路径 B2（失败 ≥6 次） | 成功 |
-|------|---------------|---------------------|--------------------|------|
-| `offline` | 不变 | 不变 | `false → true` | 设为 `false` |
-| `failed_fetch_count` | **不变** | `+1` | 设为 `6` | 设为 `0` |
-| `failed_fetch_at` | **不变** | 更新 | 更新 | 设为 `nil` |
-| `last_health_check_at` | 更新 | 更新 | 更新 | 更新 |
+**问题**: 调用异常不计入 `failed_fetch_count`，可能掩盖持续问题
 
----
-
-## 9. 关键发现与潜在问题
-
-### 9.1 关键发现总结
-
-1. **两条链路的本质区别**
-   - 路径 A（调用异常）：`rescue` 块捕获，状态字段**几乎不变**
-   - 路径 B（失败响应）：`handle_failure` 执行，状态字段**有变化**
-
-2. **`last_health_check_at` 的特殊行为**
-   - `ensure` 块确保**无论什么情况**都会更新
-   - 这意味着异常也会重置 7 天检查周期
-
-3. **异常路径的隐蔽性**
-   - 连续多次异常不会触发离线保护
-   - 用户可能看到过时的价格数据
-   - 只有开发人员通过 Sentry 知道问题
-
-4. **视图层无异常保护**
-   - `find_or_fetch_price` 没有 `rescue` 块
-   - 用户访问页面时 Provider 异常会导致 500 错误
-
-### 9.2 潜在改进建议
-
-#### 建议 1：统一异常和失败响应的处理
-- **问题**: 调用异常不计入失败计数，但失败响应会
-- **建议**:
-  ```ruby
-  rescue => e
-    Sentry.capture_exception(e) do |scope|
-      scope.set_tags(security_id: @security.id)
-    end
-    handle_failure  # 异常也应该走失败处理逻辑
-  ```
-
-#### 建议 2：异常场景不更新 `last_health_check_at`
-- **问题**: 异常会重置 7 天周期，问题可能被掩盖
-- **建议**: 将 `last_health_check_at` 更新移到 `ensure` 之外，或区分成功/异常
-
-#### 建议 3：为 `find_or_fetch_price` 添加异常保护
-- **问题**: 用户页面可能因 Provider 异常而崩溃
-- **建议**:
-  ```ruby
-  def find_or_fetch_price(date: Date.current, cache: true)
-    # ...
-    begin
-      response = provider.fetch_security_price(...)
-    rescue => e
-      Sentry.capture_exception(e)
-      return nil  # 优雅降级，返回 nil 而不是抛异常
-    end
-    # ...
+**建议**:
+```ruby
+rescue => e
+  Sentry.capture_exception(e) do |scope|
+    scope.set_tags(security_id: @security.id)
   end
-  ```
-
-#### 建议 4：前端展示 `offline` 状态
-- **问题**: 用户看到 "Unknown" 但不知道原因
-- **建议**: 前端可展示 `offline` 状态，提示 "该证券当前不可用"
-
-#### 建议 5：添加异常路径的测试
-- **问题**: 当前测试未覆盖 Provider 抛异常的场景
-- **建议**: 添加单元测试验证异常路径的行为
+  handle_failure  # 异常也应该走失败处理逻辑
+ensure
+  security.update!(last_health_check_at: Time.current)
+end
+```
 
 ---
 
-## 10. 测试覆盖现状
+## 12. 测试覆盖现状
 
-**位置**: `test/models/security/health_checker_test.rb`
-
-| 测试用例 | 覆盖路径 | 状态 |
-|----------|---------|------|
-| `failure incrementor increases for each health check failure` | 路径 B1 | ✅ 已覆盖 |
-| `after enough consecutive health check failures, security goes offline` | 路径 B2 | ✅ 已覆盖 |
-| `failure incrementor resets to 0 when health check succeeds` | 成功路径 | ✅ 已覆盖 |
-| **Provider 抛异常场景** | 路径 A | ❌ **未覆盖** |
-| **视图层异常场景** | `find_or_fetch_price` 异常 | ❌ **未覆盖** |
+| 测试场景 | 覆盖路径 | 状态 |
+|---------|---------|------|
+| 失败响应递增计数器 | 健康检查 - 失败响应 | ✅ 已覆盖 |
+| 连续失败 6 次标记离线 | 健康检查 - 失败响应 | ✅ 已覆盖 |
+| 成功重置计数器 | 健康检查 - 成功 | ✅ 已覆盖 |
+| **调用异常场景** | 健康检查 - 调用异常 | ❌ **未覆盖** |
+| **页面请求异常场景** | 页面请求 - 调用异常 | ❌ **未覆盖** |
 
 ---
 
-## 11. 关键文件索引
+## 13. 关键文件索引
 
-| 文件路径 | 职责 |
-|----------|------|
-| `config/schedule.yml` | 定时任务配置 |
-| `app/jobs/security_health_check_job.rb` | 任务入口 |
-| `app/models/security/health_checker.rb` | 健康检查核心逻辑（含 rescue/ensure） |
-| `app/models/security.rb` | Security 模型，`current_price` 方法 |
-| `app/models/security/provided.rb` | `find_or_fetch_price` 实现（**无 rescue**） |
-| `app/models/security/resolver.rb` | 证券解析 |
-| `app/models/security/price/importer.rb` | 价格导入逻辑 |
-| `app/models/market_data_importer.rb` | 批量价格导入（受 offline 状态影响） |
-| `app/models/holding.rb` | 持仓模型 |
-| `app/models/trade.rb` | 交易模型 |
-| `app/views/holdings/show.html.erb` | 持仓详情页面（显示 Unknown） |
-| `app/views/trades/_header.html.erb` | 交易详情页面 |
-| `config/locales/views/holdings/en.yml` | 国际化文件（Unknown 定义） |
-| `db/schema.rb` | 数据库表结构 |
-| `test/models/security/health_checker_test.rb` | 测试用例（缺异常场景） |
+| 文件路径 | 职责 | 关键代码行 |
+|----------|------|-----------|
+| `app/models/security/health_checker.rb` | 健康检查逻辑 | 49-63 (`rescue` + `ensure`) |
+| `app/models/security.rb` | `current_price` 方法 | 14-18 |
+| `app/models/security/provided.rb` | `find_or_fetch_price` | 39-62 (**无 `rescue`**) |
+| `test/support/provider_test_helper.rb` | 测试辅助方法 | 10-16 (`provider_error_response`) |
+| `app/views/holdings/show.html.erb` | 持仓详情视图 | 22-25 (显示 "Unknown") |
+| `config/schedule.yml` | 定时任务配置 | 16-20 |
