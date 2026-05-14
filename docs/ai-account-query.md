@@ -4,7 +4,10 @@
 
 Maybe Finance 的 AI 助手通过工具函数（Function Calling）机制，为用户提供账户数据查询能力。本文档详细说明 AI 助手可调用的查询维度、权限校验机制、各查询间的过滤差异以及对回答口径的影响。
 
-**修订说明**：本文档校正了各查询函数对停用/待删除账户的过滤行为差异，以及分页机制的真实限制。
+**修订说明**：本文档校正了以下关键内容：
+1. 各查询函数对停用/待删除账户的过滤行为差异
+2. 分页机制的真实限制及参数传递链路
+3. 会话认证中 IP、User-Agent 的真实处理逻辑
 
 ---
 
@@ -264,7 +267,7 @@ end
 **`Entry.visible` 定义**：`app/models/entry.rb:17-19`
 ```ruby
 scope :visible, -> {
-  joins(:account).where(accounts: { status: [ "draft", "active" ] })
+  joins(:account).where(accounts: { status: [ "draft", "active" ])
 }
 ```
 
@@ -290,43 +293,142 @@ scope :visible, -> {
 
 ## 二、分页机制的真实限制
 
-### 2.1 Schema 声明 vs 实际行为
+### 2.1 page_size 参数传递链路完整分析
 
-**声明的分页参数**（`app/models/assistant/function/get_transactions.rb:71`）：
+#### 第 1 层：Schema 声明（`app/models/assistant/function/get_transactions.rb:69-132`
+
 ```ruby
-required: [ "order", "page", "page_size" ],
-properties: {
-  page: { type: "integer", description: "Page number" },
-  ...
-}
+def params_schema
+  build_schema(
+    required: [ "order", "page", "page_size" ],  # 声明 page_size 为 required
+    properties: {
+      page: { type: "integer", description: "Page number" },
+      # ⚠️ 注意：properties 中没有定义 page_size！
+      order: { ... },
+      search: { ... },
+      ...
+    }
+  )
+end
 ```
 
-**实际实现**（`app/models/assistant/function/get_transactions.rb:142-150`）：
+**问题 1**：`required` 数组声明了 `page_size`，但 `properties` 中没有定义它的 schema。
+
+---
+
+#### 第 2 层：函数描述（`app/models/assistant/function/get_transactions.rb:24-33`
+
 ```ruby
+Note on pagination:
+
+This function can be paginated.  You can expect the following properties in the response:
+
+- `total_pages`: The total number of pages of results
+- `page`: The current page of results
+- `page_size`: The number of results per page (this will always be #{default_page_size})  # ⚠️ 明确说"总是"默认值
+- `total_results`: The total number of results for the given filters
+```
+
+**问题 2**：函数描述本身就说明 `page_size` "will always be" 默认值。
+
+---
+
+#### 第 3 层：call 方法参数处理（`app/models/assistant/function/get_transactions.rb:134-137`
+
+```ruby
+def call(params = {})
+  search_params = params.except("order", "page")  # 只排除 order 和 page
+  
+  # ⚠️ 问题 3：page_size 被包含在 search_params 中传给了 Transaction::Search
+  search = Transaction::Search.new(family, filters: search_params)
+```
+
+---
+
+#### 第 4 层：Transaction::Search 处理（`app/models/transaction/search.rb:5-16`
+
+```ruby
+class Transaction::Search
+  include ActiveModel::Model
+  include ActiveModel::Attributes
+
+  attribute :search, :string
+  attribute :amount, :string
+  attribute :amount_operator, :string
+  attribute :types, array: true
+  attribute :accounts, array: true
+  attribute :account_ids, array: true
+  attribute :start_date, :string
+  attribute :end_date, :string
+  attribute :categories, array: true
+  attribute :merchants, array: true
+  attribute :tags, array: true
+  attribute :active_accounts_only, :boolean, default: true
+
+  # ⚠️ 问题 4：Transaction::Search 没有定义 page_size 属性
+```
+
+**问题 4**：`Transaction::Search` 没有 `page_size` 属性，所以该参数被静默丢弃。
+
+---
+
+#### 第 5 层：pagy 调用（`app/models/assistant/function/get_transactions.rb:141-150`
+
+```ruby
+# By default, we give a small page size to force the AI to use filters effectively and save on tokens
 pagy, paginated_transactions = pagy(
   pagy_query.includes(...),
-  page: params["page"] || 1,      # 仅使用 page 参数
-  limit: default_page_size        # 固定使用默认值，忽略 params["page_size"]
+  page: params["page"] || 1,        # 仅使用 page 参数
+  limit: default_page_size        # ⚠️ 问题 5：完全忽略 params["page_size"]，硬编码为 default_page_size (50)
 )
 ```
 
-### 2.2 真实限制
+**问题 5**：`limit` 参数硬编码为 `default_page_size`，完全忽略 `params["page_size"]`。
 
-| 限制项 | 真实值 | 说明 |
-|--------|--------|------|
-| 每页大小 | **固定 50 条** | `page_size` 参数在 Schema 中声明为 required，但实际代码中**完全忽略** |
-| 页码 | 从 1 开始 | 使用 `params["page"] \|\| 1` |
-| 设计目的 | 强制 AI 使用筛选条件 | 代码注释："By default, we give a small page size to force the AI to use filters effectively and save on tokens" |
+---
 
-### 2.3 Schema 与实现不一致问题
+#### 第 6 层：返回结果（`app/models/assistant/function/get_transactions.rb:171-179`
 
-- Schema 声明 `page_size` 为 `required`
-- 但代码中 `limit: default_page_size` 硬编码为 50
-- 这意味着：
-  - AI 可能尝试传递 `page_size` 参数（因为 Schema 要求）
-  - 但该参数会被**静默忽略**
-  - AI 无法调整每页大小，始终只能获取 50 条/页
-  - 返回结果中 `page_size` 字段始终为 50
+```ruby
+{
+  transactions: normalized_transactions,
+  total_results: pagy.count,
+  page: pagy.page,
+  page_size: default_page_size,  # ⚠️ 问题 6：硬编码返回 default_page_size
+  total_pages: pagy.pages,
+  total_income: totals.income_money.format,
+  total_expenses: totals.expense_money.format
+}
+```
+
+**问题 6**：返回结果中的 `page_size` 也硬编码为 `default_page_size`。
+
+---
+
+### 2.2 真实限制总结
+
+| 层级|真实值|说明|
+|-----|-----|-----|
+|每页大小|**固定 50 条|代码注释："By default, we give a small page size to force the AI to use filters effectively and save on tokens"|
+|页码|从 1 开始|使用 `params["page"]] \|\| 1|
+|AI 可控制性|❌ 无法控制|`page_size` 参数被静默忽略|
+|设计目的|强制 AI 使用筛选条件|节省 Token，避免单次返回过多数据|
+
+### 2.3 为什么固定为 50 条的原因
+
+这是一个**有意的设计决策**，不是 bug：
+
+1. **节省 Token**：LLM 的上下文窗口有限，每页返回过多交易会消耗大量 Token
+2. **强制筛选**：通过限制每页大小，"force the AI to use filters effectively"，鼓励 AI 使用筛选条件而非遍历数据
+3. **成本控制**：避免 AI 尝试通过调大每页大小来获取完整数据集
+
+### 2.4 Schema 与实现的不一致问题
+
+|不一致点|详情|影响|
+|-------|-----|-----|
+|required vs properties|`required` 声明了 `page_size`，但 `properties` 未定义|AI 可能尝试传递该参数，但 schema 校验可能宽松|
+|描述 vs 实现|函数描述说 `page_size` "will always be"默认值|AI 知道不能调整，但 schema 要求传递|
+|参数传递|`page_size` 被传给 search，但被忽略|AI 传递了参数但无效果|
 
 ---
 
@@ -336,10 +438,10 @@ pagy, paginated_transactions = pagy(
 
 **可能的回答路径**：
 
-| 路径 | AI 调用函数 | 返回结果 | 回答内容 |
-|------|------------|---------|---------|
-| A | GetAccounts | 8 个账户（含 2 个已停用） | "您有 8 个账户" |
-| B | GetBalanceSheet | 基于 6 个可见账户计算净值 | "您的净值由 6 个账户构成" |
+|路径|AI 调用函数|返回结果|回答内容|
+|-----|----------|--------|---------|
+|A|GetAccounts|8 个账户（含 2 个已停用）|"您有 8 个账户"|
+|B|GetBalanceSheet|基于 6 个可见账户计算净值|"您的净值由 6 个账户构成"|
 
 **口径差异**：同一用户同一时刻的问题，可能得到不同的"账户数量"答案。
 
@@ -349,12 +451,12 @@ pagy, paginated_transactions = pagy(
 
 **假设**：用户的房贷账户在 3 个月前被标记为 `disabled`
 
-| 查询函数 | 是否包含该账户 | 对回答的影响 |
+|查询函数|是否包含该账户|对回答的影响|
 |---------|---------------|-------------|
-| GetAccounts | ✅ 包含 | AI 会看到这个贷款账户存在 |
-| GetTransactions | ❌ 不包含 | 搜索不到该账户下的还款记录 |
-| GetIncomeStatement | ❌ 不包含 | 支出统计中缺少该账户的还款 |
-| GetBalanceSheet | ❌ 不包含 | 负债中不包含该贷款余额 |
+|GetAccounts|✅ 包含|AI 会看到这个贷款账户存在|
+|GetTransactions|❌ 不包含|搜索不到该账户下的还款记录|
+|GetIncomeStatement|❌ 不包含|支出统计中缺少该账户的还款|
+|GetBalanceSheet|❌ 不包含|负债中不包含该贷款余额|
 
 **口径差异**：AI 可能会困惑"账户列表显示有这笔贷款，但交易查询找不到相关记录"。
 
@@ -364,10 +466,10 @@ pagy, paginated_transactions = pagy(
 
 **假设**：用户 2024 年初注销了旧信用卡（标记为 `disabled`）
 
-| 查询函数 | 是否包含 2023 年数据 | 对回答的影响 |
+|查询函数|是否包含 2023 年数据|对回答的影响|
 |---------|---------------------|-------------|
-| GetTransactions | ❌ 不包含 | 无法查询该卡的历史交易 |
-| GetIncomeStatement | ❌ 不包含 | 2023 年支出统计缺失该卡数据 |
+|GetTransactions|❌ 不包含|无法查询该卡的历史交易|
+|GetIncomeStatement|❌ 不包含|2023 年支出统计缺失该卡数据|
 
 **口径差异**：
 - GetAccounts 会显示该信用卡（状态为 `disabled`）
@@ -396,12 +498,12 @@ end
 
 ### 3.5 影响总结
 
-| 差异类型 | 影响场景 | 对回答的影响 |
-|---------|---------|-------------|
-| GetAccounts 与其他函数不一致 | 账户数量、资产构成 | 回答可能出现数字矛盾 |
-| 停用账户的交易不可查 | 历史支出查询、预算对比 | 数据缺失但无明确提示 |
-| Schema 与实现不一致 | 交易分页 | AI 无法调整每页大小，可能遗漏数据 |
-| 账户筛选 enum 限制 | 按账户筛选交易 | 无法选择已停用账户 |
+|差异类型|影响场景|对回答的影响|
+|-------|--------|-------------|
+|GetAccounts 与其他函数不一致|账户数量、资产构成|回答可能出现数字矛盾|
+|停用账户的交易不可查|历史支出查询、预算对比|数据缺失但无明确提示|
+|Schema 与实现不一致|交易分页|AI 无法调整每页大小，可能遗漏数据|
+|账户筛选 enum 限制|按账户筛选交易|无法选择已停用账户|
 
 ---
 
@@ -449,14 +551,88 @@ end
 3. 若会话有效，设置 `Current.session`
 4. 否则重定向到登录页面
 
-**安全特性**：
+---
+
+### 4.3 IP、User-Agent 的真实处理逻辑（⚠️ 核心校正）
+
+#### ⚠️ 原有结论错误
+
+**错误结论**："会话与用户 IP、User-Agent 绑定
+
+**代码事实**：
+
+**Session 创建时记录（`app/models/session.rb:8-11`）：
+```ruby
+before_create do
+  self.user_agent = Current.user_agent  # 记录 User-Agent
+  self.ip_address = Current.ip_address  # 记录 IP
+end
+```
+
+**会话认证时（`app/controllers/concerns/authentication.rb:30-38`）：
+```ruby
+def find_session_by_cookie
+  cookie_value = cookies.signed[:session_token]
+
+  if cookie_value.present?
+    Session.find_by(id: cookie_value)  # ⚠️ 仅通过 ID 查找，不校验 IP 或 User-Agent！
+  else
+    nil
+  end
+end
+```
+
+#### 真实情况：仅记录，不校验
+
+|处理阶段|IP 处理|User-Agent 处理|
+|-------|--------|---------------|
+|Session 创建|✅ 记录到数据库|✅ 记录到数据库|
+|Session 认证|❌ 不校验|❌ 不校验|
+|Session 过期|❌ 不检查|❌ 不检查|
+
+#### 边界影响
+
+由于仅记录不校验，存在以下边界情况：
+
+|边界场景|影响|风险/行为|
+|---------|-----|---------|
+|用户从办公室切换到家里网络|IP 变化|✅ 会话仍然有效|
+|用户从 Chrome 切换到 Firefox|User-Agent 变化|✅ 会话仍然有效|
+|Cookie 被窃取到另一台设备|IP + User-Agent 都变化|✅ 会话仍然有效（⚠️ 安全风险）|
+|用户使用 VPN|IP 变化|✅ 会话仍然有效|
+
+#### 记录的用途
+
+IP 和 User-Agent 仅用于：
+1. **审计目的**：管理员查看用户从哪些设备/位置访问
+2. **Sentry 用户标识**：`app/controllers/concerns/authentication.rb:55-66` 中用于 Sentry 错误追踪
+3. **模拟操作日志**：`impersonatable.rb` 中记录模拟操作时的 IP 和 User-Agent
+
+**代码证据**：`app/controllers/concerns/authentication.rb:55-66`
+```ruby
+def set_sentry_user
+  return unless defined?(Sentry) && ENV["SENTRY_DSN"].present?
+
+  if Current.user
+    Sentry.set_user(
+      id: Current.user.id,
+      email: Current.user.email,
+      username: Current.user.display_name,
+      ip_address: Current.ip_address  # 用于 Sentry，不是用于认证校验
+    )
+  end
+end
+```
+
+#### 安全特性（实际存在的）
+
 - Cookie 采用 `signed` + `permanent` 加密存储
 - 设置 `httponly: true` 防止 XSS 攻击
-- 会话与用户 IP、User-Agent 绑定（创建时记录）
+- ⚠️ 注意：没有 IP/User-Agent 绑定校验
 
 ---
 
-### 4.3 第二层：Chat 归属校验
+### 4.4 第二层：Chat 归属校验
 
 **机制**：Chat 必须属于当前登录用户
 
@@ -471,7 +647,7 @@ end
 
 ---
 
-### 4.4 第三层：工具函数作用域隔离
+### 4.5 第三层：工具函数作用域隔离
 
 **核心原则**：所有数据查询都以 `user.family` 为作用域边界
 
@@ -485,12 +661,12 @@ end
 
 所有查询函数都继承自 `Assistant::Function`，通过以下方式隔离数据：
 
-| 函数 | 作用域实现 |
-|------|-----------|
-| GetAccounts | `family.accounts.includes(:balances)` |
-| GetTransactions | `Transaction::Search.new(family, filters: search_params)` |
-| GetBalanceSheet | `family.balance_sheet` |
-| GetIncomeStatement | `family.income_statement` |
+|函数|作用域实现|
+|-----|---------|
+|GetAccounts|`family.accounts.includes(:balances)`|
+|GetTransactions|`Transaction::Search.new(family, filters: search_params)`|
+|GetBalanceSheet|`family.balance_sheet`|
+|GetIncomeStatement|`family.income_statement`|
 
 **关键设计**：
 - 工具函数初始化时传入的是 `chat.user`（`app/models/assistant.rb:69-71`）
@@ -499,7 +675,7 @@ end
 
 ---
 
-### 4.5 数据模型层次结构
+### 4.6 数据模型层次结构
 
 ```
 Family (隔离单元)
@@ -538,7 +714,7 @@ Family (隔离单元)
 - GetIncomeStatement：**不可以**访问（过滤）
 
 **代码位置**：
-- `app/models/account.rb:21`：`scope :visible, -> { where(status: [ "draft", "active" ]) }`
+- `app/models/account.rb:21`：`scope :visible, -> { where(status: [ "draft", "active" ])`
 - `app/models/assistant/function/get_balance_sheet.rb:47`：`scope = family.accounts.visible`
 - `app/models/transaction/search.rb:16`：`active_accounts_only: true`
 
@@ -549,7 +725,7 @@ Family (隔离单元)
 **返回格式约束**：
 - 所有货币值以原始数值 + 格式化字符串形式返回
 - 历史数据限制：最多返回过去 5 年的数据
-- 交易分页限制：**固定** 50 条/页（Schema 声明可配置，但实现硬编码）
+- 交易分页限制：**固定** 50 条/页（有意设计，强制 AI 使用筛选条件）
 
 **敏感数据保护**：
 - 不返回完整的账户号码、凭证等敏感信息
@@ -566,11 +742,11 @@ Family (隔离单元)
 enum :role, { member: "member", admin: "admin", super_admin: "super_admin" }, validate: true
 ```
 
-| 角色 | AI 助手权限 | 说明 |
-|------|------------|------|
-| member | ✅ 可访问同 Family 数据 | 普通成员，可使用 AI 助手 |
-| admin | ✅ 可访问同 Family 数据 | 家族管理员，AI 权限同 member |
-| super_admin | ⚠️ 可模拟用户（需记录） | 超级管理员，支持模拟功能 |
+|角色|AI 助手权限|说明|
+|-----|----------|-----|
+|member|✅ 可访问同 Family 数据|普通成员，可使用 AI 助手|
+|admin|✅ 可访问同 Family 数据|家族管理员，AI 权限同 member|
+|super_admin|⚠️ 可模拟用户（需记录）|超级管理员，支持模拟功能|
 
 ---
 
@@ -643,60 +819,73 @@ AI 系统指令中包含明确的行为约束：
 
 ### 7.1 账户过滤行为（核心校正）
 
-| 查询函数 | 过滤停用/待删除 | 代码实现 | 对回答的影响 |
-|---------|---------------|---------|-------------|
-| GetAccounts | ❌ 不过滤 | `family.accounts` | 返回所有账户（含已停用） |
-| GetTransactions | ✅ 过滤 | `Transaction::Search` (active_accounts_only: true) | 无法查询停用账户的历史交易 |
-| GetBalanceSheet | ✅ 过滤 | `family.accounts.visible` | 净值不包含停用账户 |
-| GetIncomeStatement | ✅ 过滤 | `family.transactions.visible` | 收支统计不包含停用账户 |
+|查询函数|过滤停用/待删除|代码实现|对回答的影响|
+|--------|---------------|---------|-------------|
+|GetAccounts|❌ 不过滤|`family.accounts`|返回所有账户（含已停用）|
+|GetTransactions|✅ 过滤|`Transaction::Search` (active_accounts_only: true)|无法查询停用账户的历史交易|
+|GetBalanceSheet|✅ 过滤|`family.accounts.visible`|净值不包含停用账户|
+|GetIncomeStatement|✅ 过滤|`family.transactions.visible`|收支统计不包含停用账户|
 
 ### 7.2 分页真实限制（核心校正）
 
-| 限制项 | 真实值 | 说明 |
-|--------|--------|------|
-| 每页大小 | **固定 50 条** | Schema 声明 `page_size` 为 required，但代码硬编码 `default_page_size` |
-| 页码 | 从 1 开始 | 使用 `params["page"] \|\| 1` |
-| Schema 一致性 | ❌ 不一致 | AI 无法通过参数调整每页大小 |
+|限制项|真实值|说明|
+|------|------|-----|
+|每页大小|**固定 50 条**|有意设计：强制 AI 使用筛选条件，节省 Token|
+|页码|从 1 开始|使用 `params["page"]` \|\| 1|
+|Schema 一致性|❌ 不一致|`page_size` 在 required 中声明但未使用|
 
-### 7.3 权限校验要点
+### 7.3 会话认证真实情况（核心校正）
+
+|处理|IP|User-Agent|
+|-----|-----|----------|
+|创建时|✅ 记录|✅ 记录|
+|认证时|❌ 不校验|❌ 不校验|
+|安全影响|IP 变化不影响会话|User-Agent 变化不影响会话|
+
+**边界影响**：
+- Cookie 被窃取后，即使在不同 IP/设备上仍然有效
+- IP/User-Agent 仅用于审计和 Sentry 追踪
+
+### 7.4 权限校验要点
 
 1. **入口层**：Session Cookie 认证，未登录则重定向
 2. **资源层**：Chat 必须属于 Current.user
 3. **数据层**：所有查询以 Family 为作用域边界
 4. **审计层**：模拟操作全量日志记录
 
-### 7.4 安全边界
+### 7.5 安全边界
 
-| 边界类型 | 限制 |
-|---------|------|
-| 数据隔离 | Family 级别的严格隔离 |
-| 时间范围 | 历史数据最多 5 年 |
-| 返回数量 | 交易分页固定 50 条/页 |
-| 角色权限 | super_admin 才允许模拟 |
-| 函数调用 | 仅 4 个预定义函数，禁止递归 |
+|边界类型|限制|
+|-------|-----|
+|数据隔离|Family 级别的严格隔离|
+|时间范围|历史数据最多 5 年|
+|返回数量|交易分页固定 50 条/页|
+|角色权限|super_admin 才允许模拟|
+|函数调用|仅 4 个预定义函数，禁止递归|
 
-### 7.5 代码定位速查
+### 7.6 代码定位速查
 
-| 组件 | 文件路径 |
-|------|---------|
-| 会话认证 | `app/controllers/concerns/authentication.rb` |
-| Chat 控制器 | `app/controllers/chats_controller.rb` |
-| 助手主逻辑 | `app/models/assistant.rb` |
-| 函数调用器 | `app/models/assistant/function_tool_caller.rb` |
-| 工具函数基类 | `app/models/assistant/function.rb` |
-| GetAccounts | `app/models/assistant/function/get_accounts.rb` |
-| GetTransactions | `app/models/assistant/function/get_transactions.rb` |
-| GetBalanceSheet | `app/models/assistant/function/get_balance_sheet.rb` |
-| GetIncomeStatement | `app/models/assistant/function/get_income_statement.rb` |
-| Transaction Search | `app/models/transaction/search.rb` |
-| BalanceSheet AccountTotals | `app/models/balance_sheet/account_totals.rb` |
-| IncomeStatement | `app/models/income_statement.rb` |
-| Entry visible scope | `app/models/entry.rb` |
-| Account visible scope | `app/models/account.rb` |
-| 当前上下文 | `app/models/current.rb` |
-| 用户模型 | `app/models/user.rb` |
-| 家族模型 | `app/models/family.rb` |
-| 模拟功能 | `app/models/impersonation_session.rb` |
+|组件|文件路径|
+|-----|---------|
+|会话认证|`app/controllers/concerns/authentication.rb`|
+|Session 模型|`app/models/session.rb`|
+|Chat 控制器|`app/controllers/chats_controller.rb`|
+|助手主逻辑|`app/models/assistant.rb`|
+|函数调用器|`app/models/assistant/function_tool_caller.rb`|
+|工具函数基类|`app/models/assistant/function.rb`|
+|GetAccounts|`app/models/assistant/function/get_accounts.rb`|
+|GetTransactions|`app/models/assistant/function/get_transactions.rb`|
+|GetBalanceSheet|`app/models/assistant/function/get_balance_sheet.rb`|
+|GetIncomeStatement|`app/models/assistant/function/get_income_statement.rb`|
+|Transaction Search|`app/models/transaction/search.rb`|
+|BalanceSheet AccountTotals|`app/models/balance_sheet/account_totals.rb`|
+|IncomeStatement|`app/models/income_statement.rb`|
+|Entry visible scope|`app/models/entry.rb`|
+|Account visible scope|`app/models/account.rb`|
+|当前上下文|`app/models/current.rb`|
+|用户模型|`app/models/user.rb`|
+|家族模型|`app/models/family.rb`|
+|模拟功能|`app/models/impersonation_session.rb`|
 
 ---
 
@@ -719,10 +908,15 @@ AI 系统指令中包含明确的行为约束：
    - GetAccounts 使用 `family.accounts`
    - **影响**：AI 无法通过参数筛选已停用账户，即使 GetAccounts 能看到
 
+4. **会话认证中 IP/User-Agent 仅记录不校验**
+   - 原有结论："会话与 IP、User-Agent 绑定"
+   - 代码事实：仅记录，不校验
+   - **影响**：Cookie 被窃取后可在任意 IP/设备上使用
+
 ### B. 潜在改进方向
 
 1. 统一各函数的账户过滤策略（或在 GetAccounts 中也使用 visible）
 2. 移除 Schema 中无效的 `page_size` 参数，或在代码中真正支持它
 3. 考虑为 AI 提供明确的"是否包含停用账户"参数选项
 4. 在系统指令中明确各函数的数据范围差异，帮助 AI 理解并向用户说明
-
+5. 考虑增加会话的 IP/User-Agent 校验机制（或明确说明仅用于审计）
