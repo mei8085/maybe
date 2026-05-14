@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档详细描述了从原始交易描述到最终匹配商户记录的完整识别链路，包括跨模块的判定规则、优先级机制和兜底分支。
+本文档详细描述了从原始交易描述到最终匹配商户记录的完整识别链路，包括跨模块的判定规则、执行顺序、优先级机制和兜底分支。
 
 ---
 
@@ -35,31 +35,50 @@ Merchant (基类)
 
 ---
 
-## 二、完整识别链路总览
+## 二、完整识别执行时序总览
+
+### 2.1 执行顺序流程图
 
 ```
 交易数据入口
     │
-    ├─→ 1. Plaid 同步阶段 (PlaidEntry::Processor)
-    │       ├─→ 匹配 Plaid merchant_entity_id
-    │       └─→ 创建/复用 ProviderMerchant (source: plaid)
+    ├─→ 阶段 1: Plaid 同步识别 [最先执行]
+    │       时机: 交易同步时自动执行
+    │       条件: Plaid 返回 merchant_entity_id + merchant_name
+    │       来源: plaid
+    │       行为: enrich_attribute + 隐式不锁定（依赖后续阶段锁定）
     │
-    ├─→ 2. 规则引擎阶段 (Rule::ActionExecutor)
-    │       ├─→ SetTransactionMerchant (规则手动指定)
-    │       └─→ AutoDetectMerchants (触发 AI 自动识别)
-    │               └─→ 异步调度: AutoDetectMerchantsJob
+    ├─→ 阶段 2: 用户手动编辑 [最高优先级，可随时执行]
+    │       时机: 用户通过 API 编辑交易
+    │       条件: 用户提交 merchant_id 参数
+    │       行为: 直接 save + lock_saved_attributes! 锁定
+    │       注意: 不记录 DataEnrichment 审计日志
     │
-    └─→ 3. AI 自动识别阶段 (Family::AutoMerchantDetector)
-            ├─→ 过滤 enrichable 交易
-            ├─→ 调用 OpenAI LLM API
-            ├─→ 匹配用户已有商户 (优先级高)
-            ├─→ 创建 AI ProviderMerchant (兜底)
-            └─→ 锁定 merchant_id 属性
+    └─→ 阶段 3: 规则引擎执行 [第二优先级]
+            │
+            ├─→ 动作 A: SetTransactionMerchant (规则直接指定)
+            │       时机: 规则匹配触发
+            │       默认条件: merchant_id 未锁定 (enrichable)
+            │       强制条件: ignore_attribute_locks: true 可绕过锁定
+            │       来源: rule
+            │       行为: enrich_attribute + 不自动锁定
+            │
+            └─→ 动作 B: AutoDetectMerchants (触发 AI 批量识别)
+                    时机: 规则匹配触发
+                    条件: merchant_id 未锁定 (enrichable)
+                    行为: 调度异步任务 (每批 20 笔)
+                        ↓
+                        └─→ 阶段 4: AI 自动识别 [最后执行]
+                                时机: 异步任务执行
+                                条件: merchant_id == nil AND 未锁定
+                                来源: ai
+                                行为: 匹配商户 OR 创建 AI 商户 OR 识别失败
+                                关键: 无论成功与否，强制 lock_attr!(:merchant_id)
 ```
 
 ---
 
-## 三、阶段一：Plaid 同步自动识别
+## 三、阶段 1: Plaid 同步自动识别
 
 ### 3.1 处理流程 (`app/models/plaid_entry/processor.rb:39-45`)
 
@@ -94,17 +113,52 @@ end
 ```
 
 **判定规则**:
-1. **必须同时满足**: Plaid 返回 `merchant_entity_id` AND `merchant_name`
-2. **查找/创建**: 按 `source: "plaid"` + `name` 唯一键查找或创建
-3. **兜底分支**: 任一条件不满足 → 跳过，留待后续阶段处理
+1. **前置条件**: Plaid 必须同时返回 `merchant_entity_id` AND `merchant_name`
+2. **查找/创建**: 按 `source: "plaid"` + `name` 唯一键查找或创建 ProviderMerchant
+3. **兜底分支**: 任一条件不满足 → 返回 nil，不设置 merchant_id
+4. **锁定行为**: 仅设置值，不执行 `lock_attr!`，属性保持可 enrichable 状态
 
 ---
 
-## 四、阶段二：规则引擎触发
+## 四、阶段 2: 用户手动编辑（最高优先级）
 
-### 4.1 规则动作类型
+### 4.1 处理流程 (`app/controllers/api/v1/transactions_controller.rb:107-121`)
 
-#### A. SetTransactionMerchant (手动指定商户)
+```ruby
+def update
+  if @entry.update(entry_params_for_update)
+    @entry.sync_account_later
+    @entry.lock_saved_attributes!  # 锁定所有被修改的属性
+    # ...
+  end
+end
+```
+
+### 4.2 锁定机制 (`app/models/concerns/enrichable.rb:69-73`)
+
+```ruby
+def lock_saved_attributes!
+  saved_changes.keys.reject do |attr|
+    ignored_enrichable_attributes.include?(attr)
+  end.each do |attr|
+    lock_attr!(attr)
+  end
+end
+```
+
+**关键行为**:
+1. **执行时机**: 用户创建或更新交易后自动执行
+2. **锁定范围**: 所有被修改的属性（包括 merchant_id）
+3. **审计日志**: ❌ 不通过 `enrich_attribute`，不记录 DataEnrichment
+4. **优先级**: ⭐⭐⭐⭐⭐ 最高优先级，锁定后阻止所有后续自动识别
+
+---
+
+## 五、阶段 3: 规则引擎触发
+
+### 5.1 规则动作类型
+
+#### A. SetTransactionMerchant (规则直接指定商户)
 **文件**: `app/models/rule/action_executor/set_transaction_merchant.rb:1-27`
 
 ```ruby
@@ -121,9 +175,10 @@ end
 ```
 
 **判定规则**:
-1. **前置检查**: 商户必须存在于家庭商户列表中
-2. **锁定检查**: 默认仅处理 `enrichable(:merchant_id)` 的交易
-3. **强制覆盖**: `ignore_attribute_locks: true` 可绕过锁定机制
+1. **前置检查**: 商户必须存在于家庭商户列表中（FamilyMerchant）
+2. **默认锁定检查**: 仅处理 `enrichable(:merchant_id)` 的交易
+3. **强制覆盖模式**: `ignore_attribute_locks: true` 可绕过锁定机制
+4. **锁定行为**: 仅设置值，不执行 `lock_attr!`
 
 #### B. AutoDetectMerchants (触发 AI 批量识别)
 **文件**: `app/models/rule/action_executor/auto_detect_merchants.rb:1-23`
@@ -142,13 +197,14 @@ end
 **调度机制**:
 - **批量大小**: 每批 20 笔交易
 - **异步执行**: 通过 `AutoDetectMerchantsJob` 放入 `medium_priority` 队列
+- **锁定检查**: 仅调度 `enrichable(:merchant_id)` 的交易，不可绕过
 - **文件**: `app/jobs/auto_detect_merchants_job.rb:1-7`
 
 ---
 
-## 五、阶段三：AI 自动识别核心逻辑
+## 六、阶段 4: AI 自动识别核心逻辑
 
-### 5.1 入口与范围过滤 (`app/models/family/auto_merchant_detector.rb:1-98`)
+### 6.1 入口与范围过滤 (`app/models/family/auto_merchant_detector.rb:1-98`)
 
 ```ruby
 def scope
@@ -158,12 +214,12 @@ def scope
 end
 ```
 
-**前置过滤条件**:
+**前置过滤条件 (必须同时满足)**:
 1. ✅ 在指定 `transaction_ids` 范围内
 2. ✅ 当前 `merchant_id` 为 `nil` (未匹配)
 3. ✅ `merchant_id` 属性未被锁定 (`enrichable`)
 
-### 5.2 LLM API 调用 (OpenAI)
+### 6.2 LLM API 调用 (OpenAI)
 **文件**: `app/models/provider/openai/auto_merchant_detector.rb:1-146`
 
 #### 输入数据结构
@@ -211,7 +267,7 @@ Determining a value:
 Confidence threshold: 80%+ → return value, else return "null"
 ```
 
-### 5.3 核心匹配与兜底分支
+### 6.3 核心匹配与兜底分支
 
 ```ruby
 scope.each do |transaction|
@@ -240,25 +296,28 @@ scope.each do |transaction|
     transaction.enrich_attribute(:merchant_id, merchant_id, source: "ai")
   end
 
-  # 无论成功与否，锁定属性防止重复识别
+  # 🔴 关键: 无论成功与否，强制锁定属性防止重复识别
   transaction.lock_attr!(:merchant_id)
 end
 ```
 
 ---
 
-## 六、匹配优先级与判定规则总结
+## 七、商户匹配优先级与生效条件总结
 
-### 6.1 商户匹配优先级 (从高到低)
+### 7.1 按执行时序与优先级排序
 
-| 优先级 | 商户类型 | 来源 | 说明 |
-|--------|----------|------|------|
-| 1️⃣ 最高 | FamilyMerchant | 用户手动创建 | LLM 识别结果与用户已有商户精确匹配 |
-| 2️⃣ 高 | ProviderMerchant | Plaid API | 交易同步时 Plaid 提供的商户实体 |
-| 3️⃣ 中 | ProviderMerchant | AI (OpenAI) | LLM 识别后创建的新商户 |
-| 4️⃣ 最低 | FamilyMerchant | Rule 规则 | 用户配置的规则手动指定 |
+| 顺序 | 阶段 | 商户类型 | 来源 | 生效条件 | 锁定行为 |
+|------|------|----------|------|----------|----------|
+| 1 | Plaid 同步 | ProviderMerchant | plaid | Plaid 返回 merchant_entity_id + merchant_name | 不锁定 |
+| 2 | 规则指定 | FamilyMerchant | rule | 商户存在 + (属性未锁定 OR ignore_attribute_locks) | 不锁定 |
+| 3 | AI 识别匹配 | FamilyMerchant | ai | LLM 识别名称与用户已有商户精确匹配 | 识别后锁定 |
+| 4 | AI 识别创建 | ProviderMerchant | ai | LLM 返回 business_name + business_url | 识别后锁定 |
+| 5 | 用户编辑 | FamilyMerchant/ ProviderMerchant | (无) | 用户通过 API 提交 merchant_id | 编辑后强制锁定 |
 
-### 6.2 LLM 内部判定层级
+> **注意**: 用户编辑虽在表格中排第 5，但实际可在任意时间点执行，且锁定后会阻止所有后续自动识别。
+
+### 7.2 LLM 内部判定层级
 
 ```
 LLM 判定流程:
@@ -272,48 +331,89 @@ LLM 判定流程:
     └─→ 第三层: 置信度 < 80% → 返回 null
 ```
 
-### 6.3 防止重复处理机制
+### 7.3 属性锁定机制详解
 
 **Enrichable 模块** (`app/models/concerns/enrichable.rb:1-91`)
 
 ```ruby
-# 锁定属性，防止后续规则/AI 覆盖
+# 锁定单个属性，记录锁定时间
 def lock_attr!(attr)
   update!(locked_attributes: locked_attributes.merge(attr.to_s => Time.current))
 end
 
-# 仅处理未锁定的属性
+# 查询范围: 仅包含未锁定指定属性的记录
 scope :enrichable, ->(attrs) {
   attrs = Array(attrs).map(&:to_s)
   where.not(Arel.sql("#{table_name}.locked_attributes ?| array[:keys]"), keys: attrs)
 }
 ```
 
-**关键行为**:
-- AI 识别完成后 **无论成功与否**，都会执行 `lock_attr!(:merchant_id)`
-- 被锁定的交易不会再进入后续的自动识别流程
-- 用户手动编辑具有最高优先级，可解锁并覆盖
+**锁定触发时机**:
+
+| 触发点 | 锁定范围 | 说明 |
+|--------|----------|------|
+| AI 识别完成后 | `merchant_id` | 无论识别成功或失败，强制锁定 |
+| 用户编辑交易后 | 所有被修改的属性 | 通过 `lock_saved_attributes!` |
+| 规则 SetTransactionMerchant | ❌ 不锁定 | 仅设置值，不自动锁定 |
+| Plaid 同步识别 | ❌ 不锁定 | 仅设置值，不自动锁定 |
 
 ---
 
-## 七、兜底分支汇总
+## 八、兜底分支与异常处理汇总
+
+### 8.1 各阶段兜底条件一览
 
 | 阶段 | 兜底条件 | 处理方式 |
 |------|----------|----------|
-| **Plaid 同步** | 缺少 merchant_entity_id 或 merchant_name | 跳过，merchant_id 保持 nil |
-| **规则执行** | 商户 ID 不存在 | 静默跳过，不做处理 |
+| **Plaid 同步** | 缺少 merchant_entity_id 或 merchant_name | 返回 nil，不设置 merchant_id |
+| **规则 SetTransactionMerchant** | 商户 ID 不存在 | 静默跳过，不做处理 |
+| **规则 SetTransactionMerchant** | 属性已锁定且未启用 ignore_attribute_locks | 跳过该交易 |
 | **LLM 识别** | 置信度 < 80% | 返回 business_name: null, business_url: null |
 | **LLM 识别** | 通用交易名称 (Paycheck, Grocery store 等) | 返回 null |
-| **商户匹配** | LLM 返回 null | 不设置 merchant_id，但锁定属性 |
-| **商户匹配** | 未匹配到用户商户但有 business_url | 创建 ProviderMerchant (source: ai) |
+| **AI 商户匹配** | LLM 返回 null | 不设置 merchant_id，但强制锁定属性 |
+| **AI 商户匹配** | 未匹配到用户商户但有 business_url | 创建 ProviderMerchant (source: ai) |
+
+### 8.2 AI 识别失败锁定的影响与兜底
+
+#### 🔴 关键行为：识别失败仍锁定属性
+
+**代码位置**: `app/models/family/auto_merchant_detector.rb:62`
+
+```ruby
+# 无论成功与否，锁定属性防止重复识别
+transaction.lock_attr!(:merchant_id)
+```
+
+#### 影响分析
+
+| 影响项 | 说明 |
+|--------|------|
+| **不再重试** | 锁定后 `enrichable(:merchant_id)` 范围排除该交易，后续 AI 识别永不再重试 |
+| **规则限制** | 普通规则执行（无 ignore_attribute_locks）无法修改该交易的 merchant_id |
+| **Plai 同步覆盖** | Plaid 同步如在 AI 识别之后执行，也无法覆盖（因属性已锁定） |
+
+#### 兜底方案
+
+| 场景 | 兜底方式 |
+|------|----------|
+| 用户需要修改被锁定的商户 | ✅ 通过 API 手动编辑（用户编辑不受锁定限制） |
+| 规则需要强制覆盖 | ✅ 启用 `ignore_attribute_locks: true` |
+| 需要重新触发 AI 识别 | ⚠️ 需手动解锁：`transaction.unlock_attr!(:merchant_id)` |
 
 ---
 
-## 八、数据流转追踪
+## 九、DataEnrichment 审计日志
 
-### 8.1 DataEnrichment 审计日志
+### 9.1 来源枚举（代码依据）
+**文件**: `app/models/data_enrichment.rb:4`
 
-每次 `enrich_attribute` 调用都会创建审计记录:
+```ruby
+enum :source, { rule: "rule", plaid: "plaid", synth: "synth", ai: "ai" }
+```
+
+> **重要**: `user` 来源不存在于代码枚举中。用户手动编辑不通过 `enrich_attribute` 流程，因此不会记录 DataEnrichment 审计日志。
+
+### 9.2 日志记录逻辑
 
 ```ruby
 def log_enrichment(attribute_name:, attribute_value:, source:, metadata: {})
@@ -328,25 +428,25 @@ def log_enrichment(attribute_name:, attribute_value:, source:, metadata: {})
 end
 ```
 
-**Source 来源枚举**:
+**Source 实际来源**:
 - `plaid` - Plaid API 自动识别
 - `rule` - 规则引擎设置
 - `ai` - OpenAI LLM 自动识别
-- `user` - 用户手动编辑 (最高优先级)
+- `synth` - 系统内置合成数据
 
 ---
 
-## 九、关键约束与边界条件
+## 十、关键约束与边界条件
 
-### 9.1 批量限制
+### 10.1 批量限制
 - OpenAI API 单次请求最大 25 笔交易 (`app/models/provider/openai.rb:31`)
 - 规则调度按每批 20 笔异步执行
 
-### 9.2 唯一性约束
+### 10.2 唯一性约束
 - FamilyMerchant: `family_id + name` 唯一
 - ProviderMerchant: `source + name` 唯一
 
-### 9.3 幂等性保证
+### 10.3 幂等性保证
 - ProviderMerchant 使用 `find_or_create_by!` 确保幂等
 - `locked_attributes` 机制防止重复处理
 
@@ -364,3 +464,5 @@ end
 | `app/models/rule/action_executor/set_transaction_merchant.rb` | 规则设置商户 |
 | `app/models/provider_merchant.rb` | 第三方商户模型 |
 | `app/models/merchant.rb` | 商户基类 |
+| `app/models/data_enrichment.rb` | 数据丰富审计日志模型 |
+| `app/controllers/api/v1/transactions_controller.rb` | 交易编辑 API |
