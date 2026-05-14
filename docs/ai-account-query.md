@@ -8,6 +8,7 @@ Maybe Finance 的 AI 助手通过工具函数（Function Calling）机制，为�
 1. 各查询函数对停用/待删除账户的过滤行为差异
 2. 分页机制的真实限制及参数传递链路
 3. 会话认证中 IP、User-Agent 的真实处理逻辑
+4. **Cookie 安全语义：`signed` 与 `encrypted` 的差异及措辞偏差影响**
 
 ---
 
@@ -546,22 +547,100 @@ end
 ```
 
 **认证流程**：
-1. 请求到达时，从 Cookie 中读取加密的 `session_token`
+1. 请求到达时，从 Cookie 中读取签名的 `session_token`
 2. 通过 `Session.find_by(id: cookie_value)` 查找会话记录
 3. 若会话有效，设置 `Current.session`
 4. 否则重定向到登录页面
 
 ---
 
-### 4.3 IP、User-Agent 的真实处理逻辑（⚠️ 核心校正）
+### 4.3 Cookie 安全语义：`signed` 与 `encrypted` 的差异（⚠️ 核心校正）
+
+#### ⚠️ 原有表述错误
+
+**错误表述**："Cookie 采用 `signed` + `permanent` **加密存储**"
+
+**问题**：`signed` 不是加密，是签名。
+
+#### 代码事实
+
+**实际使用的方式**（`app/controllers/concerns/authentication.rb:31, 42`）：
+```ruby
+# 读取时
+cookie_value = cookies.signed[:session_token]
+
+# 写入时
+cookies.signed.permanent[:session_token] = { value: session.id, httponly: true }
+```
+
+#### Rails 中 `signed` 与 `encrypted` 的核心差异
+
+| 特性 | `signed`（当前使用） | `encrypted`（未使用） |
+|------|---------------------|---------------------|
+| **保护目标** | 防篡改 | 防篡改 + 防读取 |
+| **内容可见性** | ✅ **可读**（Base64 编码） | ❌ **不可读**（AES 加密） |
+| **使用方式** | `cookies.signed[:key]` | `cookies.encrypted[:key]` |
+| **数据存储** | 原始值 + HMAC 签名 | 加密后的密文 |
+
+#### 详细解释
+
+**`signed` Cookie 的工作原理**：
+
+1. 服务器生成 Session ID（如 `"abc123"`）
+2. 使用应用的 `secret_key_base` 计算 HMAC 签名
+3. 最终 Cookie 值格式：`"abc123" + "--" + Base64(HMAC)`
+4. 整个值再用 Base64 编码
+
+**结果**：
+- 攻击者可以 Base64 解码看到原始 Session ID
+- 攻击者**不能**修改它（因为没有 secret_key_base，无法生成有效签名）
+- 服务器读取时会验证签名，篡改会被检测到
+
+**`encrypted` Cookie 的工作原理**：
+
+1. 服务器生成 Session ID（如 `"abc123"`）
+2. 使用 AES-GCM 加密算法对值进行加密
+3. 最终 Cookie 值是密文
+
+**结果**：
+- 攻击者无法看到原始 Session ID
+- 攻击者无法修改它
+- 提供了更强的保密性
+
+#### 实际 Cookie 内容示例
+
+假设 Session ID 为 `"3fa85f64-5717-4562-b3fc-2c963f66afa6"`：
+
+**使用 `signed` 时**：
+```
+Cookie 值（Base64 编码后）：
+"M2ZhODVmNjQtNTcxNy00NTYyLWIzZmMtMmM5NjNmNjZhZmE2LS1kaDEyc2lnbmF0dXJl"
+
+Base64 解码后：
+"3fa85f64-5717-4562-b3fc-2c963f66afa6--d12signature"
+
+可以看到原始 Session ID："3fa85f64-5717-4562-b3fc-2c963f66afa6"
+```
+
+**使用 `encrypted` 时**：
+```
+Cookie 值（密文）：
+"encrypted_data_here...iv_and_tag..."
+
+无法直接看到原始 Session ID
+```
+
+---
+
+### 4.4 IP、User-Agent 的真实处理逻辑（⚠️ 核心校正）
 
 #### ⚠️ 原有结论错误
 
-**错误结论**："会话与用户 IP、User-Agent 绑定
+**错误结论**："会话与用户 IP、User-Agent 绑定"
 
 **代码事实**：
 
-**Session 创建时记录（`app/models/session.rb:8-11`）：
+**Session 创建时记录**（`app/models/session.rb:8-11`）：
 ```ruby
 before_create do
   self.user_agent = Current.user_agent  # 记录 User-Agent
@@ -569,7 +648,7 @@ before_create do
 end
 ```
 
-**会话认证时（`app/controllers/concerns/authentication.rb:30-38`）：
+**会话认证时**（`app/controllers/concerns/authentication.rb:30-38`）：
 ```ruby
 def find_session_by_cookie
   cookie_value = cookies.signed[:session_token]
@@ -626,13 +705,54 @@ end
 
 #### 安全特性（实际存在的）
 
-- Cookie 采用 `signed` + `permanent` 加密存储
-- 设置 `httponly: true` 防止 XSS 攻击
+- Cookie 采用 `signed` 签名，防止值被篡改
+- Cookie 采用 `permanent` 设置长期有效
+- 设置 `httponly: true` 防止 XSS 攻击（浏览器端 JavaScript 无法访问）
+- ⚠️ 注意：Cookie 内容**可读**（Base64 可解码），只是**不能篡改**
 - ⚠️ 注意：没有 IP/User-Agent 绑定校验
 
 ---
 
-### 4.4 第二层：Chat 归属校验
+### 4.5 措辞偏差对风险评估的影响
+
+#### 为什么"加密"一词误导风险判断
+
+| 方面 | "加密"表述暗示的风险 | 实际风险（`signed`） |
+|------|---------------------|---------------------|
+| **内容保密性** | 攻击者无法看到 Session ID | ❌ 攻击者可以 Base64 解码看到 Session ID |
+| **Cookie 窃取风险** | 即使 Cookie 被偷，攻击者无法解密 | ❌ Cookie 被偷后，攻击者可以直接看到 Session ID 并使用 |
+| **对 HTTPS 的依赖理解** | 可能认为有了"加密"就够了 | ⚠️ 需要认识到 HTTPS 是防止网络传输中被窃取的关键 |
+| **安全评估偏差** | 可能低估 Cookie 保护的重要性 | ⚠️ 需要明确：`signed` 只防篡改，不防读取 |
+
+#### 具体影响
+
+**场景 1：Cookie 被窃取**
+
+- **错误理解**："Cookie 是加密的，即使被偷也没事"
+- **实际情况**：Cookie 内容可解码，攻击者可以直接看到 Session ID 并使用
+
+**场景 2：本地存储安全**
+
+- **错误理解**："Cookie 是加密的，浏览器存储相对安全"
+- **实际情况**：任何能访问浏览器存储的程序都可以读取和使用该 Cookie
+
+**场景 3：XSS 攻击防护**
+
+- **`httponly: true`**：这是真正有效的防护，阻止 JavaScript 访问 Cookie
+- **注意**：`signed` 和 `encrypted` 都不能替代 `httponly`
+
+#### 正确的风险认知
+
+| 威胁 | `signed` 能防护吗 | `httponly` 能防护吗 | HTTPS 能防护吗 |
+|------|------------------|-------------------|---------------|
+| **Cookie 值被篡改** | ✅ 能（签名验证） | ❌ 不能 | ❌ 不能 |
+| **XSS 攻击读取 Cookie** | ❌ 不能（内容可读） | ✅ 能（JS 无法访问） | ❌ 不能 |
+| **网络传输中被窃听** | ❌ 不能（内容可读） | ❌ 不能 | ✅ 能 |
+| **浏览器存储中被窃取** | ❌ 不能（内容可读） | ❌ 不能（浏览器可读取） | ❌ 不能 |
+
+---
+
+### 4.6 第二层：Chat 归属校验
 
 **机制**：Chat 必须属于当前登录用户
 
@@ -647,7 +767,7 @@ end
 
 ---
 
-### 4.5 第三层：工具函数作用域隔离
+### 4.7 第三层：工具函数作用域隔离
 
 **核心原则**：所有数据查询都以 `user.family` 为作用域边界
 
@@ -675,7 +795,7 @@ end
 
 ---
 
-### 4.6 数据模型层次结构
+### 4.8 数据模型层次结构
 
 ```
 Family (隔离单元)
@@ -834,7 +954,16 @@ AI 系统指令中包含明确的行为约束：
 |页码|从 1 开始|使用 `params["page"]` \|\| 1|
 |Schema 一致性|❌ 不一致|`page_size` 在 required 中声明但未使用|
 
-### 7.3 会话认证真实情况（核心校正）
+### 7.3 Cookie 安全语义（核心校正）
+
+|方面|事实|说明|
+|-----|----|-----|
+|使用方式|`cookies.signed.permanent`|使用签名，不是加密|
+|内容保密性|❌ 可读|Base64 可解码看到 Session ID|
+|防篡改能力|✅ 能防篡改|HMAC 签名验证|
+|`httponly`|✅ 已设置|防止 XSS 攻击读取 Cookie|
+
+### 7.4 会话认证真实情况（核心校正）
 
 |处理|IP|User-Agent|
 |-----|-----|----------|
@@ -846,14 +975,28 @@ AI 系统指令中包含明确的行为约束：
 - Cookie 被窃取后，即使在不同 IP/设备上仍然有效
 - IP/User-Agent 仅用于审计和 Sentry 追踪
 
-### 7.4 权限校验要点
+### 7.5 措辞偏差影响（核心校正）
+
+| 威胁 | `signed` 能防护吗 | `httponly` 能防护吗 | HTTPS 能防护吗 |
+|------|------------------|-------------------|---------------|
+| **Cookie 值被篡改** | ✅ 能（签名验证） | ❌ 不能 | ❌ 不能 |
+| **XSS 攻击读取 Cookie** | ❌ 不能（内容可读） | ✅ 能（JS 无法访问） | ❌ 不能 |
+| **网络传输中被窃听** | ❌ 不能（内容可读） | ❌ 不能 | ✅ 能 |
+| **浏览器存储中被窃取** | ❌ 不能（内容可读） | ❌ 不能（浏览器可读取） | ❌ 不能 |
+
+**关键认知**：
+- `signed` = 防篡改，但**不防读取**
+- `encrypted` = 防篡改 + 防读取（当前未使用）
+- "加密"一词会误导风险评估，应准确使用"签名"
+
+### 7.6 权限校验要点
 
 1. **入口层**：Session Cookie 认证，未登录则重定向
 2. **资源层**：Chat 必须属于 Current.user
 3. **数据层**：所有查询以 Family 为作用域边界
 4. **审计层**：模拟操作全量日志记录
 
-### 7.5 安全边界
+### 7.7 安全边界
 
 |边界类型|限制|
 |-------|-----|
@@ -863,7 +1006,7 @@ AI 系统指令中包含明确的行为约束：
 |角色权限|super_admin 才允许模拟|
 |函数调用|仅 4 个预定义函数，禁止递归|
 
-### 7.6 代码定位速查
+### 7.8 代码定位速查
 
 |组件|文件路径|
 |-----|---------|
@@ -913,6 +1056,11 @@ AI 系统指令中包含明确的行为约束：
    - 代码事实：仅记录，不校验
    - **影响**：Cookie 被窃取后可在任意 IP/设备上使用
 
+5. **Cookie 安全语义表述不准确**
+   - 原有表述："`signed` 加密存储"
+   - 代码事实：`signed` 是签名，不是加密
+   - **影响**：误导风险评估，低估 Cookie 窃取风险
+
 ### B. 潜在改进方向
 
 1. 统一各函数的账户过滤策略（或在 GetAccounts 中也使用 visible）
@@ -920,3 +1068,4 @@ AI 系统指令中包含明确的行为约束：
 3. 考虑为 AI 提供明确的"是否包含停用账户"参数选项
 4. 在系统指令中明确各函数的数据范围差异，帮助 AI 理解并向用户说明
 5. 考虑增加会话的 IP/User-Agent 校验机制（或明确说明仅用于审计）
+6. 考虑使用 `cookies.encrypted` 替代 `cookies.signed` 以增强 Cookie 保密性
