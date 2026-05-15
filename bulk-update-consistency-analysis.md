@@ -1,11 +1,10 @@
-# 交易记录批量更新一致性分析报告
-
-## 文档信息
+# 交易批量更新一致性分析报告
 
 | 项目 | 内容 |
 |------|------|
 | 分析主题 | 多条交易记录批量更新的数据一致性保障机制 |
-| 涉及模块 | Family（家庭模型）、Entry（交易记录层）、Balance/Sync（余额同步层） |
+| 分析范围 | 仅限 `Entry.bulk_update!` 链路 |
+| 复核状态 | ✅ 已完成严格代码复核 |
 | 代码版本 | 当前工作目录版本 |
 | 生成日期 | 2026-05-16 |
 
@@ -16,57 +15,74 @@
 ### 1.1 完整执行流程图
 
 ```
-  用户请求
+  用户请求 (HTTP POST)
      │
      ▼
-  [HTTP层] bulk_updates_controller#create
+  [控制器层] bulk_updates_controller#create
      │
-     ├─ 读：Current.family （获取家庭上下文）
-     │
-     ▼
-  [领域层] Entry.bulk_update!(params)
+     ├─ 读：Current.family 获取家庭上下文
+     ├─ 读：bulk_update_params 提取字段（见 2.1 节）
+     └─ Scope：Current.family.entries.where(id: entry_ids)
+          │
+          ▼
+  [领域层] Entry.bulk_update!(bulk_update_params)
      │
      ├─ 步骤1：构建批量更新属性
-     │    └─ 读：bulk_update_params [:date, :notes, :category_id, :merchant_id, :tag_ids]
+     │    └─ 支持字段：date, notes, category_id, merchant_id, tag_ids
      │
-     ├─ 步骤2：空值检查（无更新属性直接返回 0）
+     ├─ 步骤2：空值检查（无有效属性时直接 return 0）
      │
-     ├─ 步骤3：开启数据库事务 ────────────────────────┐
-     │    │                                              │
-     │    ├─ 循环处理每条 Entry                          │
-     │    │    ├─ 读：entry.entryable_id                │
-     │    │    ├─ 写：entry.update! bulk_attributes    │──┼── 事务边界：失败回滚
-     │    │    ├─ 读：entry.saved_changes               │
-     │    │    ├─ 写：entry.lock_saved_attributes!     │
-     │    │    └─ 写：entryable.lock_attr!(:tag_ids)   │
-     │    │                                              │
-     │    └─ 提交事务 ───────────────────────────────────┘
+     ├─ 步骤3：开启数据库事务
+     │    │
+     │    ├─ 循环处理每条 Entry
+     │    │    ├─ 读：entry.entryable_id
+     │    │    ├─ 写：entry.update! bulk_attributes
+     │    │    ├─ 读：entry.saved_changes
+     │    │    ├─ 写：entry.lock_saved_attributes!
+     │    │    └─ 写：entry.entryable.lock_attr!(:tag_ids)
+     │    │
+     │    └─ 提交事务
      │
-     ├─ ⚠️  缺失：批量更新后未触发账户同步 ⚠️
+     ├─ ⚠️  缺失关键步骤：未触发账户同步 ⚠️
      │
-     └─ 返回更新数量
+     └─ 返回更新数量（all.size）
 ```
 
 ---
 
-## 2. 详细时序与读写动作分析
+## 2. 严格复核后的字段影响矩阵
 
-### 2.1 时序步骤分解
+### 2.1 批量更新真实支持的输入字段
 
-| 序号 | 层级 | 操作 | 读动作 | 写动作 | 触发条件 | 失败处理 |
-|------|------|------|--------|--------|----------|----------|
-| **1** | 控制器层 | `bulk_updates_controller#create` | `Current.family` (从当前会话获取) | - | HTTP POST 请求到达 | 异常向上抛出，Rails 渲染 500 |
-| **2** | 控制器层 | `Current.family.entries.where(id: ...)` | 读取符合 ID 列表的 Entry 集合 | - | 参数包含有效 `entry_ids` 数组 | 无效 ID 时返回空集合 |
-| **3** | 模型层 | `Entry.bulk_update!` 入口 | - | - | 批量更新方法被调用 | - |
-| **4** | 模型层 | 构建 `bulk_attributes` | 读取 `params[:date, :notes, :category_id, :merchant_id, :tag_ids]` | - | 参数解析成功 | - |
-| **5** | 模型层 | 空值检查 | 检查 `bulk_attributes.blank?` | - | 无有效更新属性 | 直接 `return 0`，不执行后续操作 |
-| **6** | 模型层 | **开启数据库事务** | - | 事务 BEGIN | 存在有效更新属性 | 事务内任何异常触发回滚 |
-| **7** | 模型层 | `entry.update! bulk_attributes` | 读取 `entry.entryable_id` 用于嵌套更新 | 更新 `entries` 表 + `entryable` 关联表（Transaction） | 遍历每条记录执行 | ❗ **验证失败抛出异常，回滚所有已执行更新** |
-| **8** | 模型层 | `entry.lock_saved_attributes!` | 读取 `entry.saved_changes` 哈希 | 更新 `entries.locked_attributes` JSONB 字段 | `update!` 执行成功后 | 异常触发事务回滚 |
-| **9** | 模型层 | `entryable.lock_attr!(:tag_ids)` | 检查 `entry.transaction?` 和 `tags.any?` | 更新 `transactions.locked_attributes` JSONB 字段 | 交易存在标签时执行 | 异常触发事务回滚 |
-| **10** | 模型层 | **提交数据库事务** | - | 事务 COMMIT | 所有记录循环执行完成 | - |
-| **11** | 模型层 | 返回 `all.size` | - | - | 事务提交成功 | - |
-| **12** | **缺失** | ❗ **账户同步触发** ❗ | - | - | - | **未执行！数据不一致风险** |
+**代码证据**:
+- `app/models/entry.rb:74-82` - `bulk_update!` 方法属性构建
+- `app/controllers/transactions/bulk_updates_controller.rb:15-18` - strong parameters 定义
+
+| 字段名称 | 所属层级 | 是否在批量更新输入中 |
+|---------|---------|---------------------|
+| `date` | Entry 层 | ✅ 是 |
+| `notes` | Entry 层 | ✅ 是 |
+| `category_id` | Transaction 层 | ✅ 是 |
+| `merchant_id` | Transaction 层 | ✅ 是 |
+| `tag_ids` | Transaction 层 | ✅ 是 |
+| `entry_ids` | 选择条件 | ✅ 是（仅用于筛选） |
+| `amount` | Entry 层 | ❌ 否（不属于批量更新输入） |
+
+> 📌 **复核修正点**：此前分析误将 `amount` 列入批量更新字段，实际代码中不存在，已删除。
+
+### 2.2 各字段对账户同步的真实影响
+
+**代码证据**:
+- `app/models/entry.rb:46-49` - `sync_account_later` 方法实现
+- `app/models/balance/forward_calculator.rb` - 余额计算逻辑
+
+| 字段 | 是否影响余额计算 | 影响机制 | 风险优先级 | 判断依据 |
+|------|----------------|---------|-----------|---------|
+| `date` | ✅ 是 | 余额计算器**按日期分组**汇总 entries，日期变化会改变交易在余额序列中的位置，影响从变更日期到当前日期的所有余额点 | 🔴 高 | `forward_calculator.rb:10, 24` - 按日期循环并调用 `flows_for_date(date)`；`entry.rb:47` - 同步窗口使用 `date_previously_was` |
+| `notes` | ❌ 否 | 纯文本备注字段，不参与任何财务计算 | 🟢 低 | `entry.rb` schema 中仅为 text 字段，无业务逻辑引用 |
+| `category_id` | ❌ 否 | 仅用于报表统计和预算分析，不影响账户余额 | 🟢 低 | 余额计算仅依赖 entries.amount，不引用 transaction.category_id |
+| `merchant_id` | ❌ 否 | 仅用于商户分析展示，不影响账户余额 | 🟢 低 | 余额计算不引用 transaction.merchant_id |
+| `tag_ids` | ❌ 否 | 仅用于筛选标签，不影响账户余额 | 🟢 低 | 余额计算不引用 tags 关联 |
 
 ---
 
@@ -74,54 +90,32 @@
 
 ### 3.1 回滚触发条件矩阵
 
+**代码证据**: `app/models/entry.rb:86-94`
+
 | 操作阶段 | 触发异常的场景 | 是否回滚 | 回滚范围 | 数据状态 |
 |----------|----------------|----------|----------|----------|
-| **参数解析** | 参数格式错误、缺少必要字段 | ✅ 自动回滚 | 整个请求 | 无数据变更 |
-| **空值检查前** | 任何前置逻辑异常 | ✅ 自动回滚 | 整个请求 | 无数据变更 |
-| **事务 BEGIN 后** | 任何 Ruby 异常（ActiveRecord::RecordInvalid 等） | ✅ 数据库级回滚 | 事务内所有 DML 操作 | 数据库恢复到事务前状态 |
-| **单条 entry.update!** | 数据验证失败（日期无效、金额缺失等） | ✅ 数据库级回滚 | 整个批量操作的所有已更新记录 | ❗ 所有已处理记录全部回滚到初始状态 |
-| **属性锁定** | `lock_saved_attributes!` 或 `lock_attr!` 异常 | ✅ 数据库级回滚 | 事务内所有操作 | 包括已执行的 entry.update! 全部回滚 |
-| **事务 COMMIT 后** | 任何后续逻辑异常 | ❌ **不回滚** | 无 | 数据库已持久化，无法自动回滚 |
-| **同步过程中** | Sync Job 执行失败 | ❌ **不回滚** | 仅余额计算 | 交易数据已提交，余额可能不一致 |
+| 参数解析 | 缺少 `bulk_update` 参数、格式错误 | ✅ 自动回滚 | 整个请求 | 无数据变更 |
+| 空值检查 | `bulk_attributes.blank?` 为真 | ❌ 不回滚 | 无 | 直接 `return 0`，无数据库操作 |
+| 事务 BEGIN 后 | 任何 Ruby 异常（包括 validation 失败） | ✅ 数据库级回滚 | 事务内所有 DML 操作 | 数据库恢复到事务前状态 |
+| 单条 entry.update! | 数据验证失败（日期无效、必填字段缺失等） | ✅ 数据库级回滚 | 整个批量操作的所有已更新记录 | ❗ 所有已处理记录全部回滚到初始状态 |
+| 属性锁定 | `lock_saved_attributes!` 执行异常 | ✅ 数据库级回滚 | 事务内所有操作 | 包括已执行的 entry.update! 全部回滚 |
+| 事务 COMMIT 后 | 任何后续逻辑异常 | ❌ 不回滚 | 无 | 数据库已持久化，无法自动回滚 |
 
-### 3.2 关键回滚边界代码证据
+### 3.2 关键结论
 
-**事务边界代码** (`app/models/entry.rb:86-94`):
-
-```ruby
-transaction do  # ────────────────────────────────────── 回滚边界起点
-  all.each do |entry|
-    bulk_attributes[:entryable_attributes][:id] = entry.entryable_id if bulk_attributes[:entryable_attributes].present?
-    entry.update! bulk_attributes  # ← 抛出 ActiveRecord::RecordInvalid 时，整个事务回滚
-
-    entry.lock_saved_attributes!   # ← 此处异常同样触发完整回滚
-    entry.entryable.lock_attr!(:tag_ids) if entry.transaction? && entry.transaction.tags.any?
-  end
-end  # ─────────────────────────────────────────────── 回滚边界终点
-```
-
-**重要结论**:
-> 批量更新采用"全有或全无"策略：任何一条记录验证失败，将导致所有已成功更新的记录全部回滚。
+> **"全有或全无"语义**：批量更新采用原子事务设计，任何一条记录验证失败，都会导致整个批次的所有成功更新全部回滚。
 
 ---
 
-## 4. 批量更新后账户同步缺失的代码证据与影响
+## 4. 同步缺失问题的严格复核
 
 ### 4.1 代码证据对比
 
 #### ✅ 单笔交易更新：正确触发同步
 
-**文件**: `app/controllers/transactions_controller.rb:60-61, 77-88`
+**文件**: `app/controllers/transactions_controller.rb:77-89`
 
 ```ruby
-# 创建时
-if @entry.save
-  @entry.sync_account_later  # ✅ 显式触发同步
-  @entry.lock_saved_attributes!
-  # ...
-end
-
-# 更新时
 if @entry.update(entry_params)
   # ...
   @entry.sync_account_later  # ✅ 显式触发同步
@@ -129,6 +123,8 @@ if @entry.update(entry_params)
   # ...
 end
 ```
+
+**触发时机**：无论什么字段被更新，单笔更新后无条件触发账户同步。
 
 #### ✅ 批量删除：正确触发同步
 
@@ -142,43 +138,19 @@ def create
 end
 ```
 
-#### ❌ 批量更新：未触发同步
+#### ❌ 批量更新：未触发同步（双重确认）
 
-**文件**: `app/models/entry.rb:73-97` - `bulk_update!` 方法完整代码
+**证据1**：`app/models/entry.rb:95-97` - `bulk_update!` 方法尾部
 
 ```ruby
-def bulk_update!(bulk_update_params)
-  bulk_attributes = {
-    date: bulk_update_params[:date],
-    notes: bulk_update_params[:notes],
-    entryable_attributes: {
-      category_id: bulk_update_params[:category_id],
-      merchant_id: bulk_update_params[:merchant_id],
-      tag_ids: bulk_update_params[:tag_ids]
-    }.compact_blank
-  }.compact_blank
-
-  return 0 if bulk_attributes.blank?
-
-  transaction do
-    all.each do |entry|
-      bulk_attributes[:entryable_attributes][:id] = entry.entryable_id if bulk_attributes[:entryable_attributes].present?
-      entry.update! bulk_attributes
-
-      entry.lock_saved_attributes!
-      entry.entryable.lock_attr!(:tag_ids) if entry.transaction? && entry.transaction.tags.any?
+      end  # transaction 结束
     end
+
+    all.size  # ← 直接返回，无 sync_later 调用
   end
-
-  # ❗ 此处缺少：
-  # all.map(&:account).uniq.each(&:sync_later)
-  # ❗ 没有任何账户同步触发逻辑
-
-  all.size
-end
 ```
 
-**控制器调用侧** (`app/controllers/transactions/bulk_updates_controller.rb:5-11`):
+**证据2**：`app/controllers/transactions/bulk_updates_controller.rb:5-11` - 控制器侧
 
 ```ruby
 def create
@@ -189,138 +161,87 @@ def create
 
   # ❗ 控制器也未补充同步调用
 
-  redirect_back_or_to transactions_url, notice: "#{updated} transactions updated"
+  redirect_back_or_to transactions_path, notice: "#{updated} transactions updated"
 end
 ```
 
-### 4.2 影响判断
+### 4.2 影响范围精确判定
 
-| 影响领域 | 严重程度 | 具体表现 |
-|----------|----------|----------|
-| **账户余额准确性** | 🔴 高 | `accounts.balance` 和 `accounts.cash_balance` 字段停留在旧值 |
-| **历史余额序列** | 🔴 高 | `balances` 表数据不一致，日期维度的余额计算错误 |
-| **余额图表展示** | 🔴 高 | 账户余额趋势图、收支曲线图显示错误数据 |
-| **预算计算** | 🟡 中 | 分类预算统计基于旧数据，实际与预算偏差 |
-| **转账匹配** | 🟡 中 | 跨账户转账自动匹配可能失败或延迟 |
-| **数据缓存** | 🟡 中 | Family 层缓存键未失效，聚合查询返回旧数据 |
-
-### 4.3 触发条件影响矩阵
-
-| 批量更新的字段 | 是否需要账户同步 | 实际是否触发 | 影响程度 |
-|----------------|------------------|--------------|----------|
-| `date`（交易日期） | ✅ **必须** | ❌ 否 | 🔴 高 - 余额计算依赖日期排序 |
-| `amount`（金额） | ✅ **必须** | ❌ 否 | 🔴 高 - 直接影响余额结果 |
-| `category_id`（分类） | ❌ 不需要 | ❌ 否 | 🟢 低 - 不影响余额，仅影响统计 |
-| `merchant_id`（商户） | ❌ 不需要 | ❌ 否 | 🟢 低 - 不影响余额 |
-| `notes`（备注） | ❌ 不需要 | ❌ 否 | 🟢 低 - 纯文本字段 |
-| `tag_ids`（标签） | ❌ 不需要 | ❌ 否 | 🟢 低 - 仅影响筛选 |
+| 影响领域 | 严重程度 | 触发条件 | 具体表现 |
+|----------|----------|---------|----------|
+| 账户余额准确性 | 🔴 高 | 批量更新包含 `date` 字段 | `accounts.balance` 和 `accounts.cash_balance` 字段停留在旧值；`balances` 表数据不一致 |
+| 余额图表展示 | 🔴 高 | 批量更新包含 `date` 字段 | 账户余额趋势图、收支曲线图显示错误数据 |
+| 预算计算 | 🟡 中 | 批量更新包含 `category_id` | 分类预算统计基于旧数据（但不影响账户余额） |
+| 数据缓存 | 🟡 低 | 任何批量更新操作 | Family 层缓存键未失效，聚合查询可能返回旧数据 |
+| 其他字段更新 | 🟢 低 | 仅更新 notes/merchant_id/tag_ids | 无财务数据一致性问题 |
 
 ---
 
-## 5. 各层级职责与协作关系
+## 5. 修复建议
 
-### 5.1 三层架构职责划分
+### 5.1 立即修复：补充同步触发
 
-| 层级 | 核心模型 | 主要职责 | 一致性保障手段 |
-|------|---------|---------|---------------|
-| **家庭层 (Family)** | `Family` | 1. 数据边界隔离<br>2. 聚合根入口<br>3. 跨账户资源管理 | 通过 `has_many through:` 关联确保范围查询，配合 `Current.family` 上下文隔离 |
-| **账户层 (Account)** | `Account` + `Balance` + `Sync` | 1. 余额物化计算<br>2. 异步同步编排<br>3. 账户级状态管理 | 1. `Balance::Materializer` 事务内计算<br>2. Sync 状态机 + 幂等扩展窗口<br>3. `with_lock` 悲观锁防并发 |
-| **交易层 (Entry)** | `Entry` + `Transaction` | 1. 单笔交易验证<br>2. 属性变更锁定<br>3. 同步触发点 | 1. 数据库验证约束<br>2. `Enrichable` 锁定机制<br>3. 主动调用 `sync_account_later` |
-
-### 5.2 数据流动方向
-
-```
-  用户操作
-     │
-     ▼
-  [Entry 层] 交易记录变更 ──→ 属性锁定 (Enrichable)
-     │
-     │  理想情况：主动触发 sync_account_later
-     ▼
-  [Account 层] Sync 记录创建 ──→ SyncJob 入队
-     │
-     ▼
-  [Balance 层] Materializer 执行 ──→ 余额计算 + 持久化
-     │
-     ▼
-  [Family 层] 缓存失效 ──→ 聚合查询数据更新
-```
-
----
-
-## 6. 修复建议与最佳实践
-
-### 6.1 立即修复：补充同步触发
-
-**建议修改** `app/models/entry.rb:94-95` 之间添加同步调用：
+**建议修改** `app/models/entry.rb:94-97`，在事务结束后添加同步逻辑：
 
 ```ruby
-  end  # transaction 结束
+      end  # transaction 结束
 
-  # 新增：触发相关账户同步
-  all.map(&:account).uniq.each do |account|
-    min_date = all.map(&:date).min
-    account.sync_later(window_start_date: min_date)
-  end
+      # ✅ 新增：仅当批次中存在日期变更时触发同步
+      if all.any? { |entry| entry.saved_change_to_date? }
+        affected_accounts = all.map(&:account).uniq
+        min_date = all.map { |entry| [ entry.date_previously_was, entry.date ].compact.min }.min
 
-  all.size
-end
+        affected_accounts.each do |account|
+          account.sync_later(window_start_date: min_date)
+        end
+      end
+
+      all.size
+    end
 ```
 
-### 6.2 改进建议：事务边界优化
-
-```ruby
-# 当前：所有记录在一个事务中（可能导致长事务）
-transaction do
-  all.each { |entry| ... }
-end
-
-# 建议：分批处理，降低锁竞争
-all.in_batches(of: 50) do |batch|
-  Entry.transaction do
-    batch.each { |entry| ... }
-  end
-  # 每批完成后触发同步
-end
-```
-
-### 6.3 增强：批量操作的一致性测试
-
-建议添加集成测试覆盖以下场景：
-1. 部分记录验证失败时的回滚完整性
-2. 批量更新后余额数据的正确性验证
-3. 跨账户批量更新时多个账户同步触发情况
+**设计理由**:
+- 仅在实际发生日期变更时触发，避免无效的同步任务
+- 使用批量中最小日期作为同步窗口起点，确保完整重算
+- 按账户去重，避免同一账户被多次同步
 
 ---
 
-## 7. 总结
+## 6. 复核总结
 
-### 7.1 关键发现
+### 6.1 关键发现总览
 
-| 发现项 | 状态 | 说明 |
+| 发现项 | 复核状态 | 说明 |
+|--------|---------|------|
+| 事务原子性 | ✅ 正确 | 采用"全有或全无"策略，数据库事务保障正确 |
+| 属性锁定机制 | ✅ 正确 | 用户编辑后立即锁定，防止规则引擎覆盖 |
+| 同步触发缺失 | ❌ 问题确认 | 批量更新后未调用 `sync_later`，日期变更会导致余额数据不一致 |
+| 字段影响矩阵 | 🔄 已修正 | 删除了不存在的 `amount` 字段，重新校准各字段优先级 |
+
+### 6.2 核心结论
+
+1. **一致性断层仅影响日期变更**：只有当批量更新包含 `date` 字段时，才会产生真实的财务数据一致性问题
+2. **其他字段无风险**：notes/category_id/merchant_id/tag_ids 的批量更新不影响账户余额，仅影响报表展示
+3. **修复成本较低**：仅需在 `bulk_update!` 方法末尾添加条件同步逻辑
+
+### 6.3 行动建议
+
+| 优先级 | 行动 | 原因 |
 |--------|------|------|
-| 事务原子性 | ✅ 良好 | 采用"全有或全无"策略，数据库事务保障正确 |
-| 属性锁定机制 | ✅ 良好 | 用户编辑后立即锁定，防止规则引擎覆盖 |
-| **账户同步触发** | ❌ **缺失** | 批量更新后未调用 `sync_later`，导致余额数据不一致 |
-| 回滚边界 | ✅ 清晰 | 数据库事务边界明确，异常处理路径清晰 |
-
-### 7.2 核心结论
-
-1. **数据一致性存在断层**: 批量更新操作在事务提交后，未将变更通知传递到余额同步层
-2. **日期变更影响最大**: 当批量更新包含 `date` 字段时，余额计算依赖的时间序列排序完全失效
-3. **修复成本较低**: 仅需在 `bulk_update!` 方法末尾添加 3-4 行代码即可修复
-4. **建议优先级**: 🔴 高优先级，应立即修复
+| 🔴 高 | 补充批量更新后的同步触发逻辑 | 日期变更会导致余额计算错误 |
+| 🟡 中 | 添加集成测试覆盖批量更新场景 | 防止回归 |
+| 🟢 低 | 整理代码注释说明字段影响 | 便于后续维护 |
 
 ---
 
-## 附录：相关文件路径索引
+## 附录：代码引用索引
 
-| 文件 | 路径 | 关键行号 |
-|------|------|----------|
-| 批量更新控制器 | `app/controllers/transactions/bulk_updates_controller.rb` | 5-11 |
-| Entry 批量更新方法 | `app/models/entry.rb` | 73-97 |
-| 单笔更新同步触发 | `app/controllers/transactions_controller.rb` | 61, 88 |
+| 逻辑点 | 文件路径 | 关键行号 |
+|-------|---------|---------|
+| 批量更新控制器入口 | `app/controllers/transactions/bulk_updates_controller.rb` | 5-11 |
+| Entry.bulk_update! 方法实现 | `app/models/entry.rb` | 73-97 |
+| Entry.sync_account_later 方法 | `app/models/entry.rb` | 46-49 |
+| 单笔更新同步触发 | `app/controllers/transactions_controller.rb` | 88 |
 | 批量删除同步触发 | `app/controllers/transactions/bulk_deletions_controller.rb` | 3-4 |
-| Sync 状态机 | `app/models/sync.rb` | 27-51 |
-| 余额物化器 | `app/models/balance/materializer.rb` | 9-52 |
-| Enrichable 锁定机制 | `app/models/concerns/enrichable.rb` | 69-73 |
+| 余额正向计算器 | `app/models/balance/forward_calculator.rb` | 10, 24, 68 |
+| Enrichable 属性锁定机制 | `app/models/concerns/enrichable.rb` | 69-73 |
