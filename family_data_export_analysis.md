@@ -34,39 +34,50 @@ T1 ─ FamilyExportsController#create 开始
 T2 ─ 控制器返回 HTTP 响应给用户
   │   └── 重定向到设置页面，提示"导出已开始"
   │
-T3 ─ 【异步边界】Sidekiq 调度器 picked up 任务
+T3 ─ 【ActiveJob 异步边界】任务被加入队列
   │
-T4 ─ FamilyDataExportJob#perform 开始
+T4 ─ 队列调度器 picked up 任务并执行
+  │
+T5 ─ FamilyDataExportJob#perform 开始
   │   ├── family_export.update!(status: :processing)
   │   └── exporter = Family::DataExporter.new(family)
   │
-T5 ─ Family::DataExporter#generate_export 执行
+T6 ─ Family::DataExporter#generate_export 执行
   │   ├── 1. accounts.csv 生成
   │   ├── 2. transactions.csv 生成
   │   ├── 3. trades.csv 生成
   │   ├── 4. categories.csv 生成
   │   └── 5. all.ndjson 生成
   │
-T6 ─ 导出文件生成完成，ZIP 包准备就绪
+T7 ─ 导出文件生成完成，ZIP 包准备就绪
   │   ├── family_export.export_file.attach()
   │   └── family_export.update!(status: :completed)
   │
-T7 ─ 任务完成，用户可下载导出文件
+T8 ─ 任务完成，用户可下载导出文件
 ```
 
 **关键时序边界说明：**
 
 | 时间点 | 边界类型 | 说明 |
 |--------|----------|------|
-| T2-T3 | **同步/异步边界** | 控制器在此处结束，用户获得立即响应；任务排队等待执行 |
-| T3-T4 | **任务调度边界** | 任务在 Sidekiq 队列中等待，取决于队列负载 |
-| T4-T6 | **数据处理边界** | 数据库查询密集型操作，时间取决于数据量 |
-| T6-T7 | **文件持久化边界** | Active Storage 附件上传，可能涉及外部存储服务 |
+| T2-T3 | **同步/异步边界** | 控制器在此处结束，用户获得立即响应；任务被 ActiveJob 加入队列 |
+| T3-T4 | **任务调度边界** | 任务在队列中等待，取决于队列适配器实现和当前负载 |
+| T5-T7 | **数据处理边界** | 数据库查询密集型操作，时间取决于数据量 |
+| T7-T8 | **文件持久化边界** | Active Storage 附件上传，可能涉及外部存储服务 |
+
+### 2.3 ActiveJob 环境适配差异
+
+| 环境 | queue_adapter | 异步行为表现 |
+|------|---------------|------------|
+| **生产环境** | `:sidekiq` | 真正异步执行，任务入 Sidekiq 队列，需独立 Sidekiq 进程消费；支持重试、超时等高级特性 |
+| **测试环境** | `:test` | 默认不立即执行，任务存入 `enqueued_jobs` 数组；需调用 `perform_enqueued_jobs` 才实际执行；便于断言队列状态 |
+| **开发环境** | 默认（通常 :async） | 异步执行但使用线程池；无需独立进程，适合本地开发调试 |
 
 **设计意图：**
 - **请求快速返回**：避免 HTTP 超时（通常 30s-60s 限制）
 - **资源隔离**：导出任务不会阻塞 web 服务器请求处理
 - **可重试性**：任务失败可独立重试，不影响用户体验
+- **环境一致性**：通过 ActiveJob 抽象层，保证不同环境的 API 一致
 
 ## 3. 导出控制器职责边界分析
 
@@ -89,11 +100,10 @@ def create
   # 重定向响应...
 end
 ```
-**职责：
-- 创建 `FamilyExport` 记录创建
-- 异步任务触发后台任务（不阻塞用户等待）
-- 立即返回响应，避免HTTP请求
-- **不参与实际数据处理
+**职责：**
+- 创建 `FamilyExport` 持久化记录
+- 触发 ActiveJob 异步任务（不阻塞，立即返回）
+- 不参与实际数据处理逻辑
 
 #### 3.1.3 导出历史查询（index 动作）
 ```ruby
@@ -113,17 +123,17 @@ end
 
 ### 3.2 控制器设计原则
 
-1. **单一职责原则**：控制器仅负责HTTP层面的处理，不包含业务逻辑
-2. **异步处理**：通过后台任务处理耗时操作，避免请求超时
-3. **状态管理**：通过FamilyExport模型跟踪导出状态
+1. **单一职责原则**：控制器仅负责 HTTP 层面的处理，不包含业务逻辑
+2. **异步处理**：通过 ActiveJob 后台任务处理耗时操作，避免请求超时
+3. **状态管理**：通过 FamilyExport 模型跟踪导出状态
 
 ## 4. 数据聚合核心：Family::DataExporter
 
-**文件位置：`app/models/family/data_exporter.rb`
+**文件位置：`app/models/family/data_exporter.rb`**
 
 ### 4.1 导出文件结构
 
-DataExporter 生成包含以下文件的ZIP包：
+DataExporter 生成包含以下文件的 ZIP 包：
 
 | 文件名 | 内容 |
 |--------|------|
@@ -131,7 +141,7 @@ DataExporter 生成包含以下文件的ZIP包：
 | transactions.csv | 交易记录 |
 | trades.csv | 投资交易 |
 | categories.csv | 分类信息 |
-| all.ndjson | 完整数据的NDJSON格式 |
+| all.ndjson | 完整数据的 NDJSON 格式 |
 
 ### 4.2 数据聚合流程
 
@@ -152,9 +162,9 @@ def generate_accounts_csv
 end
 ```
 
-**关键点：
+**关键点：**
 - 通过 `@family.accounts` 关联获取家庭所有账户
-- 使用 `includes(:accountable)` 避免N+1查询
+- 使用 `includes(:accountable)` 避免 N+1 查询
 - 导出原始金额和货币，不做汇率转换
 
 #### 4.2.2 交易数据导出
@@ -194,7 +204,7 @@ class Entry < ApplicationRecord
 end
 ```
 
-**币种字段来源链：
+**币种字段来源链：**
 ```
 Account.currency ← 账户级别基准货币
     ↑
@@ -205,54 +215,85 @@ Trade.entry.currency
 Valuation.entry.currency
 ```
 
-### 5.2 CSV 文件中的币种落点
+### 5.2 CSV 文件中的币种落点（列号从 0 开始）
 
 #### 5.2.1 accounts.csv 币种字段
-**列索引：第5列（balance）、第6列（currency）
+**表头：`["id", "name", "type", "subtype", "balance", "currency", "created_at"]`**
+
+| 列索引 | 字段名 | 说明 | 数据来源 |
+|--------|--------|------|----------|
+| 0 | id | 账户ID | Account.id |
+| 1 | name | 账户名称 | Account.name |
+| 2 | type | 账户类型 | Account.accountable_type |
+| 3 | subtype | 子类型 | Account.subtype |
+| 4 | balance | 余额金额 | Account.balance |
+| **5** | **currency** | **货币代码** | **Account.currency** |
+| 6 | created_at | 创建时间 | Account.created_at |
 
 ```ruby
-# 数据来源: Account.balance, Account.currency
+# 共 7 列，币种在第 5 列（索引从 0 开始）
 csv << [
-  account.id,              # 列0
-  account.name,            # 列1
-  account.accountable_type,# 列2
-  account.subtype,         # 列3
-  account.balance.to_s,    # 列4: 原始金额数值
-  account.currency,        # 列5: 货币代码 (ISO 4217)
-  account.created_at.iso8601 # 列6
+  account.id,              # 列 0
+  account.name,            # 列 1
+  account.accountable_type,# 列 2
+  account.subtype,         # 列 3
+  account.balance.to_s,    # 列 4: 原始金额数值
+  account.currency,        # 列 5: 货币代码 (ISO 4217)
+  account.created_at.iso8601 # 列 6
 ]
 ```
 
 #### 5.2.2 transactions.csv 币种字段
-**列索引：第6列（currency）
+**表头：`["date", "account_name", "amount", "name", "category", "tags", "notes", "currency"]`**
+
+| 列索引 | 字段名 | 说明 | 数据来源 |
+|--------|--------|------|----------|
+| 0 | date | 交易日期 | Entry.date |
+| 1 | account_name | 账户名称 | Account.name |
+| 2 | amount | 交易金额 | Entry.amount |
+| 3 | name | 交易名称 | Entry.name |
+| 4 | category | 分类名称 | Category.name |
+| 5 | tags | 标签 | Tag.name |
+| 6 | notes | 备注 | Entry.notes |
+| **7** | **currency** | **货币代码** | **Entry.currency** |
 
 ```ruby
-# 数据来源: Transaction → Entry.currency
+# 共 8 列，币种在第 7 列（索引从 0 开始）
 csv << [
-  transaction.entry.date.iso8601,  # 列0
-  transaction.entry.account.name,  # 列1
-  transaction.entry.amount.to_s,   # 列2
-  transaction.entry.name,          # 列3
-  transaction.category&.name,      # 列4
-  transaction.tags.pluck(:name).join(","), # 列5
-  transaction.entry.notes,         # 列6
-  transaction.entry.currency       # 列7: 交易级别的货币代码
+  transaction.entry.date.iso8601,  # 列 0
+  transaction.entry.account.name,  # 列 1
+  transaction.entry.amount.to_s,   # 列 2
+  transaction.entry.name,          # 列 3
+  transaction.category&.name,      # 列 4
+  transaction.tags.pluck(:name).join(","), # 列 5
+  transaction.entry.notes,         # 列 6
+  transaction.entry.currency       # 列 7: 交易级别的货币代码
 ]
 ```
 
 #### 5.2.3 trades.csv 币种字段
-**列索引：第5列（currency）
+**表头：`["date", "account_name", "ticker", "quantity", "price", "amount", "currency"]`**
+
+| 列索引 | 字段名 | 说明 | 数据来源 |
+|--------|--------|------|----------|
+| 0 | date | 交易日期 | Entry.date |
+| 1 | account_name | 账户名称 | Account.name |
+| 2 | ticker | 证券代码 | Security.ticker |
+| 3 | quantity | 数量 | Trade.qty |
+| 4 | price | 单价 | Trade.price |
+| 5 | amount | 总金额 | Entry.amount |
+| **6** | **currency** | **货币代码** | **Trade.currency** |
 
 ```ruby
-# 数据来源: Trade.currency
+# 共 7 列，币种在第 6 列（索引从 0 开始）
 csv << [
-  trade.entry.date.iso8601,   # 列0
-  trade.entry.account.name,   # 列1
-  trade.security.ticker,      # 列2
-  trade.qty.to_s,             # 列3
-  trade.price.to_s,           # 列4
-  trade.entry.amount.to_s,    # 列5
-  trade.currency              # 列6: 交易级别的货币代码
+  trade.entry.date.iso8601,   # 列 0
+  trade.entry.account.name,   # 列 1
+  trade.security.ticker,      # 列 2
+  trade.qty.to_s,             # 列 3
+  trade.price.to_s,           # 列 4
+  trade.entry.amount.to_s,    # 列 5
+  trade.currency              # 列 6: 交易级别的货币代码
 ]
 ```
 
@@ -351,9 +392,9 @@ csv << [
   │     ↓
   ├─ DataExporter.generate_accounts_csv
   │     │
-  │     ├─→ accounts.csv: [balance, currency] 列
+  │     ├─→ accounts.csv: balance(列4), currency(列5)
   │     │
-  │     └─→ all.ndjson: Account.data.currency 字段
+  │     └─→ all.ndjson: Account.data.balance, Account.data.currency
   │
   └─ Entry(id, account_id, amount, currency, entryable_type)
         │
@@ -364,28 +405,28 @@ csv << [
         │    │
         │    ├─→ DataExporter.generate_transactions_csv
         │    │     ↓
-        │    │     transactions.csv: currency 列
+        │    │     transactions.csv: currency(列7)
         │    │
-        │    └─→ all.ndjson: Transaction.data.currency 字段
+        │    └─→ all.ndjson: Transaction.data.amount, Transaction.data.currency
         │
         ├─ entryable_type = "Trade"
         │    │
         │    ├─→ DataExporter.generate_trades_csv
         │    │     ↓
-        │    │     trades.csv: currency 列
+        │    │     trades.csv: currency(列6)
         │    │
-        │    └─→ all.ndjson: Trade.data.currency 字段
+        │    └─→ all.ndjson: Trade.data.amount, Trade.data.currency
         │
         └─ entryable_type = "Valuation"
              │
-             └─→ all.ndjson: Valuation.data.currency 字段
+             └─→ all.ndjson: Valuation.data.amount, Valuation.data.currency
 ```
 
 ## 6. 账户模型与汇率模型的协作
 
 ### 6.1 Account 模型核心结构
 
-**文件位置：`app/models/account.rb`
+**文件位置：`app/models/account.rb`**
 
 ```ruby
 class Account < ApplicationRecord
@@ -401,7 +442,7 @@ end
 
 ### 6.2 ExchangeRate 模型
 
-**文件位置：`app/models/exchange_rate.rb`
+**文件位置：`app/models/exchange_rate.rb`**
 
 ```ruby
 class ExchangeRate < ApplicationRecord
@@ -413,7 +454,7 @@ end
 
 ### 6.3 货币转换机制：Money 类
 
-**文件位置：`lib/money.rb`
+**文件位置：`lib/money.rb`**
 
 #### 6.3.1 汇率查询与账户模型协作流程：
 ```ruby
@@ -428,20 +469,6 @@ def exchange_to(other_currency, date: Date.current, fallback_rate: nil)
     )
     Money.new(amount * exchange_rate, other_iso_code)
   end
-end
-```
-
-#### 6.3.2 汇率获取策略
-
-**文件位置：`app/models/exchange_rate/provided.rb`
-
-```ruby
-def find_or_fetch_rate(from:, to:, date: Date.current, cache: true)
-  rate = find_by(from_currency: from, to_currency: to, date: date)
-  return rate if rate.present?
-  
-  # 如果数据库没有则从外部provider获取
-  response = provider.fetch_exchange_rate(...)
 end
 ```
 
@@ -482,19 +509,46 @@ ExchangeRate.find_or_fetch_rate(from: "EUR", to: "USD", date: "2024-01-15")
   ↓
 find_by(from_currency: "EUR", to_currency: "USD", date: "2024-01-15")
   ↓
-找到记录 → 返回 ExchangeRate 对象
+找到记录 → 返回 ExchangeRate 模型对象
   ↓
-返回 rate 字段值 (如 1.085)
+返回 .rate 字段值 (如 1.085)
   ↓
 Money.new(amount * 1.085, "USD")
 ```
 
-**特征：
-- 纯数据库查询，无网络IO
+**特征：**
+- 纯数据库查询，无网络 IO
 - 响应时间 < 10ms
 - 不会触发外部 API 调用
+- 返回类型：ActiveRecord::Base 子类 ExchangeRate 对象
 
 #### 6.4.3 路径二：缓存未命中（数据库无记录，但有 Provider）
+
+**文件位置：`app/models/exchange_rate/provided.rb`**
+
+```ruby
+def find_or_fetch_rate(from:, to:, date: Date.current, cache: true)
+  rate = find_by(from_currency: from, to_currency: to, date: date)
+  return rate if rate.present?  # 命中则返回
+
+  return nil unless provider.present?
+
+  response = provider.fetch_exchange_rate(from: from, to: to, date: date)
+  return nil unless response.success?
+
+  rate = response.data  # Provider 返回的业务对象（非 ActiveRecord）
+  
+  # 关键：只有 cache=true 时才写入数据库，且返回值被忽略
+  ExchangeRate.find_or_create_by!(
+    from_currency: rate.from,
+    to_currency: rate.to,
+    date: rate.date,
+    rate: rate.rate
+  ) if cache
+  
+  rate  # 无论 cache 是 true/false，始终返回 Provider 的业务对象
+end
+```
 
 ```
 调用链:
@@ -512,21 +566,24 @@ HTTP 请求到外部汇率服务 (可能耗时 100ms-2s)
   ↓
 response.success? → true
   ↓
-ExchangeRate.create!(  # 写入缓存
-  from_currency: "EUR",
-  to_currency: "USD", 
-  date: "2024-01-15",
-  rate: 1.085
-)
+rate = response.data  # Provider 业务对象，含 from/to/date/rate
   ↓
-返回汇率对象
+cache = true?
+  ├─ 是 → ExchangeRate.find_or_create_by!(...) 写入数据库（返回值被丢弃）
+  └─ 否 → 不做任何数据库操作
+  ↓
+始终返回 rate (Provider 业务对象)
+  ↓
+Money.new(amount * rate.rate, "USD")
 ```
 
-**特征：
-- 触发网络IO调用外部服务
-- 可能因网络超时或服务不可用失败
-- 成功后写入数据库缓存，后续请求命中路径一
-- 具有幂等性：同一天相同货币对只查询一次
+**关键事实说明：**
+1. **返回值类型差异**：缓存命中时返回 ExchangeRate 模型对象，缓存未命中时返回 Provider 定义的业务对象
+2. **find_or_create_by! 的作用**：仅用于缓存写入，其返回的 ActiveRecord 对象被完全丢弃，不影响最终返回值
+3. **cache 参数影响**：
+   - `cache: true`（默认）：调用外部 API 后写入数据库，后续相同查询命中路径一
+   - `cache: false`：仅调用外部 API，不写入数据库，每次调用都会触发网络请求
+4. **幂等性保证**：使用 `find_or_create_by!` 而非 `create!`，避免重复插入唯一性约束错误
 
 #### 6.4.4 路径三：无 Provider 配置
 
@@ -549,7 +606,7 @@ provider.present? → false (自托管环境常见)
   └─ 无 fallback_rate → raise Money::ConversionError
 ```
 
-**Provider 检查逻辑：
+**Provider 检查逻辑：**
 ```ruby
 # app/models/exchange_rate/provided.rb
 def provider
@@ -558,7 +615,7 @@ def provider
 end
 ```
 
-**特征：
+**特征：**
 - 自部署环境通常不配置外部汇率服务
 - 依赖调用方提供 fallback_rate 或处理异常
 - 完全离线操作，无网络依赖
@@ -567,7 +624,7 @@ end
 
 #### 6.5.1 根本原因：导出器只读取原始字段，不调用转换方法
 
-**CSV 导出代码分析：
+**CSV 导出代码分析：**
 ```ruby
 # app/models/family/data_exporter.rb
 
@@ -584,7 +641,7 @@ trade.entry.amount.to_s   # 原始 BigDecimal
 trade.currency            # 原始字符串
 ```
 
-**NDJSON 导出代码分析：
+**NDJSON 导出代码分析：**
 ```ruby
 # Account - 简单 as_json，没有转换
 account.as_json(include: { accountable: {} })
@@ -656,13 +713,13 @@ end
 
 ### 6.6 导出过程中的汇率使用策略
 
-**重要发现：**在当前的导出实现中，**导出数据保留原始货币，不进行汇率转换。
+**重要发现：** 在当前的导出实现中，**导出数据保留原始货币，不进行汇率转换**。
 
-#### 6.6.1 账户导出的原因：
+#### 6.6.1 不做转换的原因：
 1. **数据保真**：保留原始货币和金额，避免转换精度损失
 2. **灵活性**：下游系统可以自行处理转换
-3. **性能**：避免导出性能
-4. **避免实时汇率查询影响导出性能
+3. **性能**：避免大量汇率查询拖慢导出速度
+4. **复杂度**：无需处理汇率服务不可用、 fallback 策略等边界情况
 
 #### 6.6.2 汇率模型在导出中的潜在应用场景：
 
@@ -692,7 +749,7 @@ end
 
 ### 7.1 Family 模型作为聚合根
 
-**文件位置：`app/models/family.rb`
+**文件位置：`app/models/family.rb`**
 
 ```ruby
 class Family < ApplicationRecord
@@ -723,7 +780,7 @@ Family
 
 ### 8.1 FamilyExport 状态机
 
-**文件位置：`app/models/family_export.rb`
+**文件位置：`app/models/family_export.rb`**
 
 ```ruby
 enum :status, {
@@ -747,17 +804,17 @@ pending → processing → completed
 ### 9.1 优点
 
 1. **关注点分离**：控制器、任务、导出器各司其职
-2. **异步处理**：避免长请求阻塞
-3. **数据完整性**：NDJSON格式包含完整数据关系
-4. **批量查询**：使用find_each避免内存溢出
-5. **Eager Loading**：includes预加载避免N+1查询
+2. **异步处理**：通过 ActiveJob 抽象层，支持多种队列后端
+3. **数据完整性**：NDJSON 格式包含完整数据关系
+4. **批量查询**：使用 find_each 避免内存溢出
+5. **Eager Loading**：includes 预加载避免 N+1 查询
 6. **数据保真**：不进行汇率转换，保留原始货币信息
 
 ### 9.2 潜在优化点
 
 1. **汇率数据导出**：当前未包含汇率数据，多货币场景下游使用不便
    - 建议：可增加 exchange_rates.csv 导出相关日期的汇率
-2. **增量导出**：当前全量导出，大数据量场景效率
+2. **增量导出**：当前全量导出，大数据量场景效率待提升
 3. **导出进度**：缺乏细粒度进度反馈
 4. **币种字段说明**：导出文件缺少 schema 说明文档
 
@@ -765,21 +822,21 @@ pending → processing → completed
 
 ### 10.1 控制器职责边界
 
-- ✅ HTTP请求处理
+- ✅ HTTP 请求处理
 - ✅ 权限验证
-- ✅ 异步任务触发
+- ✅ ActiveJob 异步任务触发
 - ✅ 下载重定向
 - ❌ 不处理业务逻辑
 - ❌ 不直接操作数据聚合
 
-### 10.2 币种字段落点速查表
+### 10.2 币种字段落点速查表（0 基索引）
 
 | 文件格式 | 数据类型 | 字段/列名 | 位置索引 | 数据来源 |
 |---------|----------|-----------|----------|----------|
-| CSV | Account | balance | 列4 | Account.balance |
-| CSV | Account | currency | 列5 | Account.currency |
-| CSV | Transaction | currency | 列7 | Entry.currency |
-| CSV | Trade | currency | 列6 | Trade.currency |
+| CSV | Account | balance | 列 4 | Account.balance |
+| CSV | Account | currency | 列 5 | Account.currency |
+| CSV | Transaction | currency | 列 7 | Entry.currency |
+| CSV | Trade | currency | 列 6 | Trade.currency |
 | NDJSON | Account | data.balance | - | Account.balance |
 | NDJSON | Account | data.currency | - | Account.currency |
 | NDJSON | Transaction | data.amount | - | Entry.amount |
@@ -791,27 +848,31 @@ pending → processing → completed
 
 ### 10.3 汇率调用路径总结
 
-| 场景 | 数据库查询 | 网络IO | 结果 | 性能特征 |
-|------|-----------|---------|------|----------|
-| 缓存命中 | ✅ 1次 | ❌ 无 | 返回汇率 | < 10ms |
-| 缓存未命中 + 有Provider | ✅ 1次查 + ✅ 1次写 | ✅ HTTP请求 | 返回汇率并缓存 | 100ms-2s |
-| 无 Provider | ✅ 1次查 | ❌ 无 | 返回 nil | < 5ms |
+| 场景 | 数据库查询 | 网络IO | 返回值类型 | 性能特征 | cache 参数影响 |
+|------|-----------|---------|-----------|----------|----------------|
+| 缓存命中 | ✅ 1次 find_by | ❌ 无 | ExchangeRate 模型对象 | < 10ms | 无影响 |
+| 缓存未命中 + 有Provider | ✅ 1次 find_by + (cache=true时追加1次 find_or_create_by) | ✅ HTTP 请求 | Provider 业务对象 | 100ms-2s | cache=true 写入缓存，false 不写入 |
+| 无 Provider | ✅ 1次 find_by | ❌ 无 | nil | < 5ms | 无影响 |
+
+**关键修正：**
+- 缓存未命中时，`find_or_create_by!` 的返回值被丢弃，始终返回 Provider 业务对象
+- `cache: false` 时完全不写入数据库，每次都触发网络请求
 
 ### 10.4 账户与汇率模型协作
 
 | 组件 | 职责 | 在导出中的作用 |
 |------|------|-----------------|
 | Account | 账户数据管理 | 提供原始余额和货币信息 |
-| ExchangeRate | 汇率存储与获取 | 未直接使用，供下游转换 |
+| ExchangeRate | 汇率存储与获取 | 未直接使用，供下游消费方转换 |
 | Money | 货币转换逻辑 | 封装汇率查询接口 |
 | Family::DataExporter | 数据聚合 | 协调各模型数据，不触发转换 |
 
 ### 10.5 导出链路的核心设计哲学
 
-**"原始数据导出，转换由下游处理"
+**"原始数据导出，转换由下游处理"**
 
 这一设计决策确保了：
 - 数据的原始性和完整性
-- 导出性能
-- 系统解耦
-- 下游系统灵活性
+- 导出性能不依赖外部服务
+- 系统解耦，转换逻辑自由下放
+- 下游系统灵活性最大化
