@@ -184,59 +184,150 @@ end
 
 ## 2. 重复事件与乱序处理机制
 
-### 2.1 当前机制分析
+> ⚠️ **本章已修订** - 重点修正了乱序覆盖风险分析，并补充了Job失败重试与异常分支的影响分析
 
-**基于现有代码的分析**:
+### 2.1 乱序事件的覆盖风险分析
 
-#### ✅ 天然的幂等性保障
+**核心问题**：代码无条件覆盖写入，晚到的旧事件会产生严重的状态回滚
 
-1. **更新操作的幂等性** (`subscription_event_processor.rb:7-15`)
-   ```ruby
-   family.subscription.update(...)
-   ```
-   - 使用数据库 `UPDATE` 操作而非 `INSERT`
-   - 相同事件重复处理只会覆盖写入相同数据
-   - 不会产生重复记录或数据不一致
+**真实场景示例**：
 
-2. **唯一索引约束** (`db/schema.rb:686`)
-   ```ruby
-   t.index ["family_id"], name: "index_subscriptions_on_family_id", unique: true
-   ```
-   - 每个 Family 只能有一个 Subscription
-   - 从数据库层面防止重复订阅记录
+| 时间线 | 事件 | 事件类型 | Stripe 端状态 | 处理顺序 | 处理后本地状态 |
+|--------|------|----------|---------------|----------|----------------|
+| T10:00 | 取消订阅 | `subscription.updated | trialing → active | ✓ 先处理 | active ✅ |
+| T10:05 | 用户取消 | `subscription.updated` | active → canceled | ✓ 先处理 | canceled ✅ |
+| T09:55 | 试用转正式 | `subscription.updated` | trialing → active | ❌ 后处理（乱序到达） | active ❌ 状态被错误回滚！|
 
-#### ⚠️ 缺少显式的去重机制
+**问题根源** (`subscription_event_processor.rb:7-14`)：
+```ruby
+family.subscription.update(
+  stripe_id: subscription.id,
+  status: subscription.status,  # ⚠️ 无条件覆盖！
+  interval: subscription_details.plan.interval,
+  amount: subscription_details.plan.amount / 100.0,
+  currency: subscription_details.plan.currency.upcase,
+  current_period_ends_at: Time.at(subscription_details.current_period_end)
+)
+```
 
-当前代码**没有**以下机制：
-- ❌ 没有 `stripe_webhook_events` 表记录已处理事件
-- ❌ 没有基于事件 ID 的幂等性检查
-- ❌ 没有事件时间戳比较（处理乱序）
+**覆盖风险的本质**：
+1. **无时间戳检查**：不比较事件时间与本地记录的更新时间
+2. **全字段覆盖**：所有 6 个字段全部无条件写入，没有部分更新策略
+3. **依赖队列不可控**：Sidekiq 队列不保证严格按入队顺序执行（网络延迟、重试、队列优先级等）
 
 ---
 
-### 2.2 乱序事件的兜底策略
+### 2.2 当前代码已存在的保护机制
 
-**当前依赖的兜底机制**:
+#### ✅ 保护 1：重复事件的幂等性保障
 
-1. **Stripe API 重新拉取事件** (`stripe.rb:85-87`)
-   ```ruby
-   def retrieve_event(event_id)
-     client.v1.events.retrieve(event_id)
-   end
-   ```
-   - 不直接使用 webhook 推送的数据
-   - 从 Stripe 服务器拉取最新的事件状态
-   - 确保处理的是权威数据
+```ruby
+family.subscription.update(...)
+```
+- 使用数据库 `UPDATE` 操作而非 `INSERT`
+- **相同事件**重复处理：覆盖写入相同数据 → 无副作用
+- 适用场景：Stripe 重复投递同一个 event_id
 
-2. **状态覆盖写入**
-   - 后处理的事件会覆盖先处理的事件
-   - 最终以 Stripe 为准（因为每次都重新拉取）
-   - 即使乱序，最终状态会收敛到正确值
+#### ✅ 保护 2：唯一索引约束防重复订阅
 
-3. **Stripe webhook 的最佳实践**
+```ruby
+t.index ["family_id"], name: "index_subscriptions_on_family_id", unique: true
+```
+- 每个 Family 只能有一条 Subscription 记录
+- 从数据库层面防止重复订阅记录（但不防状态回滚）
+
+#### ✅ 保护 3：从 Stripe API 重新拉取完整事件
+
+```ruby
+def retrieve_event(event_id)
+  client.v1.events.retrieve(event_id)
+end
+```
+- 不直接信任 webhook 推送的 payload
+- 从 Stripe 服务器拉取权威事件数据
+- 防止 webhook 数据被篡改或损坏
+- ❗ **但拉取的仍是历史快照，不是订阅的当前状态**
+
+---
+
+### 2.3 缺失的去重与乱序保护机制
+
+当前代码**完全缺失**以下关键保护：
+
+| 缺失机制 | 风险 |
+|---------|------|
+| ❌ **事件处理记录表** | 无法识别已处理过的 event_id，重复事件会重复执行 UPDATE |
+| ❌ **事件时间戳比较** | 无法判断"旧事件晚到"情况，旧状态覆盖新状态 |
+| ❌ **Stripe 最新状态兜底查询** | 直接使用事件快照，不查询订阅当前真实状态 |
+| ❌ **数据库乐观锁** | 并发更新时可能产生竞态条件 |
+| ❌ **按事件类型的差异化处理** | `deleted` 事件与 `updated` 事件使用相同逻辑 |
+
+---
+
+### 2.4 Job 失败重试与异常分支的影响
+
+#### 🔍 🔍 **Job 重试配置分析** (`application_job.rb:1-5`)：
+
+```ruby
+class ApplicationJob < ActiveJob::Base
+  retry_on ActiveRecord::Deadlocked   # ✅ 死锁会重试
+  discard_on ActiveJob::DeserializationError  # ❌ 反序列化错误直接丢弃
+  queue_as :low_priority
+end
+```
+
+**异常场景 1：网络波动导致 Stripe API 调用失败**
+
+```ruby
+# stripe.rb:85-87
+def retrieve_event(event_id)
+  client.v1.events.retrieve(event_id)  # ⚠️ 无异常捕获！
+end
+```
+- ❌ **后果**：网络超时、Stripe API 5xx 错误 → Job 抛出异常 → 进入 Sidekiq 默认重试（最多 25 次，指数退避）
+- ⚠️ **风险**：重试时问题可能已解决，但**事件已过时 → 重试时可能覆盖了更新的状态
+
+**异常场景 2：Family 未找到异常**
+
+```ruby
+# subscription_event_processor.rb:5
+raise Error, "Family not found for Stripe customer ID: #{subscription.customer}" unless family
+```
+- ❌ **后果**：Customer ID 关联延迟（例如订阅创建事件先于用户注册完成 → Job 失败进入重试
+- ⚠️ **风险**：重试成功时，可能后续事件已先处理完成 → 状态回滚
+
+**异常场景 3：数据库死锁**
+
+```ruby
+retry_on ActiveRecord::Deadlocked
+```
+- ✅ **有重试保护 → 稍后重试
+- ⚠️ **风险**：重试窗口内其他事件已更新状态 → 死锁解除后覆盖新状态
+
+**异常场景 4：反序列化错误**
+
+```ruby
+discard_on ActiveJob::DeserializationError
+```
+- ❌ **直接丢弃，永不重试
+- ⚠️ **严重风险**：该事件对应的状态变更永久丢失
+
+---
+
+### 2.5 乱序事件的兜底策略（当前）
+
+**当前依赖的兜底机制（非常有限）：
+
+1. **状态覆盖写入的"最终可能正确"假设**
+   - 如果所有事件最终都成功执行
+   - 且最后执行的是时间上最新的事件
+   - 那么最终状态是正确的
+   - ❗ **如果最新事件先失败后重试，中间夹杂旧事件 → 最终状态错误**
+
+2. **Stripe webhook 的最佳实践**
    - Stripe 保证至少一次投递（at-least-once）
-   - 不保证顺序
-   - 推荐处理逻辑具备幂等性
+   - 不保证投递顺序
+   - **推荐：处理逻辑必须具备幂等性和乱序容忍
 
 ---
 
