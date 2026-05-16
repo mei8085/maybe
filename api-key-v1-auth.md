@@ -279,24 +279,70 @@ end
 
 #### 边界：双 Header 场景分支逻辑
 
-当请求**同时携带** `Authorization` 和 `X-Api-Key` 时，执行分支如下：
+**真实执行路径流程图**：
 
-| 场景 | Authorization | X-Api-Key | 执行分支 | 最终结果 |
-|------|--------------|-----------|---------|---------|
-| 1 | ✅ 有效（Token 有效 + 有 scope） | 任意 | OAuth 成功 → 忽略 API Key | 200 成功 |
-| 2 | ❌ 无效（Token 不存在/过期/scope 不足） | ✅ 有效 | OAuth 验证失败 → **直接 render 401** | **401 Unauthorized** |
-| 3 | ❌ 不存在 | ✅ 有效 | 跳过 OAuth → 走 API Key 鉴权 | 200 成功 |
-| 4 | ❌ 不存在 | ❌ 无效 | 两者都失败 → render_unauthorized | 401 Unauthorized |
+```
+请求到达
+   │
+   ▼
+authenticate_request!
+   │
+   ├─→ authenticate_oauth
+   │    │
+   │    ├─ Authorization 不存在？ → return false ←┐
+   │    │                                          │
+   │    └─ Authorization 存在？
+   │         │
+   │         ├─ 验证通过 → return true ←───────┐  │
+   │         │                                  │  │
+   │         └─ 验证失败                        │  │
+   │              │                             │  │
+   │              ├─ render_json(401) ←─────── 已发送响应！
+   │              │                             │  │
+   │              └─ return false ←─────────────┘  │
+   │                                                │
+   └─→ authenticate_api_key  ◄────────── 这里还会执行吗？
+        │
+        ├─ X-Api-Key 不存在？ → return false
+        │
+        └─ X-Api-Key 存在且有效？
+             ├─ 是 → 设置 @current_user, return true
+             └─ 否 → return false
+```
 
-> **关键注意**：场景 2 中，只要 `Authorization` header 存在但验证失败，系统会**立即返回 401 并终止后续流程**，**不会**尝试用 API Key 进行降级鉴权。只有当 `Authorization` header **完全不存在**时，才会进入 API Key 鉴权流程。
+**源码证据与真实分支结果**：
 
-文件: `app/controllers/api/v1/base_controller.rb:59-62`
+文件: `app/controllers/api/v1/base_controller.rb:42-46, 59-62`
 ```ruby
+def authenticate_request!
+  return if authenticate_oauth      # 步骤1: 返回 false，不 return
+  return if authenticate_api_key    # 步骤2: 还会继续执行！
+  render_unauthorized unless performed?
+end
+
+# 在 authenticate_oauth 验证失败时：
 unless access_token && !access_token.expired? && has_sufficient_scope
   render_json({ error: "unauthorized", message: "..." }, status: :unauthorized)
-  return false  # 直接终止，不再尝试 API Key
+  return false  # ← 先 render，再 return false
 end
 ```
+
+**关键发现**：当 `Authorization` 存在但验证失败时，`authenticate_oauth` 先调用 `render_json` 再返回 `false`，此时：
+1. ✅ `performed?` 已变为 true（响应已写入）
+2. ❌ 方法仍然返回 `false`，所以 **会继续执行 `authenticate_api_key`**
+3. 但即使 API Key 验证成功，也无法改变已经发送的 401 响应
+4. Rails 不会报 DoubleRenderError，因为第二次 render 被跳过
+
+**最终结果矩阵**：
+
+| 场景 | Authorization | X-Api-Key | 真实执行路径 | 最终结果 |
+|------|--------------|-----------|------------|---------|
+| 1 | ✅ 有效 | 任意 | OAuth 成功，return true → 终止 | 200 成功 |
+| 2 | ❌ 无效（Token 存在但有问题） | ✅ 有效 | OAuth render 401 → return false → 执行 API Key 成功但无法改变响应 | **401 Unauthorized** |
+| 3 | ❌ 不存在 | ✅ 有效 | OAuth return false → API Key 成功 | 200 成功 |
+| 4 | ❌ 不存在 | ❌ 无效 | 两者都失败 → render_unauthorized | 401 Unauthorized |
+
+> **设计意图**：Authorization header 的存在表示客户端**明确意图**使用 OAuth 鉴权，即使失败也不应该静默降级到 API Key。这种设计避免了鉴权方式的隐式切换带来的安全隐患。
 
 ### 权限范围检查
 
@@ -425,6 +471,59 @@ end
 ```
 
 ### 在业务逻辑中使用家庭上下文
+
+#### 边界：Current.user 与 current_resource_owner 的取值链路差异
+
+**两个用户对象的取值链路对比**：
+
+| 维度 | `current_resource_owner` | `Current.user` |
+|------|-------------------------|----------------|
+| 定义位置 | API Base Controller | 全局 Current Attributes |
+| 文件 | `app/controllers/api/v1/base_controller.rb:156-158` | `app/models/current.rb` |
+| 核心代码 | `@current_user` | `session&.user` 或 `impersonated_user` |
+| 设置时机 | 鉴权成功时直接赋值 | `setup_current_context_for_api` 中间步骤 |
+
+**链路流程对比**：
+
+```
+current_resource_owner 链路（直接）:
+  ├─ authenticate_oauth 或 authenticate_api_key 成功
+  └─ @current_user = ...  ← 直接赋值
+     └─ current_resource_owner → @current_user
+
+Current.user 链路（间接）:
+  ├─ 鉴权成功 → @current_user 已赋值
+  ├─ setup_current_context_for_api 执行
+  │   ├─ 查找 @current_user.sessions.first
+  │   │  或构建临时 Session 对象
+  │   └─ Current.session = session  ← 设置 Current 上下文
+  └─ Current.user → Current.session.user
+```
+
+**代码实现**：
+
+文件: `app/controllers/api/v1/base_controller.rb:156-158`
+```ruby
+def current_resource_owner
+  @current_user  # 直接返回实例变量
+end
+```
+
+文件: `app/models/current.rb:8-14`
+```ruby
+def user
+  impersonated_user || session&.user
+end
+
+def impersonated_user
+  session&.active_impersonator_session&.impersonated
+end
+```
+
+> **API 控制器最佳实践**：
+> - 在 API 控制器及其子类中，**始终使用 `current_resource_owner`** 来获取当前用户
+> - `Current.user` 主要用于非 API 的 Web 请求场景
+> - 两者指向的是同一个 User 记录，但取值路径不同
 
 #### 示例 1: 账户查询
 
