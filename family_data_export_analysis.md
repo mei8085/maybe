@@ -577,21 +577,49 @@ Money.new(amount * rate.rate, "USD")
 ```
 
 **关键事实说明：**
-1. **返回值类型差异**：缓存命中时返回 ExchangeRate 模型对象，缓存未命中时返回 Provider 定义的业务对象，二者类型不一致但都可通过 `.rate` 读取汇率值
 
-2. **find_or_create_by! 的定位与局限**：
-   - 仅作为**可选落库**机制：只有 `cache: true` 时才执行，且返回值被完全丢弃，不影响最终返回值
-   - **不能天然保证幂等性**：数据库唯一索引才是防重复的最终屏障，高并发场景仍可能触发唯一性约束异常
+1. **首个 find_by 的早返回语义**：
+   - 方法入口先执行 `find_by(from_currency: from, to_currency: to, date: date)`
+   - 只要数据库存在该三元组记录，**无论 rate 值是什么**，都会直接命中并 `return rate`
+   - 早返回后，后续的 provider 检查、外部 API 调用、`find_or_create_by!` 分支**完全不会执行**
 
-3. **cache 参数的精确影响**：
-   - `cache: true`（默认）：调用外部 API 后尝试写入数据库，后续相同条件的查询将命中路径一
-   - `cache: false`：仅调用外部 API，不写入数据库，每次相同条件调用都会重新触发网络请求
+2. **返回值类型差异**：
+   - 缓存命中时返回 `ExchangeRate` ActiveRecord 模型对象
+   - 缓存未命中时返回 Provider 定义的业务对象
+   - 二者类型不一致但都可通过 `.rate` 读取汇率值
 
-4. **同日期币种记录已存在但 rate 不同时的行为**：
-   - 数据库层面：`[from_currency, to_currency, date]` 组合唯一索引 + rate 字段无约束
-   - 落库行为：数据库已存在同组合记录时，`find_or_create_by!` 的 `find_by` 子句命中，**直接丢弃 Provider 返回的新 rate 值**，以数据库已有记录为准（不会触发 update 操作）
-   - 实际效果：汇率值一旦写入数据库不会被自动修正，Provider 返回值变化对已缓存的日期无影响
-   - 调用方结果：汇率已落库时，后续相同查询返回的是数据库已存储的 rate 值而非 Provider 最新返回值
+3. **同日期同币种但 rate 不同时的行为**：
+   - **触发条件**：数据库已存在 `(from_currency, to_currency, date)` 记录，无论 rate 值为何
+   - **执行路径**：首个 `find_by` 直接命中 → 触发早返回 → 不会进入 provider 分支 → 不会调用外部 API → **不会执行 `find_or_create_by!`**
+   - **实际效果**：
+     - 完全不涉及 Provider，不会发起网络请求
+     - 不会触发数据库写入或更新操作
+     - 调用方获得数据库中存储的 rate 值，与 Provider 当前返回的 rate 值差异无关
+   - **结论**：该场景本质是**缓存命中**，与 Provider 交互、`find_or_create_by!`、缓存写入等行为完全无关
+
+4. **仅并发 miss 场景可能触发的唯一性冲突路径**：
+   - **触发条件**：两个请求同一时刻查询同一 `(from, to, date)`，且数据库均无记录
+   - **执行序列**：
+     1. 请求 A：`find_by` → nil
+     2. 请求 B：`find_by` → nil（与 A 近同时执行）
+     3. 请求 A：provider.fetch_exchange_rate → 获得新 rate
+     4. 请求 B：provider.fetch_exchange_rate → 获得相同或不同 rate
+     5. 请求 A：`find_or_create_by!` → `find_by` 仍 nil → `create!` → 成功写入
+     6. 请求 B：`find_or_create_by!` → `find_by` 仍 nil → `create!` → 触发数据库唯一索引约束，抛出 `ActiveRecord::RecordNotUnique` 异常
+   - **关键约束**：
+     - 冲突发生在 `create!` 阶段，而非 `find_by` 阶段
+     - 数据库层面的唯一索引 `[from_currency, to_currency, date]` 是最终屏障
+     - Rails 的 `find_or_create_by!` 并非原子操作，无法阻止竞态条件
+   - **该场景与"已有记录命中"完全独立**：前者是并发创建竞争，后者是早返回命中
+
+5. **find_or_create_by! 的定位与局限**：
+   - 仅作为**可选落库**机制：只有 `cache: true` 且缓存未命中时才执行
+   - 返回值被完全丢弃，最终始终返回 Provider 业务对象
+   - **不具备天然幂等性**：数据库唯一索引才是防止重复的最终保障
+
+6. **cache 参数的精确影响**：
+   - `cache: true`（默认）：缓存未命中时调用外部 API 后尝试写入数据库，后续相同条件的查询将命中路径一
+   - `cache: false`：缓存未命中时仅调用外部 API，不写入数据库，每次相同条件调用都会重新触发网络请求
 
 #### 6.4.4 路径三：无 Provider 配置
 
