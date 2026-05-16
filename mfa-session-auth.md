@@ -1,16 +1,16 @@
 # MFA 二次验证会话认证机制分析
-## 最终修订版（ROTP 6.3.0 源码级准确）
+## 最终复核版（源码字面级对齐）
 
 ---
 
 ## 一、概述
 
-本报告基于 ROTP 6.3.0 源码行为，对 Maybe Finance 项目中 MFA 二次验证嵌入登录会话的实现机制进行代码审计级准确分析。所有结论均对应证据代码，并附证据到结论的逐条映射。
+本报告基于源码逐行核对，对 Maybe Finance 项目中 MFA 二次验证嵌入登录会话的实现机制进行分析。所有结论、文案、状态码、路径均与源码字面完全一致，无引申、无推断。
 
 **版本信息**：
 - ROTP 版本：6.3.0
 - 审计日期：2026-05-16
-- 关键修正：`drift_behind` 参数为秒级窗口，非步数
+- 复核范围：Web登录流程、API登录流程、MFA验证
 
 ---
 
@@ -19,14 +19,13 @@
 ### 2.1 用户 MFA 配置持久化存储（User 表）
 
 **数据库字段（schema.rb:789-791）**：
-| 字段名 | 类型 | 说明 | 证据 |
-|--------|------|------|------|
+| 字段名 | 类型 | 说明 | 证据代码行 |
+|--------|------|------|------------|
 | `otp_secret` | string | TOTP 密钥，BASE32 编码 | `app/models/user.rb:191` |
 | `otp_required` | boolean | 是否启用 MFA，默认 false | `app/models/user.rb:134` |
-| `otp_backup_codes` | string[] | 备份验证码数组，共 8 个 | `app/models/user.rb:209` |
+| `otp_backup_codes` | string[] | 备份验证码数组 | `app/models/user.rb:127` |
 
-**相关代码**：
-`app/models/user.rb:124-137`
+**证据代码**（`app/models/user.rb:124-137`）：
 ```ruby
 def setup_mfa!
   update!(
@@ -39,43 +38,38 @@ end
 def enable_mfa!
   update!(
     otp_required: true,
-    otp_backup_codes: generate_backup_codes  # 8.times.map
+    otp_backup_codes: generate_backup_codes
   )
 end
 ```
 
 ### 2.2 登录过程中的临时状态存储（Rails Session）
 
-在密码验证成功、MFA 验证完成前，用户 ID 临时存储在 Rails session 中：
-
+**证据代码**（`app/controllers/sessions_controller.rb:13`）：
 ```ruby
 session[:mfa_user_id] = user.id
 ```
 
-**证据代码**：`app/controllers/sessions_controller.rb:13`
-
-⚠️ **标注**：`session[:mfa_user_id]` 的有效期依赖于 Rails Session 的配置，项目中未显式设置 `expire_after`，默认为浏览器会话级（浏览器关闭即失效）。
+| 项目 | 源码字面 |
+|------|---------|
+| session key | `:mfa_user_id` |
+| 值类型 | user.id（UUID） |
 
 ### 2.3 最终认证会话存储（Session 表 + Cookie）
 
-MFA 验证通过后，创建正式会话：
-
-**1. 数据库层**（`sessions` 表）：
-- `user_id`：关联用户
-- `user_agent`：浏览器标识（`before_create` 回调设置）
-- `ip_address`：客户端 IP（`before_create` 回调设置）
-- `data`：JSON 字段，存储会话偏好如 `tab_preferences`
-
-**证据代码**：`app/models/session.rb:8-21`
-
-**2. Cookie 层**：
+**证据代码**（`app/controllers/concerns/authentication.rb:40-44`）：
 ```ruby
-cookies.signed.permanent[:session_token] = { value: session.id, httponly: true }
+def create_session_for(user)
+  session = user.sessions.create!
+  cookies.signed.permanent[:session_token] = { value: session.id, httponly: true }
+  session
+end
 ```
 
-**证据代码**：`app/controllers/concerns/authentication.rb:42`
-
-✅ **已确认**：`permanent` 在 Rails 中表示 20 年有效期，`signed` 防篡改，`httponly` 禁止 JS 访问。
+| 层级 | 源码字面 |
+|------|---------|
+| 数据库层 | `sessions.create!`，关联 user_id、user_agent、ip_address |
+| Cookie 层 | `cookies.signed.permanent[:session_token]`，httponly: true |
 
 ---
 
@@ -83,62 +77,31 @@ cookies.signed.permanent[:session_token] = { value: session.id, httponly: true }
 
 ### 3.1 每次请求的完整认证链路
 
-**从 Cookie 到 Current.user 的完整还原路径**：
+**证据代码**（`app/controllers/concerns/authentication.rb:1-28`）：
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     HTTP 请求到达                            │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  ApplicationController 过滤器链                              │
-│  before_action : set_request_details                         │
-│  before_action : authenticate_user!  ← 认证入口              │
-│  before_action : set_sentry_user                              │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Authentication#authenticate_user!                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. 调用 find_session_by_cookie()                     │   │
-│  │    → 读取 cookies.signed[:session_token]             │   │
-│  │    → Session.find_by(id: cookie_value)               │   │
-│  └───────────────────────────┬─────────────────────────┘   │
-│                              │                               │
-│  ┌───────────────────────────▼─────────────────────────┐   │
-│  │ 2. 找到 Session 记录？                                │   │
-│  │    ├─ 是 → Current.session = session_record         │   │
-│  │    └─ 否 → redirect_to new_session_url (302)        │   │
-│  └───────────────────────────┬─────────────────────────┘   │
-└───────────────────────────────┼─────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Current 模型（ActiveSupport::CurrentAttributes）            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Current.session → 存储从数据库查到的 Session 实例      │   │
-│  └───────────────────────────┬─────────────────────────┘   │
-│                              │                               │
-│  ┌───────────────────────────▼─────────────────────────┐   │
-│  │ Current.user 方法                                      │   │
-│  │   def user                                             │   │
-│  │     impersonated_user || session&.user                │   │
-│  │   end                                                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-└───────────────────────────────┬─────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────┐
-│  业务逻辑层访问 Current.user                                  │
-└─────────────────────────────────────────────────────────────┘
+HTTP 请求到达
+     │
+     ▼
+ApplicationController 过滤器链
+  - set_request_details
+  - authenticate_user!  ← 认证入口
+  - set_sentry_user
+     │
+     ▼
+authenticate_user! 执行
+  ├─ find_session_by_cookie
+  │   ├─ 读取 cookies.signed[:session_token]
+  │   └─ Session.find_by(id: cookie_value)
+  │
+  └─ 找到 Session 记录？
+       ├─ 是 → Current.session = session_record
+       └─ 否 → redirect_to new_session_url（或 new_registration_url）
 ```
 
 ### 3.2 关键代码实现
 
-**Current 模型核心逻辑**
-`app/models/current.rb:1-19`
+**Current 模型核心逻辑**（`app/models/current.rb:1-18`）：
 ```ruby
 class Current < ActiveSupport::CurrentAttributes
   attribute :user_agent, :ip_address
@@ -147,450 +110,213 @@ class Current < ActiveSupport::CurrentAttributes
   delegate :family, to: :user, allow_nil: true
 
   def user
-    impersonated_user || session&.user  # 优先模拟用户，否则会话关联用户
-  end
-
-  def impersonated_user
-    session&.active_impersonator_session&.impersonated
-  end
-
-  def true_user
-    session&.user  # 真实用户（排除模拟）
+    session&.user
   end
 end
 ```
 
-**认证中间件链路**
-`app/controllers/concerns/authentication.rb:1-67`
+⚠️ **修订说明**：原报告含 impersonation 相关代码，当前源码无此逻辑，已移除。
+
+**认证中间件链路**（`app/controllers/concerns/authentication.rb:18-28`）：
 ```ruby
-module Authentication
-  extend ActiveSupport::Concern
-
-  included do
-    before_action :set_request_details  # 第1步：设置请求上下文
-    before_action :authenticate_user!    # 第2步：认证用户
-    before_action :set_sentry_user       # 第3步：设置监控上下文
+def authenticate_user!
+  if session_record = find_session_by_cookie
+    Current.session = session_record
+  else
+    if self_hosted_first_login?
+      redirect_to new_registration_url
+    else
+      redirect_to new_session_url
+    end
   end
-
-  private
-    def authenticate_user!
-      if session_record = find_session_by_cookie
-        Current.session = session_record  # 会话注入 Current
-      else
-        if self_hosted_first_login?
-          redirect_to new_registration_url  # 302 重定向
-        else
-          redirect_to new_session_url       # 302 重定向，无有效会话
-        end
-      end
-    end
-
-    def find_session_by_cookie
-      cookie_value = cookies.signed[:session_token]
-      cookie_value.present? ? Session.find_by(id: cookie_value) : nil
-    end
 end
 ```
 
-### 3.3 会话恢复的关键特性
+### 3.3 已确认特性清单
 
-| 特性 | 说明 | 证据 |
-|------|------|------|
-| **无状态设计** | 每次请求独立从 Cookie 还原 | `authentication.rb:19-27` |
-| **请求级隔离** | 使用 `ActiveSupport::CurrentAttributes`，线程安全 | `current.rb:1` |
-| **模拟用户支持** | `Current.user` 优先返回被模拟用户 | `current.rb:8-10` |
-| **Cookie 安全** | signed + permanent + httponly | `authentication.rb:42` |
+| 特性 | 源码依据 |
+|------|---------|
+| Cookie signed | `cookies.signed` |
+| Cookie permanent | `cookies.signed.permanent` |
+| Cookie httponly | `httponly: true` |
+| Current.session 注入 | `Current.session = session_record` |
+| Current.user 获取 | `session&.user` |
 
 ---
 
-## 四、MFA 流程接入点
+## 四、Web MFA 流程接入点
 
-### 4.1 Web 登录流程
+### 4.1 登录入口：密码验证（SessionsController#create）
 
-```
-用户输入密码
-     ↓
-SessionsController#create
-     ↓
-密码验证成功？
-     ├─ 否 → render :new (422)
-     └─ 是 → 检查 user.otp_required?
-              ├─ 否 → create_session_for → redirect_to root_path (302)
-              └─ 是 → session[:mfa_user_id] = user.id
-                        ↓
-                   redirect_to verify_mfa_path (302)
-                        ↓
-                   MfaController#verify
-                        ↓
-                   用户输入验证码
-                        ↓
-                   MfaController#verify_code
-                        ↓
-                   验证成功？
-                        ├─ 否 → render :verify (422)
-                        └─ 是 → session.delete(:mfa_user_id)
-                                  ↓
-                             create_session_for
-                                  ↓
-                             redirect_to root_path (302)
-```
-
-### 4.2 关键接入点代码
-
-**接入点1：密码验证后跳转 MFA**
-`app/controllers/sessions_controller.rb:10-23`
+**证据代码**（`app/controllers/sessions_controller.rb:10-22`）：
 ```ruby
 def create
   if user = User.authenticate_by(email: params[:email], password: params[:password])
     if user.otp_required?
-      session[:mfa_user_id] = user.id  # 保存状态
-      redirect_to verify_mfa_path      # 302 跳转到 MFA 验证页
+      session[:mfa_user_id] = user.id
+      redirect_to verify_mfa_path
     else
       @session = create_session_for(user)
-      redirect_to root_path  # 302 跳转首页
+      redirect_to root_path
     end
   else
     flash.now[:alert] = t(".invalid_credentials")
-    render :new, status: :unprocessable_entity  # 422
+    render :new, status: :unprocessable_entity
   end
 end
 ```
 
-**接入点2：MFA 验证页恢复用户**
-`app/controllers/mfa_controller.rb:21-27`
+| 项目 | 源码字面准确值 |
+|------|---------------|
+| 成功 redirect | `verify_mfa_path`（当 otp_required?） |
+| 成功 redirect | `root_path`（当无需 MFA） |
+| 失败 render | `:new` |
+| 失败状态码 | `:unprocessable_entity` |
+| 失败 flash key | `:alert` |
+| 失败 i18n key | `".invalid_credentials"` |
+| 失败实际文案 | `Invalid email or password.` |
+
+### 4.2 MFA 验证页面加载（MfaController#verify）
+
+**证据代码**（`app/controllers/mfa_controller.rb:21-27`）：
 ```ruby
 def verify
   @user = User.find_by(id: session[:mfa_user_id])
 
   if @user.nil?
-    redirect_to new_session_path  # 302，状态丢失时返回登录
+    redirect_to new_session_path
   end
 end
 ```
 
-✅ **已确认**：`@user.nil?` 为 false 时，Rails 默认渲染 verify 模板，HTTP 状态码为 200（代码未显式设置）。
+| 项目 | 源码字面准确值 |
+|------|---------------|
+| 状态丢失 redirect | `new_session_path` |
+| 正常渲染 | 默认 verify 模板（无显式 status） |
 
-**接入点3：MFA 验证成功后创建会话**
-`app/controllers/mfa_controller.rb:29-40`
+### 4.3 MFA 验证码提交（MfaController#verify_code）
+
+**证据代码**（`app/controllers/mfa_controller.rb:29-39`）：
 ```ruby
 def verify_code
   @user = User.find_by(id: session[:mfa_user_id])
 
   if @user&.verify_otp?(params[:code])
-    session.delete(:mfa_user_id)  # 清理临时状态
-    @session = create_session_for(@user)  # 创建正式会话
-    redirect_to root_path  # 302
-  else
-    flash.now[:alert] = t(".invalid_code")
-    render :verify, status: :unprocessable_entity  # 422
-  end
-end
-```
-
-### 4.3 API 登录流程
-
-API 登录与 Web 登录不同，MFA 验证在同一请求内完成：
-
-**证据代码**：`app/controllers/api/v1/auth_controller.rb:64-100`
-```ruby
-def login
-  user = User.find_by(email: params[:email])
-
-  if user&.authenticate(params[:password])
-    # 检查 MFA 如果启用
-    if user.otp_required?
-      unless params[:otp_code].present? && user.verify_otp?(params[:otp_code])
-        render json: {
-          error: "Two-Factor Authentication Required",
-          mfa_required: true
-        }, status: :unauthorized  # 401
-        return
-      end
-    end
-
-    # 创建 OAuth Token
-    device = create_or_update_device(user)
-    token_response = create_oauth_token_for_device(user, device)
-
-    render json: token_response.merge(user: ...)  # 200
-  else
-    render json: { error: "Invalid Email or Password" }, 
-           status: :unauthorized  # 401
-  end
-end
-```
-
-**API 会话恢复特点**：
-- 无中间状态，密码 + OTP 一次性验证
-- 失败直接返回 401，客户端需重新发起请求
-- 使用 Doorkeeper OAuth Token
-
-⚠️ **标注**：OAuth Token 的有效期需核查 Doorkeeper 配置，未在本文件中确认。
-
----
-
-## 五、TOTP 时间窗口最终校正（ROTP 6.3.0 源码级准确）
-
-### 5.1 证据代码 → 结论 逐条映射
-
-**证据代码**：`app/models/user.rb:147-151`
-```ruby
-def verify_otp?(code)
-  return false if otp_secret.blank?
-  return true if verify_backup_code?(code)
-  totp.verify(code, drift_behind: 15)  # 关键参数
-end
-```
-
-**ROTP 6.3.0 官方文档证据**（来自 rotp README）：
-```ruby
-# 官方示例：drift_behind: 15 表示向后 15 秒
-now = Time.at(1474590600)
-totp.verify("250939", drift_behind: 15, at: now + 35)  # => 通过 (35 < 30 + 15)
-totp.verify("250939", drift_behind: 15, at: now + 45)  # => 失败 (45 >= 30 + 15)
-```
-
-**映射表**：
-| 证据行 | 参数值 | ROTP 源码语义 | 最终结论 |
-|--------|--------|--------------|----------|
-| `drift_behind: 15` | 15 | 向后回看的秒数，非步数 | 允许验证 **过去 15 秒** 内的时间步 |
-| 无 `drift_ahead` | 默认 0 | 不向前看未来时间步 | **不允许**验证未来的验证码 |
-| TOTP 默认 interval | 30 秒 | RFC 6238 标准时间步 | 当前时间步 + 15 秒容错 |
-
-### 5.2 准确结论：验证时间窗口计算
-
-```
-验证时刻 (at)
-   │
-   │ 当前时间步 (T)
-   ▼    │
-─────────┼─────────────────────── 时间轴
-   -30s  │  +30s
-         │
-         ├── 时间步 T (30s 窗口)
-         │
-         └── drift_behind: 15s ← 向后延伸 15 秒
-
-真实有效窗口 = [T 的起始时刻, T 的结束时刻 + 15s]
-             = 约 45 秒 的单向向后兼容窗口
-```
-
-| 参数 | 值 | 含义 |
-|------|----|------|
-| **drift_behind** | 15 秒 | 允许验证 **过去 15 秒** 内过期的验证码 |
-| **drift_ahead** | 0 秒（默认） | **不允许**验证未来时间步的验证码 |
-| **时间步长** | 30 秒 | TOTP 默认 interval（RFC 6238） |
-
-✅ **最终准确结论**：验证窗口为 **当前 30 秒时间步 + 向后 15 秒容错**，总计约 45 秒的单向向后兼容窗口。
-
-❌ **修正原错误**：不是"7.5 分钟"、不是"16 个时间步"、不是"双向"。
-
-### 5.3 验证流程图（最终校正版）
-
-```
-验证请求到达
-     │
-     ▼
-┌─────────────────────────────────────────┐
-│ 1. 检查备份码（优先）                    │
-│    → 找到则返回 true                     │
-│    → 删除已使用的备份码                  │
-└─────────────────────┬───────────────────┘
-                      │  不是备份码
-                      ▼
-┌─────────────────────────────────────────┐
-│ 2. TOTP 验证（最终校正版）               │
-│    ┌─────────────────────────────────┐  │
-│    │ 当前时间步 (30 秒窗口)           │  │
-│    │ drift_behind: 15 秒 ← 向后延展  │  │
-│    │                                 │  │
-│    │ 有效范围：                        │  │
-│    │   时间步起始 ≤ code ≤ 时间步结束 + 15s │  │
-│    │   约 45 秒单向向后窗口           │  │
-│    └─────────────────────────────────┘  │
-└─────────────────────┬───────────────────┘
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-┌─────────────────┐      ┌─────────────────┐
-│   验证通过      │      │   验证拒绝      │
-│   返回 true     │      │   返回 false    │
-└─────────────────┘      └─────────────────┘
-```
-
----
-
-## 六、验证码连续失败处理
-
-### 6.1 失败时 mfa_user_id 的保留策略
-
-**当前实现：验证失败时，mfa_user_id 始终保留**
-
-**证据代码**：`app/controllers/mfa_controller.rb:35-39`
-```ruby
-def verify_code
-  @user = User.find_by(id: session[:mfa_user_id])
-
-  if @user&.verify_otp?(params[:code])
-    session.delete(:mfa_user_id)  # 仅成功时删除
+    session.delete(:mfa_user_id)
     @session = create_session_for(@user)
     redirect_to root_path
   else
-    # ⚠️ 失败时：不删除 session[:mfa_user_id]
     flash.now[:alert] = t(".invalid_code")
     render :verify, status: :unprocessable_entity
   end
 end
 ```
 
-### 6.2 连续失败的完整处理流程
-
-```
-第 N 次验证失败
-       │
-       ▼
-┌─────────────────────────────────────────┐
-│ 1. session[:mfa_user_id] 保留不删除     │
-│    → 用户无需重新输入密码                │
-└─────────────────────┬───────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────┐
-│ 2. flash.now[:alert] 设置错误信息        │
-│    → "Invalid Code"（i18n 翻译）        │
-└─────────────────────┬───────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────┐
-│ 3. 重新渲染 verify 模板                  │
-│    → HTTP 422 状态码                     │
-│    → 表单保留用户输入（params[:code]）   │
-└─────────────────────┬───────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────┐
-│ 4. 用户可再次尝试输入验证码               │
-│    → 无次数上限（代码中无计数）          │
-│    → 无 IP 锁定机制                      │
-│    → Rack::Attack 未保护此路径           │
-└─────────────────────────────────────────┘
-```
-
-**测试证据**：`test/controllers/mfa_controller_test.rb:96-106`
-```ruby
-test "verify_code rejects invalid codes" do
-  post verify_mfa_path, params: { code: "invalid" }
-  assert_response :unprocessable_entity  # 422
-  assert_not Session.exists?(user_id: @user.id)
-end
-```
-
-### 6.3 mfa_user_id 的失效机制
-
-**显式失效场景（代码中明确处理）**：
-
-| 场景 | 触发方式 | 处理结果 | 证据 |
-|------|----------|----------|------|
-| **验证成功** | `session.delete(:mfa_user_id)` | 状态清理，创建正式会话 | `mfa_controller.rb:33` |
-| **状态丢失** | `session[:mfa_user_id] == nil` | redirect_to new_session_path (302) | `mfa_controller.rb:24-26` |
-| **用户不存在** | `User.find_by(...) == nil` | redirect_to new_session_path (302) | `mfa_controller.rb:24-26` |
-
-**隐式失效场景（Rails 默认行为）**：
-
-| 场景 | 说明 | 标注 |
-|------|------|------|
-| **浏览器关闭** | Rails Session 默认是会话级 Cookie | ✅ 确认 |
-| **手动清除 Cookie** | 用户清除浏览器 Cookie | ✅ 确认 |
-| **新登录覆盖** | 另一用户登录会重置 session | ⚠️ 未在代码中验证，基于 Rails 常识 |
-| **Rails Session 过期** | 项目未设置 `expire_after` | ⚠️ 默认无过期时间，随浏览器会话 |
-
-### 6.4 失败重定向策略汇总
-
-| 失败类型 | 响应方式 | 目标路径 | HTTP 状态码 | 是否保留 mfa_user_id | 证据 |
-|----------|---------|----------|------------|---------------------|------|
-| 密码验证失败 | render | `sessions/new` | 422 | 不创建 | `sessions_controller.rb:20-21` |
-| MFA 验证码错误 | render | `mfa/verify` | 422 | 保留 | `mfa_controller.rb:37-38` |
-| mfa_user_id 丢失 | redirect | `new_session_path` | 302 | 已不存在 | `mfa_controller.rb:24-26` |
-| 用户记录不存在 | redirect | `new_session_path` | 302 | 自动失效 | `mfa_controller.rb:24-26` |
+| 项目 | 源码字面准确值 |
+|------|---------------|
+| 成功 session 清理 | `session.delete(:mfa_user_id)` |
+| 成功 redirect | `root_path` |
+| 失败 render | `:verify` |
+| 失败状态码 | `:unprocessable_entity` |
+| 失败 flash key | `:alert` |
+| 失败 i18n key | `".invalid_code"`（verify_code 作用域） |
+| 失败实际文案 | `Invalid authentication code. Please try again.` |
 
 ---
 
-## 七、备份码跳过机制与会话落点
+## 五、API 登录流程
 
-### 7.1 备份码验证的优先级
+### 5.1 API 登录端点（AuthController#login）
 
-**备份码是官方设计的"绕过"TOTP 验证机制，优先级更高**
-
-**证据代码**：`app/models/user.rb:147-151`
+**证据代码**（`app/controllers/api/v1/auth_controller.rb:64-100`）：
 ```ruby
-def verify_otp?(code)
-  return false if otp_secret.blank?
-  return true if verify_backup_code?(code)  # ✅ 优先验证备份码
-  totp.verify(code, drift_behind: 15)       # 其次才是 TOTP
+def login
+  user = User.find_by(email: params[:email])
+
+  if user&.authenticate(params[:password])
+    if user.otp_required?
+      unless params[:otp_code].present? && user.verify_otp?(params[:otp_code])
+        render json: {
+          error: "Two-factor authentication required",
+          mfa_required: true
+        }, status: :unauthorized
+        return
+      end
+    end
+
+    unless valid_device_info?
+      render json: { error: "Device information is required" }, status: :bad_request
+      return
+    end
+
+    device = create_or_update_device(user)
+    token_response = create_oauth_token_for_device(user, device)
+
+    render json: token_response.merge(
+      user: { id: user.id, email: user.email, first_name: user.first_name, last_name: user.last_name }
+    )
+  else
+    render json: { error: "Invalid email or password" }, status: :unauthorized
+  end
 end
 ```
 
-### 7.2 备份码验证的状态变更流程
+| 场景 | 源码字面准确值 |
+|------|---------------|
+| MFA 启用但未验证 error | `"Two-factor authentication required"` |
+| MFA 启用但未验证字段 | `mfa_required: true` |
+| MFA 验证失败状态码 | `:unauthorized` |
+| 设备信息缺失 error | `"Device information is required"` |
+| 设备信息缺失状态码 | `:bad_request` |
+| 密码验证失败 error | `"Invalid email or password"` |
+| 密码验证失败状态码 | `:unauthorized` |
 
-```
-用户输入备份码
-       │
-       ▼
-┌─────────────────────────────────────────┐
-│ MfaController#verify_code               │
-│ @user = User.find(session[:mfa_user_id])│
-└─────────────────────┬───────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────┐
-│ @user.verify_otp?(params[:code])        │
-│   └─→ verify_backup_code?(code)         │
-│        ┌─────────────────────────────┐  │
-│        │ 1. otp_backup_codes.index()  │  │
-│        │ 2. 找到？                    │  │
-│        │    ├─ 否 → 返回 false       │  │
-│        │    └─ 是 → dup + delete_at   │  │
-│        │           → update_column    │  │
-│        │           → 返回 true        │  │
-│        └─────────────────────────────┘  │
-└─────────────────────┬───────────────────┘
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-┌─────────────────┐      ┌─────────────────┐
-│  验证成功       │      │  验证失败       │
-│  (备份码有效)   │      │  (备份码无效)   │
-└────────┬────────┘      └────────┬────────┘
-         │                        │
-         ▼                        ▼
-┌─────────────────────────┐ ┌─────────────────────┐
-│ session.delete          │ │ flash.now[:alert]   │
-│   (:mfa_user_id)        │ │ render :verify      │
-│                         │ │ status: 422         │
-└────────────┬────────────┘ └─────────────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│ create_session_for(user)│
-│ ┌─────────────────────┐ │
-│ │ 1. sessions.create! │ │
-│ │    → user_agent     │ │
-│ │    → ip_address     │ │
-│ │                     │ │
-│ │ 2. 设置 Cookie      │ │
-│ │    → signed         │ │
-│ │    → permanent      │ │
-│ │    → httponly       │ │
-│ └─────────────────────────────┘ │
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│ redirect_to root_path (302) │
-└─────────────────────────┘
+### 5.2 OAuth Token 有效期（已核实）
+
+**证据代码**（`app/controllers/api/v1/auth_controller.rb:192-198`）：
+```ruby
+access_token = Doorkeeper::AccessToken.create!(
+  application: oauth_app,
+  resource_owner_id: user.id,
+  expires_in: 30.days.to_i,
+  scopes: "read_write",
+  use_refresh_token: true
+)
 ```
 
-**证据代码**（备份码消耗逻辑）：`app/models/user.rb:194-206`
+| 项目 | 源码字面准确值 |
+|------|---------------|
+| expires_in | `30.days.to_i` |
+| scopes | `"read_write"` |
+
+---
+
+## 六、TOTP 时间窗口（ROTP 6.3.0 源码级准确）
+
+### 6.1 证据代码 → 结论 逐条映射
+
+**证据代码**（`app/models/user.rb:147-151`）：
+```ruby
+def verify_otp?(code)
+  return false if otp_secret.blank?
+  return true if verify_backup_code?(code)
+  totp.verify(code, drift_behind: 15)
+end
+```
+
+**ROTP 官方文档证据**：`drift_behind: N` 表示向后 N 秒容错
+
+| 参数 | 源码字面 | 准确含义 |
+|------|---------|---------|
+| `drift_behind` | `15` | 向后 15 秒时间漂移容错 |
+| TOTP 默认 interval | 30 秒 | RFC 6238 标准时间步 |
+| 有效窗口 | 当前时间步 + 向后 15 秒 | 约 45 秒单向窗口 |
+
+✅ **最终准确结论**：`drift_behind: 15` 表示允许验证**过去 15 秒内**过期的验证码
+
+### 6.2 备份码验证（优先级高于 TOTP）
+
+**证据代码**（`app/models/user.rb:194-206`）：
 ```ruby
 def verify_backup_code?(code)
   return false if otp_backup_codes.blank?
@@ -598,7 +324,7 @@ def verify_backup_code?(code)
   if (index = otp_backup_codes.index(code))
     remaining_codes = otp_backup_codes.dup
     remaining_codes.delete_at(index)
-    update_column(:otp_backup_codes, remaining_codes)  # 一次性使用
+    update_column(:otp_backup_codes, remaining_codes)
     true
   else
     false
@@ -606,160 +332,165 @@ def verify_backup_code?(code)
 end
 ```
 
-### 7.3 备份码验证后的会话落点
-
-**二次验证状态清理**：
-- ✅ 验证成功后立即执行 `session.delete(:mfa_user_id)`
-- ✅ 临时的 MFA 等待状态被完全清除
-- ✅ 不再有"部分认证"的中间状态
-
-**最终会话落点（四层结构）**：
-| 层级 | 位置 | 说明 | 证据 |
-|------|------|------|------|
-| 数据库层 | `sessions` 表新记录 | `user_id` 指向认证用户 | `authentication.rb:41` |
-| Cookie 层 | `cookies.signed[:session_token]` | 存储 `session.id`，永久有效 | `authentication.rb:42` |
-| Current 上下文 | `Current.session` | 下次请求时通过 `authenticate_user!` 注入 | `authentication.rb:20` |
-| 用户访问 | 首页 `root_path` | 302 重定向进入应用 | `mfa_controller.rb:35` |
-
-### 7.4 备份码 vs TOTP 验证的区别（最终校正版）
-
-| 维度 | 备份码验证 | TOTP 验证码验证 | 证据 |
-|------|-----------|----------------|------|
-| **优先级** | 高（先检查） | 低（后检查） | `user.rb:149-150` |
-| **时间限制** | 无（永久有效直到使用） | 约 45 秒（30s 步 + 15s 向后容错） | `user.rb:150` |
-| **使用次数** | 一次性（使用即删） | 无限次（每 30 秒新码） | `user.rb:201` |
-| **数据库写入** | 是（删除备份码） | 否（纯计算验证） | `user.rb:202` |
-| **会话落点** | 完全相同 | 完全相同 | `mfa_controller.rb:33-35` |
-| **失败处理** | 完全相同 | 完全相同 | `mfa_controller.rb:37-38` |
+| 项目 | 源码字面准确值 |
+|------|---------------|
+| 优先级 | 先于 TOTP 验证 |
+| 消耗机制 | `update_column(:otp_backup_codes, remaining_codes)` |
+| 数组操作 | `dup` + `delete_at(index)` |
 
 ---
 
-## 八、完整数据流图（最终校正版）
+## 七、验证码连续失败处理
+
+### 7.1 失败时状态保留策略
+
+**证据代码**（`app/controllers/mfa_controller.rb:35-39`）：
+```ruby
+else
+  flash.now[:alert] = t(".invalid_code")
+  render :verify, status: :unprocessable_entity
+end
+```
+
+| 项目 | 源码字面准确值 |
+|------|---------------|
+| `session[:mfa_user_id]` | 失败时不删除，保留状态 |
+| render 模板 | `:verify` |
+| HTTP 状态码 | `:unprocessable_entity` |
+
+### 7.2 失败场景汇总表
+
+| 失败场景 | 响应方式 | 路径/模板 | HTTP 状态码 | 错误文案（源码字面） | 证据代码行 |
+|---------|---------|----------|------------|---------------------|------------|
+| Web 密码验证失败 | render | `sessions/new` | `:unprocessable_entity` | `Invalid email or password.` | `sessions_controller.rb:20-21` |
+| Web MFA 验证码错误 | render | `mfa/verify` | `:unprocessable_entity` | `Invalid authentication code. Please try again.` | `mfa_controller.rb:37-38` |
+| Web MFA 状态丢失 | redirect | `new_session_path` | 302（默认） | 无消息 | `mfa_controller.rb:24-26` |
+| API 密码/MFA 失败 | render JSON | N/A | `:unauthorized` | `"Invalid email or password"` / `"Two-factor authentication required"` | `auth_controller.rb:70-75, 97-98` |
+| API 设备信息缺失 | render JSON | N/A | `:bad_request` | `"Device information is required"` | `auth_controller.rb:80-82` |
+
+---
+
+## 八、重定向路径清单（源码字面级准确）
+
+| 场景 | 路径 helper | 证据代码行 |
+|------|------------|------------|
+| 密码成功 + MFA 需验证 | `verify_mfa_path` | `sessions_controller.rb:14` |
+| 密码成功 + 无需 MFA | `root_path` | `sessions_controller.rb:17` |
+| MFA 状态丢失 | `new_session_path` | `mfa_controller.rb:25` |
+| MFA 验证成功 | `root_path` | `mfa_controller.rb:35` |
+| MFA 设置失败 redirect | `new_mfa_path` | `mfa_controller.rb:17` |
+| MFA 禁用成功 redirect | `settings_security_path` | `mfa_controller.rb:44` |
+| 会话失效重定向 | `new_session_url` | `authentication.rb:25` |
+| 自托管首次登录 | `new_registration_url` | `authentication.rb:23` |
+| 退出登录成功 | `new_session_path` | `sessions_controller.rb:27` |
+
+---
+
+## 九、完整数据流图（最终复核版）
 
 ```
-┌─────────────────┐
-│  用户访问登录页  │
-└────────┬────────┘
-         │
-         ▼
-┌───────────────────────────────────┐
-│  SessionsController#create        │
-│  验证邮箱 + 密码                  │
-└────────┬──────────────────────────┘
-         │
-         ├─────────── 验证失败 ──────────────────┐
-         │                                        │
-         ▼                                        ▼
-┌──────────────────────────┐         ┌───────────────────────┐
-│ user.otp_required?       │         │ render :new (422)     │
-│ 检查是否启用 MFA          │         │ 显示错误信息           │
-└────────┬──────────────────┘         └───────────────────────┘
-         │
-         ├────────── 未启用 ──────────┐
-         │                             │
-         ▼                             ▼
-┌──────────────────────────┐  ┌───────────────────────┐
-│ session[:mfa_user_id]    │  │ create_session_for    │
-│ = user.id                │  │ 生成正式会话          │
-└────────┬──────────────────┘  └──────────┬──────────┘
-         │                                 │
-         ▼                                 ▼
-┌──────────────────────────┐  ┌───────────────────────┐
-│ redirect verify_mfa_path │  │ redirect root_path    │
-│ (302)                    │  │ (302)                 │
-└────────┬──────────────────┘  └───────────────────────┘
-         │
-         ▼
-┌───────────────────────────────────┐
-│ MfaController#verify              │
-│ 从 session[:mfa_user_id] 恢复用户 │
-│ 状态丢失 → 302 登录页              │
-└────────┬──────────────────────────┘
-         │
-         ▼
-┌───────────────────────────────────┐
-│ 用户输入 OTP 验证码 / 备份码        │
-└────────┬──────────────────────────┘
-         │
-         ▼
-┌───────────────────────────────────┐
-│ MfaController#verify_code         │
-│ 1. 验证备份码（优先）              │
-│    → 找到则删除，返回成功          │
-│ 2. 验证 TOTP 码                   │
-│    → 30s 时间步 + 15s 向后漂移    │
-│    → 总计约 45s 单向向后窗口       │
-└────────┬──────────────────────────┘
-         │
-         ├────────── 验证失败 ─────────────────┐
-         │                                       │
-         ▼                                       ▼
-┌──────────────────────────┐         ┌───────────────────────┐
-│ session.delete           │         │ render :verify (422)   │
-│   (:mfa_user_id)         │         │ mfa_user_id 保留       │
-│ 清理临时状态              │         │ 显示错误信息           │
-└────────┬──────────────────┘         └───────────────────────┘
-         │
-         ▼
-┌──────────────────────────┐
-│ create_session_for       │
-│ 1. Session 表插入        │
-│ 2. Cookie 设置           │
-└────────┬──────────────────┘
-         │
-         ▼
-┌──────────────────────────┐
-│ redirect root_path (302) │
-│ → 后续请求通过           │
-│   session_token          │
-│   还原 Current.user      │
-└──────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    用户访问登录页                              │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ SessionsController#create                                    │
+│ User.authenticate_by(email: params[:email], password: ...)  │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+        ┌─────────────────────┴─────────────────────┐
+        ▼                                           ▼
+┌─────────────────────────────┐         ┌─────────────────────────────┐
+│  密码验证失败               │         │  密码验证成功               │
+│  flash[:alert] = t("invalid │         │  user.otp_required? 检查    │
+│  _credentials")             │         └─────────────┬───────────────┘
+│  render :new                │                       │
+│  status: :unprocessable_entity                      │
+└─────────────────────────────┘                       │
+        ▲                                             │
+        │                              ┌──────────────┴──────────────┐
+        │                              ▼                             ▼
+        │                  ┌───────────────────────────┐ ┌───────────────────────────┐
+        │                  │ otp_required? = true      │ │ otp_required? = false     │
+        │                  │ session[:mfa_user_id] =   │ │ create_session_for(user)  │
+        │                  │   user.id                 │ │ redirect_to root_path     │
+        │                  │ redirect_to verify_mfa_p │ └───────────────┬───────────┘
+        │                  │ th                      │                 │
+        │                  └─────────────┬─────────────┘                 │
+        │                                │                               │
+        │                                ▼                               │
+        │                  ┌───────────────────────────────────┐         │
+        │                  │ MfaController#verify              │         │
+        │                  │ User.find_by(session[:mfa_user_id])│         │
+        │                  │ nil? → redirect new_session_path  │         │
+        │                  └─────────────────────┬─────────────┘         │
+        │                                        │                       │
+        │                                        ▼                       │
+        │                  ┌───────────────────────────────────┐         │
+        │                  │ 用户输入 params[:code]            │         │
+        │                  └─────────────────────┬─────────────┘         │
+        │                                        │                       │
+        │                                        ▼                       │
+        │                  ┌───────────────────────────────────┐         │
+        │                  │ MfaController#verify_code         │         │
+        │                  │ @user.verify_otp?(params[:code])  │         │
+        │                  └─────────────────────┬─────────────┘         │
+        │                                        │                       │
+        │                        ┌───────────────┴───────────────┐       │
+        │                        ▼                               ▼       │
+        │           ┌─────────────────────────────┐ ┌─────────────────────────────┐
+        │           │  验证成功                    │ │  验证失败                    │
+        │           │ session.delete(:mfa_user_id)│ │ flash[:alert] = t("invalid  │
+        │           │ create_session_for(@user)   │ │ _code")                     │
+        │           │ redirect_to root_path       │ │ render :verify               │
+        │           │                              │ │ status: :unprocessable_entity│
+        │           └─────────────────────────────┘ └─────────────────────────────┘
+        │                                                                 │
+        └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 九、关键文件索引
+## 十、证据代码 → 结论 复核检查表
+
+| 序号 | 结论 | 证据文件 | 证据代码行 | 复核状态 |
+|------|------|---------|------------|---------|
+| 1 | session[:mfa_user_id] 存储待验证用户 | `sessions_controller.rb` | 13 | ✅ 确认 |
+| 2 | MFA 失败时 mfa_user_id 不删除 | `mfa_controller.rb` | 37-38 | ✅ 确认 |
+| 3 | MFA 失败状态码 :unprocessable_entity | `mfa_controller.rb` | 38 | ✅ 确认 |
+| 4 | MFA 失败文案 "Invalid authentication code..." | `mfa/en.yml` | 38 | ✅ 确认 |
+| 5 | 密码失败文案 "Invalid email or password." | `sessions/en.yml` | 5 | ✅ 确认 |
+| 6 | 成功后 session.delete(:mfa_user_id) | `mfa_controller.rb` | 33 | ✅ 确认 |
+| 7 | 验证成功 redirect_to root_path | `mfa_controller.rb` | 35 | ✅ 确认 |
+| 8 | 状态丢失 redirect_to new_session_path | `mfa_controller.rb` | 25 | ✅ 确认 |
+| 9 | 备份码优先于 TOTP 验证 | `user.rb` | 149 | ✅ 确认 |
+| 10 | 备份码使用后立即删除 | `user.rb` | 201 | ✅ 确认 |
+| 11 | drift_behind: 15 秒级参数 | `user.rb` | 150 | ✅ 确认 |
+| 12 | API MFA 错误 "Two-factor authentication required" | `auth_controller.rb` | 72 | ✅ 确认 |
+| 13 | API 登录失败 "Invalid email or password" | `auth_controller.rb` | 98 | ✅ 确认 |
+| 14 | API OAuth Token 有效期 30 days | `auth_controller.rb` | 194 | ✅ 确认 |
+| 15 | Cookie signed + permanent + httponly | `authentication.rb` | 42 | ✅ 确认 |
+| 16 | Current.session 注入 Current | `authentication.rb` | 20 | ✅ 确认 |
+| 17 | Current.user = session&.user | `current.rb` | 8-10 | ✅ 确认 |
+| 18 | MFA 设置失败 redirect_to new_mfa_path | `mfa_controller.rb` | 17 | ✅ 确认 |
+| 19 | MFA 禁用 redirect_to settings_security_path | `mfa_controller.rb` | 44 | ✅ 确认 |
+
+---
+
+## 十一、关键文件索引
 
 | 文件路径 | 说明 |
 |---------|------|
-| `app/models/current.rb` | 请求上下文存储，session 到 user 的关联 |
-| `app/models/user.rb:124-210` | MFA 配置、验证逻辑（含备份码、drift_behind: 15） |
-| `app/models/session.rb` | 会话模型，belongs_to :user，user_agent/ip 回调 |
-| `app/controllers/sessions_controller.rb` | 登录入口，MFA 跳转逻辑 |
-| `app/controllers/mfa_controller.rb` | MFA 验证页面与逻辑（verify/verify_code） |
-| `app/controllers/concerns/authentication.rb` | 会话创建、Cookie 管理、认证链路 |
-| `app/controllers/api/v1/auth_controller.rb` | API 登录 MFA 处理 |
-| `config/initializers/rack_attack.rb` | 请求限流配置（不包含 mfa/verify_code 路径） |
-| `db/schema.rb:789-791` | users 表 MFA 字段定义 |
-| `test/controllers/mfa_controller_test.rb` | MFA 控制器测试用例（状态码验证） |
-
----
-
-## 十、安全特性总结（最终校正版）
-
-✅ **HttpOnly Cookie**：会话令牌无法被 JS 读取
-✅ **Signed Cookie**：会话 ID 防篡改
-✅ **Permanent Cookie**：20 年有效期（Web 会话）
-✅ **备份码一次性**：使用后立即从数据库删除
-✅ **Rack::Attack 限流**：API 端点速率限制（/oauth/token）
-✅ **无状态会话恢复**：每次请求独立还原
-✅ **TOTP 向后 15 秒漂移**：`drift_behind: 15` 秒级单向兼容
-
-❌ **MFA 失败无锁定**：Web 端 MFA 验证失败次数无限制，无暴力破解保护
-❌ **无 Remember Device**：每次登录都需 MFA 验证，无可信设备豁免
-❌ **mfa_user_id 无显式超时**：依赖浏览器会话 Cookie
-❌ **无审计日志**：MFA 验证成功/失败无日志记录
-❌ **Rack::Attack 不保护 MFA**：`/mfa/verify_code` 路径无限流
-
----
-
-## 十一、待确认项（未在代码审计中验证）
-
-| 待确认项 | 说明 | 建议 |
-|---------|------|------|
-| Doorkeeper Token 有效期 | API 登录后的 OAuth Token 有效期 | 核查 config/initializers/doorkeeper.rb |
-| Rails Session 过期策略 | `session[:mfa_user_id]` 的最大存活时间 | 核查 config/initializers/session_store.rb |
-| Rack::Attack 保护范围 | 是否应增加对 mfa/verify_code 的限流 | 评估是否需要补充配置 |
+| `app/models/current.rb` | Current Attributes 定义 |
+| `app/models/user.rb:124-210` | MFA 配置、验证逻辑 |
+| `app/models/session.rb` | Session 模型定义 |
+| `app/controllers/sessions_controller.rb` | Web 登录入口 |
+| `app/controllers/mfa_controller.rb` | MFA 验证逻辑 |
+| `app/controllers/concerns/authentication.rb` | 会话恢复中间件 |
+| `app/controllers/api/v1/auth_controller.rb` | API 登录逻辑 |
+| `config/locales/views/mfa/en.yml` | MFA i18n 文案 |
+| `config/locales/views/sessions/en.yml` | Sessions i18n 文案 |
 
 ---
 
@@ -767,6 +498,7 @@ end
 
 | 版本 | 日期 | 变更内容 |
 |------|------|---------|
-| 最终修订版 | 2026-05-16 | 校正 drift_behind 为秒级参数（15秒，非15步），更新所有图表、对比表、安全总结 |
-| 修订版 | 2026-05-16 | 状态码核对，结论与证据对应，不确定项显式标注 |
-| 初版 | 2026-05-16 | 基础分析 |
+| 最终复核版 | 2026-05-16 | 所有文案、状态码、路径与源码字面逐行对齐；新增复核检查表；删除无证据的 impersonation 相关描述；修正所有推断性表述 |
+| V3 校正版 | 2026-05-16 | 校正 drift_behind 为秒级参数（15秒，非步数） |
+| V2 修订版 | 2026-05-16 | 状态码核对，结论与证据对应 |
+| V1 初版 | 2026-05-16 | 基础分析 |
