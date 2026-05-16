@@ -82,6 +82,127 @@ end
 
 ---
 
+### 🔴 Source 字段完整边界说明
+
+#### 1. 默认值来源
+
+**source 默认值定义在数据库迁移层面，而非模型层面**
+
+文件: `db/migrate/20250618104425_add_source_to_api_keys.rb:3`
+```ruby
+add_column :api_keys, :source, :string, default: "web"
+```
+
+**关键行为**：
+- `ApiKey.new.source` → `nil`（新建内存对象时无值）
+- 只有调用 `save` 写入数据库时，才会由数据库填充 `"web"`
+- 模型层没有 `before_validation` 回调设置默认值
+
+---
+
+#### 2. 模型层单活跃 Key 约束实现
+
+**约束目标**：同一用户 + 同一 source，只能有一个活跃（未撤销、未过期）的 API Key
+
+**三层防护实现**：
+
+| 层级 | 实现位置 | 作用机制 |
+|------|---------|---------|
+| 数据库索引 | 迁移文件 | `add_index :api_keys, [:user_id, :source]` - 加速查询 |
+| 模型验证 | `app/models/api_key.rb:16, 89-93` | 创建时检查是否已有同 source 活跃 Key |
+| 业务逻辑 | 设置页控制器 | 创建前临时撤销所有现有 Key |
+
+**模型验证源码**：
+文件: `app/models/api_key.rb:16, 89-93`
+```ruby
+# 仅在创建时触发验证
+validate :one_active_key_per_user_per_source, on: :create
+
+def one_active_key_per_user_per_source
+  if user&.api_keys&.active&.where(source: source)&.where&.not(id: id)&.exists?
+    errors.add(:user, "can only have one active API key per source (#{source})")
+  end
+end
+```
+
+> 注意：`on: :create` 意味着更新操作（如撤销/过期）不会触发此验证。
+
+---
+
+#### 3. 设置页 Create 临时撤销所有 source Key 的原因
+
+**设计决策背景**：
+
+文件: `app/controllers/settings/api_keys_controller.rb:25-34`
+```ruby
+# 🔴 关键：不区分 source，全部临时撤销！
+existing_keys = Current.user.api_keys.active
+existing_keys.each { |key| key.update_column(:revoked_at, Time.current) }
+```
+
+**为什么要撤销所有 source，而不是只撤销 web source？**
+
+| 原因 | 说明 |
+|------|------|
+| **设置页定位** | 面向普通用户，假定用户同一时间只需要一个 API Key，不区分端 |
+| **简化心智模型** | 对普通用户隐藏 "source" 概念，前端表单没有 source 选择项 |
+| **避免竞态条件** | 如果只撤销 web source，而用户恰好有 mobile key，模型验证仍然会失败（因为新 key 最终 source 是 web，但验证时还没到数据库默认值填充） |
+| **模型验证时序** | source 默认值由数据库填充，save 前 validation 时 `source == nil`，无法正确过滤 |
+
+> **时序问题详解**：创建时新 key 的 source 还是 nil，此时执行模型验证 `where(source: nil)` 找不到任何现有 key，理论上可以通过。但写入数据库后 source 变为 web，就可能出现重复。所以最稳妥的做法是**先全部撤销，再创建**。
+
+---
+
+#### 4. 创建成功与失败的结果保留
+
+**状态机流程**：
+
+```
+开始创建
+   │
+   ▼
+查询所有活跃 Key → existing_keys
+   │
+   ▼
+全部临时撤销（update_column :revoked_at）
+   │
+   ▼
+尝试 save 新 Key
+   │
+   ├─ ✅ 成功 → 直接跳转，旧 Key 保持撤销状态
+   │    │
+   │    └─ 最终结果：新 Key 生效，所有旧 Key 失效（跨 source）
+   │
+   └─ ❌ 失败 → 遍历 existing_keys 恢复 revoked_at = nil
+        │
+        └─ 最终结果：新 Key 未创建，所有旧 Key 恢复可用
+```
+
+**成功与失败对比表**：
+
+| 场景 | 新 Key 状态 | 原有 web Key | 原有 mobile Key |
+|------|------------|------------|----------------|
+| 创建成功 | ✅ 生效（source = web） | ❌ 永久撤销 | ❌ 永久撤销 |
+| 创建失败 | ❌ 回滚未创建 | ✅ 恢复可用 | ✅ 恢复可用 |
+
+**代码证据**：
+文件: `app/controllers/settings/api_keys_controller.rb:28-35`
+```ruby
+if @api_key.save
+  # 成功后不做任何处理，旧 key 保持 revoked
+  flash[:notice] = "Your API key has been created successfully"
+  redirect_to settings_api_key_path
+else
+  # 失败则恢复所有旧 key（通过 ActiveRecord 脏对象追踪）
+  existing_keys.each { |key| key.update_column(:revoked_at, nil) }
+  render :new, status: :unprocessable_entity
+end
+```
+
+> **边界风险**：并发创建请求时，第二个请求会撤销第一个请求刚创建的 Key，造成竞态条件丢失。
+
+---
+
 ## 2. API Key 创建流程
 
 ### 步骤详解
@@ -474,44 +595,64 @@ end
 
 #### 边界：Current.user 与 current_resource_owner 的取值链路差异
 
-**两个用户对象的取值链路对比**：
+**1. 完整时序对比与可获得性窗口**
+
+```
+API 请求生命周期时序：
+
+  before_action 1: authenticate_request!
+      │
+      ├─ authenticate_oauth / authenticate_api_key 成功
+      │    └─ @current_user = user  ← @current_user 在此处可用
+      │         └─ current_resource_owner 立即可用 ✅
+      │
+      └─ setup_current_context_for_api 执行
+           ├─ 查找现有 Session 或 build 临时 Session
+           └─ Current.session = session  ← Current 上下文在此设置
+                └─ 此时 Current.user 才可用 ✅
+
+  before_action 2: check_api_key_rate_limit
+  before_action 3: log_api_access
+  └─ 两个用户对象都已可用
+
+  控制器动作执行
+```
+
+**关键差异点**：
+| 时间点 | `current_resource_owner` | `Current.user` |
+|--------|-------------------------|----------------|
+| 鉴权成功后立即 | ✅ 可用 | ❌ 不可用（需等 setup_current_context_for_api） |
+| setup 完成后 | ✅ 可用 | ✅ 可用 |
+
+---
+
+**2. 属性对比总表**
 
 | 维度 | `current_resource_owner` | `Current.user` |
 |------|-------------------------|----------------|
-| 定义位置 | API Base Controller | 全局 Current Attributes |
-| 文件 | `app/controllers/api/v1/base_controller.rb:156-158` | `app/models/current.rb` |
-| 核心代码 | `@current_user` | `session&.user` 或 `impersonated_user` |
-| 设置时机 | 鉴权成功时直接赋值 | `setup_current_context_for_api` 中间步骤 |
+| 定义位置 | API Base Controller 实例方法 | 全局 CurrentAttributes 单例 |
+| 文件位置 | `app/controllers/api/v1/base_controller.rb:156-158` | `app/models/current.rb` |
+| 核心代码 | 直接返回 `@current_user` 实例变量 | `impersonated_user || session&.user` |
+| 设置时机 | 鉴权成功时直接赋值 | `setup_current_context_for_api` 回调 |
+| 生效延迟 | 立即可用 | 需等待 Session 查找/构建完成 |
+| 线程安全 | 控制器实例级别，请求隔离 | 全局单例，但基于 RequestStore |
 
-**链路流程对比**：
+---
 
-```
-current_resource_owner 链路（直接）:
-  ├─ authenticate_oauth 或 authenticate_api_key 成功
-  └─ @current_user = ...  ← 直接赋值
-     └─ current_resource_owner → @current_user
-
-Current.user 链路（间接）:
-  ├─ 鉴权成功 → @current_user 已赋值
-  ├─ setup_current_context_for_api 执行
-  │   ├─ 查找 @current_user.sessions.first
-  │   │  或构建临时 Session 对象
-  │   └─ Current.session = session  ← 设置 Current 上下文
-  └─ Current.user → Current.session.user
-```
-
-**代码实现**：
+**3. 源码实现证据**
 
 文件: `app/controllers/api/v1/base_controller.rb:156-158`
 ```ruby
+# 返回直接持有，无额外间接调用
 def current_resource_owner
-  @current_user  # 直接返回实例变量
+  @current_user
 end
 ```
 
 文件: `app/models/current.rb:8-14`
 ```ruby
 def user
+  # 优先返回被模仿的用户（支持管理员模拟用户场景）
   impersonated_user || session&.user
 end
 
@@ -520,10 +661,23 @@ def impersonated_user
 end
 ```
 
-> **API 控制器最佳实践**：
-> - 在 API 控制器及其子类中，**始终使用 `current_resource_owner`** 来获取当前用户
-> - `Current.user` 主要用于非 API 的 Web 请求场景
-> - 两者指向的是同一个 User 记录，但取值路径不同
+---
+
+**4. 推荐使用场景矩阵**
+
+| 场景 | 推荐使用 | 原因 |
+|------|---------|------|
+| API 控制器内获取当前用户 | `current_resource_owner` ✅ | 立即可用，直接可靠 |
+| API 控制器内获取家庭 | `current_resource_owner.family` ✅ | 不需要 Current 上下文 |
+| Model 层回调/关注点 | `Current.user` ✅ | 全局可访问，脱离控制器 |
+| Job/异步任务 | `Current.user` ✅ | 需要通过 Current 传递上下文 |
+| Web 控制器（非 API） | `Current.user` ✅ | 由 Session 中间件设置 |
+| 跨线程/异步调用 | 需要手动传递 ⚠️ | CurrentAttributes 不跨线程 |
+
+> **API 控制器铁律**：在 API 控制器及其子类中，**始终使用 `current_resource_owner`**。
+> - 即使两者指向同一个 User 记录，直接使用 `@current_user` 避免了对 Session 查找的依赖
+> - 避免了在 before_action 执行顺序问题导致的 nil 异常
+> - 保持 API 鉴权层的独立性，不依赖全局状态
 
 #### 示例 1: 账户查询
 
