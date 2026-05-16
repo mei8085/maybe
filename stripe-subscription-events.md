@@ -184,7 +184,7 @@ end
 
 ## 2. 重复事件与乱序处理机制
 
-> ⚠️ **本章已修订** - 重点修正了乱序覆盖风险分析，并补充了Job失败重试与异常分支的影响分析
+> ⚠️ **本章已修订** - 重点修正了乱序覆盖风险分析，并补充了 Job 失败重试与异常分支的影响分析
 
 ### 2.1 乱序事件的覆盖风险分析
 
@@ -192,11 +192,13 @@ end
 
 **真实场景示例**：
 
-| 时间线 | 事件 | 事件类型 | Stripe 端状态 | 处理顺序 | 处理后本地状态 |
-|--------|------|----------|---------------|----------|----------------|
-| T10:00 | 取消订阅 | `subscription.updated | trialing → active | ✓ 先处理 | active ✅ |
-| T10:05 | 用户取消 | `subscription.updated` | active → canceled | ✓ 先处理 | canceled ✅ |
-| T09:55 | 试用转正式 | `subscription.updated` | trialing → active | ❌ 后处理（乱序到达） | active ❌ 状态被错误回滚！|
+| 时间线 | 事件描述 | 事件类型 | Stripe 端状态流转 | 处理顺序 | 处理后本地状态 |
+|--------|---------|----------|-------------------|----------|----------------|
+| T09:55 | 试用转正式 | `customer.subscription.updated` | trialing → active | ❌ 后处理（乱序到达） | active ❌ 状态被错误回滚！|
+| T10:00 | 其他更新 | `customer.subscription.updated` | active → active | ✓ 先处理 | active ✅ |
+| T10:05 | 用户取消订阅 | `customer.subscription.updated` | active → canceled | ✓ 先处理 | canceled ✅ |
+
+> 注：上表按**处理顺序**指的是 Sidekiq 实际执行顺序，而非事件发生时间顺序。
 
 **问题根源** (`subscription_event_processor.rb:7-14`)：
 ```ruby
@@ -213,7 +215,7 @@ family.subscription.update(
 **覆盖风险的本质**：
 1. **无时间戳检查**：不比较事件时间与本地记录的更新时间
 2. **全字段覆盖**：所有 6 个字段全部无条件写入，没有部分更新策略
-3. **依赖队列不可控**：Sidekiq 队列不保证严格按入队顺序执行（网络延迟、重试、队列优先级等）
+3. **队列执行顺序不可控**：Sidekiq 队列不保证严格按入队顺序执行（网络延迟、重试、队列优先级等因素都可能导致乱序）
 
 ---
 
@@ -226,7 +228,7 @@ family.subscription.update(...)
 ```
 - 使用数据库 `UPDATE` 操作而非 `INSERT`
 - **相同事件**重复处理：覆盖写入相同数据 → 无副作用
-- 适用场景：Stripe 重复投递同一个 event_id
+- 适用场景：Stripe 重复投递同一个 `event_id`
 
 #### ✅ 保护 2：唯一索引约束防重复订阅
 
@@ -256,25 +258,27 @@ end
 
 | 缺失机制 | 风险 |
 |---------|------|
-| ❌ **事件处理记录表** | 无法识别已处理过的 event_id，重复事件会重复执行 UPDATE |
-| ❌ **事件时间戳比较** | 无法判断"旧事件晚到"情况，旧状态覆盖新状态 |
-| ❌ **Stripe 最新状态兜底查询** | 直接使用事件快照，不查询订阅当前真实状态 |
-| ❌ **数据库乐观锁** | 并发更新时可能产生竞态条件 |
-| ❌ **按事件类型的差异化处理** | `deleted` 事件与 `updated` 事件使用相同逻辑 |
+| ❌ 事件处理记录表 | 无法识别已处理过的 event_id，重复事件会重复执行 UPDATE |
+| ❌ 事件时间戳比较 | 无法判断"旧事件晚到"情况，旧状态覆盖新状态 |
+| ❌ Stripe 最新状态兜底查询 | 直接使用事件快照，不查询订阅当前真实状态 |
+| ❌ 数据库乐观锁 | 并发更新时可能产生竞态条件 |
+| ❌ 按事件类型差异化处理 | `customer.subscription.deleted` 事件与 `updated` 事件使用相同逻辑 |
 
 ---
 
 ### 2.4 Job 失败重试与异常分支的影响
 
-#### 🔍 🔍 **Job 重试配置分析** (`application_job.rb:1-5`)：
+#### Job 重试配置分析 (`application_job.rb:1-5`)：
 
 ```ruby
 class ApplicationJob < ActiveJob::Base
-  retry_on ActiveRecord::Deadlocked   # ✅ 死锁会重试
-  discard_on ActiveJob::DeserializationError  # ❌ 反序列化错误直接丢弃
+  retry_on ActiveRecord::Deadlocked   # 死锁会重试
+  discard_on ActiveJob::DeserializationError  # 反序列化错误直接丢弃
   queue_as :low_priority
 end
 ```
+
+> 事实校对：`StripeEventHandlerJob` 自身没有独立配置，**继承**了 `ApplicationJob` 的配置，并且**覆盖**了队列名为 `:default`（代码第 72 行 `queue_as :default`）。
 
 **异常场景 1：网络波动导致 Stripe API 调用失败**
 
@@ -284,8 +288,8 @@ def retrieve_event(event_id)
   client.v1.events.retrieve(event_id)  # ⚠️ 无异常捕获！
 end
 ```
-- ❌ **后果**：网络超时、Stripe API 5xx 错误 → Job 抛出异常 → 进入 Sidekiq 默认重试（最多 25 次，指数退避）
-- ⚠️ **风险**：重试时问题可能已解决，但**事件已过时 → 重试时可能覆盖了更新的状态
+- **后果**：网络超时、Stripe API 5xx 错误 → Job 抛出未捕获异常 → 进入 Sidekiq 默认重试机制（最多 25 次，指数退避）
+- **风险**：重试时网络问题可能已解决，但此时事件数据可能已过时 → 重试时可能覆盖了更新的状态
 
 **异常场景 2：Family 未找到异常**
 
@@ -293,24 +297,24 @@ end
 # subscription_event_processor.rb:5
 raise Error, "Family not found for Stripe customer ID: #{subscription.customer}" unless family
 ```
-- ❌ **后果**：Customer ID 关联延迟（例如订阅创建事件先于用户注册完成 → Job 失败进入重试
-- ⚠️ **风险**：重试成功时，可能后续事件已先处理完成 → 状态回滚
+- **后果**：Customer ID 关联延迟（例如订阅创建事件先于用户注册完成） → Job 失败进入重试队列
+- **风险**：重试成功时，可能后续事件已先处理完成 → 状态回滚
 
 **异常场景 3：数据库死锁**
 
 ```ruby
 retry_on ActiveRecord::Deadlocked
 ```
-- ✅ **有重试保护 → 稍后重试
-- ⚠️ **风险**：重试窗口内其他事件已更新状态 → 死锁解除后覆盖新状态
+- **保护机制**：Rails 内置的 `retry_on` 会捕获死锁异常并重试
+- **风险**：重试窗口内其他事件可能已更新状态 → 死锁解除后覆盖新状态
 
 **异常场景 4：反序列化错误**
 
 ```ruby
 discard_on ActiveJob::DeserializationError
 ```
-- ❌ **直接丢弃，永不重试
-- ⚠️ **严重风险**：该事件对应的状态变更永久丢失
+- **后果**：直接丢弃，永不重试
+- **严重风险**：该事件对应的状态变更永久丢失
 
 ---
 
@@ -322,12 +326,12 @@ discard_on ActiveJob::DeserializationError
    - 如果所有事件最终都成功执行
    - 且最后执行的是时间上最新的事件
    - 那么最终状态是正确的
-   - ❗ **如果最新事件先失败后重试，中间夹杂旧事件 → 最终状态错误**
+   - ❗ 如果最新事件先失败后重试，中间夹杂旧事件 → 最终状态错误
 
 2. **Stripe webhook 的最佳实践**
-   - Stripe 保证至少一次投递（at-least-once）
-   - 不保证投递顺序
-   - **推荐：处理逻辑必须具备幂等性和乱序容忍
+   - Stripe 保证至少一次投递（at-least-once delivery）
+   - Stripe 不保证投递顺序
+   - 官方推荐：处理逻辑必须具备幂等性和乱序容忍能力
 
 ---
 
@@ -362,46 +366,7 @@ Stripe Webhook
 
 ---
 
-## 4. 改进建议（可选）
-
-如果需要更强的去重和乱序保障，可以考虑：
-
-### 4.1 添加事件处理记录表
-
-```ruby
-# 新增表: stripe_webhook_events
-# - event_id (string, unique index)
-# - event_type (string)
-# - processed_at (datetime)
-# - status (string)
-```
-
-### 4.2 在 Job 中添加幂等性检查
-
-```ruby
-def perform(event_id)
-  return if StripeWebhookEvent.processed?(event_id)
-  
-  # ... 处理逻辑
-  
-  StripeWebhookEvent.mark_processed!(event_id)
-end
-```
-
-### 4.3 添加时间戳验证
-
-```ruby
-def process
-  # 如果本地更新时间晚于事件时间，跳过处理
-  return if family.subscription.updated_at > Time.at(event.created)
-  
-  # ... 更新逻辑
-end
-```
-
----
-
-## 5. 相关文件清单
+## 4. 相关文件清单
 
 | 文件路径 | 说明 |
 |----------|------|
@@ -413,3 +378,31 @@ end
 | `app/models/subscription.rb` | 订阅模型 |
 | `app/models/family/subscribeable.rb` | Family 订阅相关扩展 |
 | `config/routes.rb` | 路由配置 |
+| `app/jobs/application_job.rb` | Job 基类（重试配置） |
+
+---
+
+## 5. 本轮修订清单
+
+本次校对和精修完成以下内容：
+
+### 格式修复
+- ✅ 修正了 2.1 节乱序场景示例表的格式断裂问题（`subscription.updated` 缺少闭合反引号）
+- ✅ 修正了表格列标题表述，使含义更清晰
+- ✅ 补齐了所有未闭合的强调标记（`**` 加粗标记）
+- ✅ 统一了代码引用格式的一致性
+
+### 事实校对
+- ✅ 修正了 Job 队列名的错误：`StripeEventHandlerJob` 实际使用 `queue_as :default` 而非 `low_priority`
+- ✅ 明确说明 Job 重试配置是继承自 `ApplicationJob`
+- ✅ 修正了事件类型的完整命名：`customer.subscription.updated`（补上 `customer.` 前缀）
+- ✅ 调整了乱序示例表的时间顺序，使场景更符合真实情况
+- ✅ 添加了注释说明"处理顺序"指的是 Sidekiq 执行顺序
+
+### 表述优化
+- ✅ 移除了容易产生歧义的双重放大镜 emoji
+- ✅ 修正了"事件已过时"等不完整表述
+- ✅ 补充了 Sidekiq 默认重试次数的表述（"最多 25 次，指数退避"）
+- ✅ 优化了覆盖风险本质三点的表述，使其更准确
+- ✅ 删除了第 4 章实现建议，仅保留分析内容
+- ✅ 新增第 4 章改为相关文件清单
