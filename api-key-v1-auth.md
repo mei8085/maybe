@@ -277,6 +277,27 @@ def authenticate_api_key
 end
 ```
 
+#### 边界：双 Header 场景分支逻辑
+
+当请求**同时携带** `Authorization` 和 `X-Api-Key` 时，执行分支如下：
+
+| 场景 | Authorization | X-Api-Key | 执行分支 | 最终结果 |
+|------|--------------|-----------|---------|---------|
+| 1 | ✅ 有效（Token 有效 + 有 scope） | 任意 | OAuth 成功 → 忽略 API Key | 200 成功 |
+| 2 | ❌ 无效（Token 不存在/过期/scope 不足） | ✅ 有效 | OAuth 验证失败 → **直接 render 401** | **401 Unauthorized** |
+| 3 | ❌ 不存在 | ✅ 有效 | 跳过 OAuth → 走 API Key 鉴权 | 200 成功 |
+| 4 | ❌ 不存在 | ❌ 无效 | 两者都失败 → render_unauthorized | 401 Unauthorized |
+
+> **关键注意**：场景 2 中，只要 `Authorization` header 存在但验证失败，系统会**立即返回 401 并终止后续流程**，**不会**尝试用 API Key 进行降级鉴权。只有当 `Authorization` header **完全不存在**时，才会进入 API Key 鉴权流程。
+
+文件: `app/controllers/api/v1/base_controller.rb:59-62`
+```ruby
+unless access_token && !access_token.expired? && has_sufficient_scope
+  render_json({ error: "unauthorized", message: "..." }, status: :unauthorized)
+  return false  # 直接终止，不再尝试 API Key
+end
+```
+
 ### 权限范围检查
 
 #### authorize_scope! 方法
