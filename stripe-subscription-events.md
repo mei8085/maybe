@@ -240,6 +240,7 @@ t.index ["family_id"], name: "index_subscriptions_on_family_id", unique: true
 
 #### ✅ 保护 3：从 Stripe API 重新拉取完整事件
 
+**文件**: `app/models/provider/stripe.rb:85-87`
 ```ruby
 def retrieve_event(event_id)
   client.v1.events.retrieve(event_id)
@@ -273,13 +274,13 @@ end
 `ApplicationJob` 基类配置 (`app/jobs/application_job.rb:1-5`)：
 ```ruby
 class ApplicationJob < ActiveJob::Base
-  retry_on ActiveRecord::Deadlocked   # 死锁会自动重试
-  discard_on ActiveJob::DeserializationError  # 反序列化错误直接丢弃
-  queue_as :low_priority
+  retry_on ActiveRecord::Deadlocked
+  discard_on ActiveJob::DeserializationError
+  queue_as :low_priority # default queue
 end
 ```
 
-`StripeEventHandlerJob` 自身配置 (`app/jobs/stripe_event_handler_job.rb:72`)：
+`StripeEventHandlerJob` 自身配置 (`app/jobs/stripe_event_handler_job.rb:2`)：
 ```ruby
 queue_as :default  # 覆盖基类配置，使用 default 队列
 ```
@@ -392,7 +393,7 @@ Stripe Webhook
 
 ## 5. 本轮修订清单
 
-### 第一轮修订（已有）
+### 第一轮修订
 
 #### 格式修复
 - ✅ 修正了 2.1 节乱序场景示例表的格式断裂问题（`subscription.updated` 缺少闭合反引号）
@@ -417,10 +418,10 @@ Stripe Webhook
 
 ---
 
-### 第二轮修订（本次新增）
+### 第二轮修订
 
 #### 格式修复
-- ✅ 修正了第 323 行未闭合的加粗标记：`**当前依赖的兜底机制（非常有限）**`
+- ✅ 修正了未闭合的加粗标记：`**当前依赖的兜底机制（非常有限）**`
 - ✅ 优化了流程图表述，将"异步队列"改为"异步入队"，表述更准确
 
 #### 事实表述修正
@@ -434,5 +435,23 @@ Stripe Webhook
 #### 表述精炼
 - ✅ 删除了 2.4 节标题中的"🔍🔍" emoji，保持格式统一
 - ✅ 统一了异常场景的表述风格：每行以"后果"和"风险"开头，结构清晰
-- ✅ 删除了流程图中容易引起误解的"从 Stripe API 拉取完整事件"前的多余空格
+- ✅ 删除了流程图中容易引起误解的多余空格
 - ✅ 优化了关键设计决策表的说明列表述，删除多余空格
+
+---
+
+### 第三轮修订（本次新增，最终事实对齐）
+
+#### 代码行号修正
+- ✅ 修正了 `StripeEventHandlerJob` 队列配置行号：从"代码第 72 行"改为正确的 `:2`（实际文件只有 9 行）
+- ✅ 修正了 `ApplicationJob` 注释表述：移除了"死锁会自动重试"等冗余注释，与实际代码保持一致
+- ✅ 为 2.2 节的 `retrieve_event` 方法补充了文件定位：`app/models/provider/stripe.rb:85-87`
+
+#### 2.1-2.5 章节一致性检查
+- ✅ 确认事件时序逻辑：2.1 示例表与 2.5 兜底结论一致，均指出"最后执行的事件决定最终状态"
+- ✅ 确认重试机制：2.4 节的 Sidekiq 重试行为与 2.5 节"最新事件先失败后重试"的风险场景完全对应
+- ✅ 确认兜底结论：2.5 节的两个兜底策略与 2.2 节的保护机制分析前后呼应，逻辑闭环
+
+#### 表述精炼
+- ✅ 优化了重试配置分析的表述：移除代码内冗余注释，仅保留实际代码内容
+- ✅ 统一了所有文件引用的格式风格，前后一致
