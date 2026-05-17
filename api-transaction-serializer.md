@@ -119,25 +119,66 @@ end
 
 | 维度 | API 响应 | Web 界面 | 差异说明 |
 |------|---------|---------|---------|
-| **金额显示** | `amount` 字段直接返回格式化字符串（如 "$25.50"） | 收入显示为绿色，支出显示为默认色；转账显示为 "+/-" 格式 | 界面根据 `classification` 和 `transfer?` 状态动态调整显示方式 |
+| **金额显示格式** | `amount` 字段返回格式化字符串，收入带负号（如 "-$10.00"），支出不带负号（如 "$10.00"） | 收入显示为绿色正数，支出显示为默认色正数，转账显示为 "+/-" 格式 | 界面对非转账交易的金额取反显示，并根据分类应用颜色样式 |
+| **金额符号语义** | 负号表示收入，正号（无符号）表示支出 | 所有金额显示为正数，通过颜色区分收入/支出 | 符号规则完全相反，对接方需特别注意 |
 | **转账去重** | 转账的两条交易（流入/流出）都会返回 | 转账只显示一条记录（隐藏流入交易） | 界面通过 `EntriesHelper#entries_by_date` 进行去重处理 |
 | **交易类型标识** | 未返回 `kind` 字段 | 显示 one-time 标记（橙色星号）、转账/贷款支付标签 | API 序列化器未暴露 `kind` 枚举值 |
 | **商户Logo** | 只返回 `merchant.id` 和 `merchant.name` | 显示商户 Logo 或自动生成的首字母图标 | API 不返回 logo_url 字段 |
 | **分类展示** | 返回完整 category 对象（含 color、icon） | 显示分类颜色图标和名称 | 序列化完整，无差异 |
 
-### 3.2 界面特殊处理逻辑
+### 3.2 classification 与界面金额显示规则的对应关系
+
+#### 3.2.1 核心显示逻辑
+
+Web 界面的金额显示逻辑在 `app/views/transactions/_transaction.html.erb:97-99` 中定义：
 
 ```erb
-<!-- app/views/transactions/_transaction.html.erb:98-99 -->
 <%= content_tag :p,
     transaction.transfer? && view_ctx == "global" ? "+/- #{format_money(entry.amount_money.abs)}" : format_money(-entry.amount_money),
     class: ["text-green-600": entry.amount.negative?] %>
 ```
 
-**关键差异**：
-1. 界面对转账交易使用 `+/-` 前缀并取绝对值
-2. 非转账交易对金额取反（因内部存储收入为负、支出为正）
-3. 根据金额正负应用绿色样式
+#### 3.2.2 显示规则对照表
+
+| classification | 数据库存储 | API 返回 | 界面显示逻辑 | 界面最终效果 |
+|---------------|-----------|---------|-------------|-------------|
+| `"income"` | 负数（如 -1000） | "-$10.00" | 取反后格式化：`format_money(-entry.amount_money)` → "$10.00"，并应用绿色样式 | 显示为 **绿色** 的 "$10.00" |
+| `"expense"` | 正数（如 1000） | "$10.00" | 取反后格式化：`format_money(-entry.amount_money)` → "-$10.00"，无特殊颜色 | 显示为默认色的 "$10.00"（实际为 -$10.00，但显示时负号可能被隐藏） |
+| 转账（inflow） | 负数（如 -1000） | "-$10.00" | 取绝对值并加 "+/-" 前缀："+/- $10.00" | 显示为 "+/- $10.00"（仅在全局视图，账户详情视图仍按 income/expense 显示） |
+| 转账（outflow） | 正数（如 1000） | "$10.00" | 取绝对值并加 "+/-" 前缀："+/- $10.00" | 显示为 "+/- $10.00"（仅在全局视图，账户详情视图仍按 income/expense 显示） |
+
+#### 3.2.3 关键差异说明
+
+1. **金额符号反转**：
+   - API：负号 = 收入，正号（无符号）= 支出
+   - 界面：所有金额取反显示，收入显示为绿色正数，支出显示为默认色
+   - 原因：数据库存储时收入为负、支出为正，界面为符合用户习惯进行取反
+
+2. **转账特殊处理**：
+   - API 返回转账的两条记录（流入/流出），各自带有正负号
+   - 界面在全局视图中合并显示，使用 "+/-" 前缀，金额取绝对值
+   - 界面在账户详情视图中仍按 income/expense 规则显示
+
+3. **颜色编码**：
+   - 收入（amount < 0）：绿色样式（`text-green-600`）
+   - 支出（amount > 0）：默认颜色
+   - 转账：无特殊颜色编码
+
+> **对接方注意事项**：若需在客户端复现 Web 界面的显示效果，请参考以下伪代码：
+> ```javascript
+> function displayAmount(transaction) {
+>   const amount = parseAmount(transaction.amount); // 解析字符串为数值
+>   if (transaction.transfer && isGlobalView) {
+>     return `+/- ${formatCurrency(Math.abs(amount), transaction.currency)}`;
+>   }
+>   const displayValue = -amount; // 取反以符合用户习惯
+>   const isIncome = transaction.classification === 'income';
+>   return {
+>     text: formatCurrency(Math.abs(displayValue), transaction.currency),
+>     className: isIncome ? 'text-green-600' : ''
+>   };
+> }
+> ```
 
 ## 4. 分页与过滤参数对响应结构的影响
 
@@ -380,4 +421,21 @@ API v1 交易类响应序列化采用了清晰的三层架构：
 - **Jbuilder 模板**负责将模型数据映射为对外字段
 - **家庭隔离**通过多层机制确保数据安全，是整个系统的核心保障
 
-字段映射基本满足需求，但与 Web 界面存在一些差异，主要体现在金额显示、转账去重、交易类型标识等方面。建议在后续版本中统一口径，提升 API 的一致性和可用性。
+### 7.1 核心要点回顾
+
+1. **金额口径**：
+   - API 返回的 `amount` 是**格式化字符串**（如 "-$10.00"、"$10.00"），非原始数值
+   - 负号表示收入（income），正号（无符号）表示支出（expense）
+   - `classification` 字段与金额符号一一对应，可作为判断依据
+
+2. **与 Web 界面的差异**：
+   - 界面对非转账交易金额取反显示，所有金额均为正数，通过颜色区分收入/支出
+   - 界面在全局视图中对转账交易进行去重，使用 "+/-" 前缀
+   - 建议对接方参考 3.2.3 节的伪代码实现一致的显示效果
+
+3. **协作机制**：
+   - BaseController 处理认证、限流、上下文设置
+   - TransactionsController 处理权限、家庭隔离、过滤、分页
+   - Jbuilder 模板负责字段映射和格式转换
+
+字段映射基本满足需求，但金额为字符串类型、缺少数值字段等问题增加了对接复杂度。建议在后续版本中增加 `amount_value` 数值字段，提升 API 的易用性。
