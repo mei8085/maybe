@@ -719,28 +719,31 @@ end
             │  ↓                          │  ↓  (任务 1)               │  ↓                        │
             │  message.request_           │  message.request_         │  message.request_         │
             │  response                   │  response                 │  response                 │
-            │  ↓                          │  ↓                        │  ↓                        │
-            │  chat.ask_assistant         │  chat.ask_assistant       │  chat.ask_assistant       │
-            │  ↓                          │  ↓                        │  ↓                        │
-            │  assistant.respond_to       │  assistant.respond_to     │  assistant.respond_to     │
-            │  ├─ 创建 AssistantMessage    │  ├─ 创建 AssistantMessage  │  ├─ 创建 AssistantMessage  │
-            │  ├─ 注册流式回调             │  ├─ 注册流式回调           │  ├─ 注册流式回调           │
-            │  └─ 触发 LLM 流式响应        │  └─ 触发 LLM 流式响应      │  └─ 触发 LLM 流式响应      │
+            │  ✅ 方法存在（UserMessage）  │  ✅ 方法存在              │  ❌ 方法不存在！          │
+            │  ↓                          │  ↓                        │  NoMethodError 💥         │
+            │  chat.ask_assistant         │  chat.ask_assistant       │  任务失败，进入重试队列   │
+            │  ↓                          │  ↓                        │                           │
+            │  assistant.respond_to       │  assistant.respond_to     │                           │
+            │  ├─ 创建 AssistantMessage    │  ├─ 创建 AssistantMessage  │                           │
+            │  ├─ 注册流式回调             │  ├─ 注册流式回调           │                           │
+            │  └─ 触发 LLM 流式响应        │  └─ 触发 LLM 流式响应      │                           │
             │                             │                           │                           │
             │                             │  ⚠️  任务 2 也会执行       │                           │
             │                             │  相同逻辑，产生重复回复    │                           │
             │                             │                           │                           │
 ────────────┼────────────────────────────┼───────────────────────────┼───────────────────────────┤
-6. 流式回传 │  broadcast_append_to        │  broadcast_append_to      │  broadcast_append_to      │
-            │  (首个 text chunk)          │  (首个 text chunk)        │  (首个 text chunk)        │
-            │  ↓                          │  ↓  (任务 1 和任务 2      │  ↓                        │
-            │  broadcast_update_to        │     各自独立广播)         │  broadcast_update_to      │
-            │  (后续 text chunk)          │                           │  (后续 text chunk)        │
+6. 流式回传 │  broadcast_append_to        │  broadcast_append_to      │  ❌ 无回传（任务失败）    │
+            │  (首个 text chunk)          │  (首个 text chunk)        │                           │
+            │  ↓                          │  ↓  (任务 1 和任务 2      │                           │
+            │  broadcast_update_to        │     各自独立广播)         │                           │
+            │  (后续 text chunk)          │                           │                           │
             │                             │  ⚠️  前端收到两条          │                           │
             │                             │     重复消息流            │                           │
             │                             │                           │                           │
 ────────────┴────────────────────────────┴───────────────────────────┴───────────────────────────┘
 ```
+
+> **重要修正**：API Retry 路径存在严重的调用契约不匹配，会在任务执行阶段抛出 `NoMethodError`，无法正常工作。
 
 ---
 
@@ -824,3 +827,49 @@ end
 ---
 
 ### 7.5 重复投递 Bug 修复建议
+
+**方案 A：移除 API 控制器中的手动入队（推荐）**
+
+移除 `api/v1/chats_controller.rb:31` 和 `api/v1/messages_controller.rb:16` 中的 `AssistantResponseJob.perform_later(@message)` 调用，完全依赖 `UserMessage` 的 `after_create_commit` 回调，与网页入口保持一致。
+
+优点：
+- 统一入队逻辑，避免未来类似问题
+- 代码更简洁，符合 Rails 惯例
+
+**方案 B：跳过回调，仅保留手动入队**
+
+在 API 控制器创建消息时使用 `skip_callback` 或创建时指定 `skip_after_create_commit: true`。
+
+优点：
+- 保持 API 控制器的显式控制
+
+缺点：
+- 与网页入口逻辑不一致
+- 需要额外的条件判断
+
+**方案 C：在任务中增加幂等性检查**
+
+在 `AssistantResponseJob` 中检查该消息是否已有对应的 `AssistantMessage`，如果有则跳过执行。
+
+优点：
+- 即使存在重复入队，也不会产生重复响应
+- 防御性编程，防止其他场景的重复调用
+
+缺点：
+- 仍然会浪费一次任务调度和数据库查询
+
+**推荐组合方案**：方案 A（移除手动入队）+ 方案 C（增加幂等性检查）作为双重保障。
+
+---
+
+### 7.6 入口隔离总结
+
+| 维度 | 网页入口 | API 入口 |
+|-----|---------|---------|
+| **认证方式** | Session Cookie | OAuth 2.0 / API Key |
+| **用户上下文** | `Current.session` 来自 Cookie | `Current.session` 手动构建（API base controller） |
+| **入队机制** | 仅回调驱动 | 回调驱动 + 手动入队（Bug） |
+| **响应格式** | HTML 重定向 + Turbo Streams | JSON |
+| **实时更新** | 自动通过 Turbo Streams 推送 | 需要客户端轮询或另行订阅 |
+| **速率限制** | 无（依赖 session） | API Key 有速率限制 |
+| **作用域检查** | 无 | 需要 `read_write` 作用域 |
