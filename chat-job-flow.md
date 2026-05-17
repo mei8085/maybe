@@ -2,23 +2,33 @@
 
 ## 一、整体架构概览
 
-家庭账务助手的聊天系统采用 **"同步接收 + 异步处理 + 流式推送"** 的架构模式：
+家庭账务助手的聊天系统采用 **"同步接收 + 异步处理 + 流式推送"** 的架构模式，支持 **网页端** 和 **API** 两类入口：
 
 - **同步接收**：用户消息通过 HTTP 请求同步写入数据库
 - **异步处理**：AI 响应生成通过后台任务队列（Sidekiq）异步执行
 - **流式推送**：通过 Turbo Streams（基于 Action Cable/WebSocket）实时推送更新到前端
 
 ```
-用户前端 ──HTTP──> 控制器 ──DB写入──> 消息模型 ──入队──> Sidekiq任务
-                                          │
-                                          └──Turbo Stream──> 前端实时更新
-                                          │
-                          后台任务处理 <──┘
-                               │
-                               ├── LLM API 调用（流式）
-                               ├── 工具函数调用
-                               └── 结果持久化 + Turbo Stream 推送
+┌─────────────┐
+│  网页前端   │ ──HTTP──> 网页控制器 ──┐
+└─────────────┘                         │
+                                        ├─> DB 写入 ──> 消息模型 ──入队──> Sidekiq 任务
+┌─────────────┐                         │           │
+│  API 客户端 │ ──HTTP──> API 控制器  ──┘           └──Turbo Stream──> 前端实时更新
+└─────────────┘                                             │
+                                                            │
+                                      后台任务处理 <────────┘
+                                           │
+                                           ├── LLM API 调用（流式）
+                                           ├── 工具函数调用
+                                           └── 结果持久化 + Turbo Stream 推送
 ```
+
+**核心特性**：
+1. **双入口设计**：网页端（Session 认证）和 API（OAuth/API Key 认证）
+2. **回调驱动入队**：`UserMessage` 通过 `after_create_commit` 自动触发后台任务
+3. **事件驱动流式**：Responder 采用事件模式处理 LLM 流式输出
+4. **多层级隔离**：从认证、查询到数据库外键的完整用户/会话隔离
 
 ---
 
@@ -665,36 +675,152 @@ end
 多用户隔离 | `app/models/current.rb`, `app/controllers/concerns/authentication.rb`
 聊天页面 | `app/views/chats/show.html.erb`
 
-### 7.3 数据流完整路径
+### 7.3 统一时序图：三条路径并排对比
 
 ```
-用户输入
-  ↓ [HTTP POST]
-messages#create / chats#create
-  ↓
-UserMessage.create!
-  ↓ [after_create_commit]
-user_message.request_response_later
-  ↓
-chat.ask_assistant_later(message)
-  ↓
-AssistantResponseJob.perform_later(message)
-  ↓ [Sidekiq 异步执行]
-AssistantResponseJob#perform
-  ↓
-message.request_response
-  ↓
-chat.ask_assistant(message)
-  ↓
-assistant.respond_to(message)
-  ├─ 创建空 AssistantMessage
-  ├─ 注册 :output_text / :response 回调
-  └─ responder.respond
-      ├─ llm.chat_response (流式调用 OpenAI API)
-      │   └─ stream_proxy 解析每个 chunk
-      │       └─ 触发 responder 的 :output_text 事件
-      │           ├─ 首个 chunk: 创建消息 + broadcast_append
-      │           └─ 后续 chunk: 追加文本 + broadcast_update
-      └─ 响应完成
-          └─ (可选) 处理工具调用 follow-up
+时间轴 →    │  网页入口路径              │  API 创建/追加路径         │  API Retry 路径           │
+            │  (POST /chats 或           │  (POST /api/v1/chats 或   │  (POST /api/v1/chats/    │
+            │   /chats/:id/messages)     │   /api/v1/chats/:id/      │   :id/messages/retry)     │
+            │                            │   messages)               │                           │
+────────────┼────────────────────────────┼───────────────────────────┼───────────────────────────┤
+1. 请求进入 │  HTTP POST                  │  HTTP POST                │  HTTP POST                │
+            │  ├─ Session 认证            │  ├─ OAuth/API Key 认证    │  ├─ OAuth/API Key 认证    │
+            │  └─ Current.user 设置       │  └─ Current.user 设置     │  └─ Current.user 设置     │
+            │                            │                           │                           │
+2. 消息创建 │  UserMessage.create!        │  UserMessage.build        │  查找最后一条消息         │
+            │  (type: UserMessage)        │  (type: UserMessage)     │  if last_message.type     │
+            │                            │  ↓                        │     == "AssistantMessage"│
+            │                            │  @message.save            │  ↓                        │
+            │                            │                           │  创建 AssistantMessage    │
+            │                            │                           │  (type: AssistantMessage) │
+            │                            │                           │  content: ""              │
+            │                            │                           │                           │
+────────────┼────────────────────────────┼───────────────────────────┼───────────────────────────┤
+3. 回调触发 │  after_create_commit        │  after_create_commit      │  无回调（AssistantMessage │
+            │  ↓                          │  ↓                        │  没有 after_create_       │
+            │  request_response_later     │  request_response_later   │  commit 回调）             │
+            │  ↓                          │  ↓                        │                           │
+            │  ask_assistant_later        │  ask_assistant_later      │                           │
+            │  ↓                          │  ↓                        │                           │
+            │  perform_later(msg)         │  perform_later(msg)       │                           │
+            │  ✅ 入队 1 次                │  ⚠️ 第 1 次入队           │                           │
+            │                            │                           │                           │
+────────────┼────────────────────────────┼───────────────────────────┼───────────────────────────┤
+4. 控制器   │  redirect_to chat_path      │  控制器继续执行            │  控制器手动执行           │
+   后续逻辑 │  (页面跳转)                  │  ↓                        │  ↓                        │
+            │                            │  perform_later(@message)  │  perform_later(new_msg)   │
+            │                            │  ⚠️ 第 2 次入队           │  ✅ 入队 1 次              │
+            │                            │                           │                           │
+────────────┼────────────────────────────┴───────────────────────────┴───────────────────────────┤
+                                    汇合点：Sidekiq 任务调度执行                                   │
+────────────┬────────────────────────────┬───────────────────────────┬───────────────────────────┤
+5. 任务执行 │  AssistantResponseJob       │  AssistantResponseJob     │  AssistantResponseJob     │
+            │  #perform(message)          │  #perform(message)        │  #perform(new_message)    │
+            │  ↓                          │  ↓  (任务 1)               │  ↓                        │
+            │  message.request_           │  message.request_         │  message.request_         │
+            │  response                   │  response                 │  response                 │
+            │  ↓                          │  ↓                        │  ↓                        │
+            │  chat.ask_assistant         │  chat.ask_assistant       │  chat.ask_assistant       │
+            │  ↓                          │  ↓                        │  ↓                        │
+            │  assistant.respond_to       │  assistant.respond_to     │  assistant.respond_to     │
+            │  ├─ 创建 AssistantMessage    │  ├─ 创建 AssistantMessage  │  ├─ 创建 AssistantMessage  │
+            │  ├─ 注册流式回调             │  ├─ 注册流式回调           │  ├─ 注册流式回调           │
+            │  └─ 触发 LLM 流式响应        │  └─ 触发 LLM 流式响应      │  └─ 触发 LLM 流式响应      │
+            │                             │                           │                           │
+            │                             │  ⚠️  任务 2 也会执行       │                           │
+            │                             │  相同逻辑，产生重复回复    │                           │
+            │                             │                           │                           │
+────────────┼────────────────────────────┼───────────────────────────┼───────────────────────────┤
+6. 流式回传 │  broadcast_append_to        │  broadcast_append_to      │  broadcast_append_to      │
+            │  (首个 text chunk)          │  (首个 text chunk)        │  (首个 text chunk)        │
+            │  ↓                          │  ↓  (任务 1 和任务 2      │  ↓                        │
+            │  broadcast_update_to        │     各自独立广播)         │  broadcast_update_to      │
+            │  (后续 text chunk)          │                           │  (后续 text chunk)        │
+            │                             │  ⚠️  前端收到两条          │                           │
+            │                             │     重复消息流            │                           │
+            │                             │                           │                           │
+────────────┴────────────────────────────┴───────────────────────────┴───────────────────────────┘
 ```
+
+---
+
+### 7.4 关键节点说明
+
+#### 7.4.1 分叉点与汇合点
+
+| 节点类型 | 位置 | 说明 |
+|---------|------|------|
+| **分叉点 1** | 步骤 3 → 步骤 4 | API 创建/追加路径中，回调入队后，控制器继续手动入队，产生两条相同任务 |
+| **汇合点 1** | 步骤 5 | 三条路径最终都进入相同的 `AssistantResponseJob` 执行逻辑 |
+| **汇合点 2** | 步骤 6 | 三条路径最终都通过相同的 `broadcast_*` 机制推送到前端 |
+
+#### 7.4.2 重复投递风险定位
+
+**重复投递只发生在：**
+1. `POST /api/v1/chats` - 创建聊天并包含首条消息时
+2. `POST /api/v1/chats/:chat_id/messages` - 追加消息时
+
+**不发生重复投递的路径：**
+- ✅ 所有网页入口路径
+- ✅ `POST /api/v1/chats/:chat_id/messages/retry`
+
+#### 7.4.3 为什么网页路径不触发重复
+
+```ruby
+# app/controllers/messages_controller.rb
+def create
+  @message = UserMessage.create!(...)
+  redirect_to chat_path(@chat, thinking: true)
+  # 控制器没有手动调用 perform_later！
+  # 完全依赖 UserMessage 的 after_create_commit 回调
+end
+```
+
+**原因**：网页控制器完全遵循 "单一职责" 原则，仅负责创建消息和页面跳转，入队逻辑完全委托给模型回调，没有重复调用。
+
+#### 7.4.4 为什么 API Retry 路径不触发重复
+
+```ruby
+# app/controllers/api/v1/messages_controller.rb
+def retry
+  new_message = @chat.messages.create!(
+    type: "AssistantMessage",  # 注意类型是 AssistantMessage
+    content: "",
+    ai_model: last_message.ai_model
+  )
+  AssistantResponseJob.perform_later(new_message)  # 仅手动入队 1 次
+end
+```
+
+**原因**：
+1. 创建的是 `AssistantMessage` 类型，不是 `UserMessage`
+2. `AssistantMessage` 没有定义 `after_create_commit :request_response_later` 回调
+3. 只有控制器手动入队 1 次，没有双重触发
+
+#### 7.4.5 为什么 API 创建/追加路径触发重复
+
+```ruby
+# app/controllers/api/v1/messages_controller.rb
+def create
+  @message = @chat.messages.build(
+    type: "UserMessage",  # 类型是 UserMessage，带有回调！
+    ...
+  )
+
+  if @message.save
+    # save 触发 after_create_commit 回调 → 第 1 次入队
+    AssistantResponseJob.perform_later(@message)  # 第 2 次入队！
+    ...
+  end
+end
+```
+
+**根本原因**：
+1. 创建的是 `UserMessage`，带有 `after_create_commit :request_response_later` 回调
+2. `save` 触发回调自动入队（第 1 次）
+3. 控制器又手动调用了一次 `perform_later`（第 2 次）
+4. 两条完全相同的任务进入队列，各自独立执行，产生两条重复回复
+
+---
+
+### 7.5 重复投递 Bug 修复建议
