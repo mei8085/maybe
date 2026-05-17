@@ -58,7 +58,8 @@ end
 **关键设计决策：**
 - `skip_before_action :verify_authenticity_token` - 外部服务无法携带 CSRF token
 - `skip_authentication` - 无需用户登录态
-- 所有异常捕获并上报 Sentry，保证始终返回 200/400 给外部供应商（避免被标记为不健康端点）
+
+> **⚠️ 重要澄清**：第一轮报告中"所有异常捕获并上报 Sentry"的表述不准确。实际上 Plaid 与 Stripe 的异常处理策略**完全不同**，详见第 8 章的详细对比。
 
 ---
 
@@ -127,6 +128,26 @@ end
 - Plaid: 接收区域特定的配置（API 端点、client_id、secret）
 - Stripe: 接收 `secret_key` 和 `webhook_secret`（从环境变量读取）
 
+### 4.2 Provider 缺失的静默失败
+
+> **⚠️ 关键风险点**：Registry 的私有方法在配置缺失时**返回 nil 而非抛出异常**。
+
+```ruby
+def stripe
+  secret_key = ENV["STRIPE_SECRET_KEY"]
+  webhook_secret = ENV["STRIPE_WEBHOOK_SECRET"]
+
+  return nil unless secret_key.present? && webhook_secret.present?  # ← 静默返回 nil
+
+  Provider::Stripe.new(secret_key:, webhook_secret:)
+end
+```
+
+**这意味着：**
+- `Provider::Registry.get_provider(:stripe)` 可能返回 `nil`
+- 后续调用 `nil.process_webhook_later` 会抛出 `NoMethodError`
+- 该异常是否被捕获取决于控制器的异常处理策略（详见第 8 章）
+
 ---
 
 ## 5. 事件路由分发
@@ -148,6 +169,7 @@ end
 **关键设计：**
 - 同步处理但快速返回，实际同步工作异步化（`sync_later`）
 - 未找到对应 PlaidItem 时上报 Sentry，不抛出异常（保证 200 返回）
+- `process` 方法内部有独立的 `rescue` 块，捕获所有处理异常并上报 Sentry
 
 ### 5.2 Stripe 事件路由（异步处理）
 
@@ -238,12 +260,25 @@ def sync_later(parent_sync: nil, window_start_date: nil, window_end_date: nil)
       if sync
         sync.expand_window_if_needed(window_start_date, window_end_date)
       else
-        # 创建新 sync 并异步执行
+        sync = self.syncs.create!(...)
+        SyncJob.perform_later(sync)
       end
     end
   end
 end
 ```
+
+### 6.4 任务入队失败的影响
+
+> **⚠️ 关键风险点**：`perform_later` 可能因以下原因失败，且失败时的行为差异显著：
+
+| 失败场景 | 影响范围 | 异常类型 | 是否被捕获 | 对重试的影响 |
+|---------|---------|---------|-----------|-------------|
+| Redis 连接中断 | 所有异步任务 | `Redis::CannotConnectError` | Plaid: 是 (400)<br>Stripe: 否 (500) | Plaid: 外部供应商重试<br>Stripe: 外部供应商重试 |
+| 任务序列化失败 | 特定任务 | `ActiveJob::SerializationError` | Plaid: 是 (400)<br>Stripe: 否 (500) | 同上 |
+| Sidekiq 进程未运行 | 所有异步任务 | 入队成功但永不执行 | - | 依赖 Sidekiq 自身的重试机制 |
+
+**特别注意**：`sync_later` 中的 `perform_later` 在数据库事务内，如果入队失败，**整个事务会回滚**，Sync 记录不会被创建。
 
 ---
 
@@ -252,11 +287,16 @@ end
 ### 7.1 Sentry 异常上报
 
 **关键上报点：**
-1. Webhook 控制器全局异常捕获（`webhooks_controller.rb:17,31,53`）
-2. Plaid WebhookProcessor 内部异常捕获（`webhook_processor.rb:32-35`）
-3. Sync 执行失败（`sync.rb:73-76`）
-4. Post-sync 钩子异常（`sync.rb:146-149`）
-5. Plaid Item 缺失告警（`webhook_processor.rb:52-54`）
+
+| 位置 | 异常类型 | 上报方式 |
+|-----|---------|---------|
+| `webhooks_controller.rb:17,34` | Plaid 所有异常 | `rescue => error` 全量捕获 |
+| `webhooks_controller.rb:48,52` | Stripe JSON/签名异常 | 特定 rescue 捕获 |
+| `webhooks_controller.rb` (未捕获) | Stripe 其他异常 | Rails 全局异常处理 |
+| `webhook_processor.rb:32-35` | Plaid 处理阶段异常 | 内部 rescue 捕获 |
+| `sync.rb:73-76` | Sync 执行失败 | 内部 rescue 捕获 |
+| `sync.rb:146-149` | Post-sync 钩子异常 | 内部 rescue 捕获 |
+| `webhook_processor.rb:52-54` | Plaid Item 缺失 | 主动上报 |
 
 **上下文标签示例：**
 ```ruby
@@ -265,7 +305,15 @@ Sentry.capture_exception(MissingItemError.new(...)) do |scope|
 end
 ```
 
-### 7.2 日志记录
+### 7.2 观测性盲区
+
+> **⚠️ 第一轮报告遗漏**：存在多个观测性盲区
+
+1. **Stripe 未捕获异常**：`NoMethodError`（Provider 为 nil）、`Redis::CannotConnectError` 等异常**不会**被 Stripe 控制器的特定 rescue 捕获，依赖 Rails 全局异常处理
+2. **任务入队成功但执行失败**：如 Stripe API 拉取事件失败、订阅处理失败等，仅在 Job 日志中有记录
+3. **静默丢弃的事件**：未匹配到路由的 webhook 仅记录 warn 日志，不上报 Sentry
+
+### 7.3 日志记录
 
 **关键日志点：**
 - 未处理的 webhook 类型（warn 级别）
@@ -274,7 +322,7 @@ end
 - Sync 窗口扩展（info 级别）
 - Post-sync 错误（error 级别）
 
-### 7.3 业务指标
+### 7.4 业务指标
 
 `app/models/sync.rb:157-166`
 
@@ -290,25 +338,101 @@ end
 
 ---
 
-## 8. 架构特点与权衡
+## 8. Plaid vs Stripe：异常处理与返回码深度对比
+
+### 8.1 控制器异常处理代码对比
+
+**Plaid (`webhooks_controller.rb:5-19`)：**
+```ruby
+def plaid
+  # ... 业务逻辑 ...
+  render json: { received: true }, status: :ok
+rescue => error  # ← 捕获 ALL 异常
+  Sentry.capture_exception(error)
+  render json: { error: "Invalid webhook: #{error.message}" }, status: :bad_request
+end
+```
+
+**Stripe (`webhooks_controller.rb:37-56`)：**
+```ruby
+def stripe
+  stripe_provider = Provider::Registry.get_provider(:stripe)  # ← 可能返回 nil
+  begin
+    # ... 业务逻辑 ...
+    head :ok
+  rescue JSON::ParserError => error  # ← 仅捕获 JSON 解析错误
+    Sentry.capture_exception(error)
+    head :bad_request
+  rescue Stripe::SignatureVerificationError => error  # ← 仅捕获签名错误
+    Sentry.capture_exception(error)
+    head :bad_request
+  end
+  # ← 其他异常直接抛出，返回 500
+end
+```
+
+### 8.2 异常场景行为矩阵
+
+| 异常场景 | Plaid 行为 | Stripe 行为 |
+|---------|-----------|------------|
+| 签名验证失败 | 捕获 → Sentry → 400 | 捕获 → Sentry → 400 |
+| JSON 解析失败 | 捕获 → Sentry → 400 | 捕获 → Sentry → 400 |
+| Provider 配置缺失 (返回 nil) | 捕获 → Sentry → 400 | **未捕获 → Rails 500** |
+| 任务入队失败 (Redis 问题) | 捕获 → Sentry → 400 | **未捕获 → Rails 500** |
+| 业务处理阶段异常 | WebhookProcessor 内部捕获 → Sentry → 200 | Job 中异常 → Sidekiq 重试 |
+| 未找到对应资源 (PlaidItem/Family) | 捕获 → Sentry → 200 | Job 中异常 → Sidekiq 重试 |
+
+### 8.3 设计意图分析
+
+| 维度 | Plaid 策略 | Stripe 策略 |
+|-----|-----------|------------|
+| 核心目标 | **保持端点健康**：始终返回 200/400，避免 Plaid 标记端点为不健康 | **快速响应**：仅验证必要信息，快速返回 200，异步处理 |
+| 异常哲学 | **容错优先**：即使内部处理失败，也告诉 Plaid "已收到" | **诚实反馈**：签名/格式错误返回 400，系统错误返回 500 |
+| 重试依赖 | 依赖 Plaid 对 400 的重试机制 | 依赖 Stripe 对 500 的重试 + Sidekiq 对 Job 的重试 |
+| 可观测性 | 所有异常都在控制器层上报 Sentry | 部分异常遗漏，依赖 Rails 全局处理 |
+
+### 8.4 外部供应商重试行为
+
+- **Plaid**：对非 200 响应会重试，具体策略未明确文档化
+- **Stripe**：对 4xx 响应**不重试**（认为是客户端错误），对 5xx 响应会重试（指数退避，最多 24 小时）
+
+> **⚠️ 关键影响**：Stripe 入口的 500 错误**会触发 Stripe 重试**，而 400 错误不会。这意味着 Provider 缺失、Redis 故障等场景下，Stripe 会自动重试，直到成功或超过重试上限。
+
+---
+
+## 9. 架构特点与权衡
 
 | 决策 | 优点 | 缺点 |
 |-----|-----|-----|
 | Plaid 同步处理签名验证 | 签名失败立即返回 400，Plaid 会重试 | 控制器内逻辑稍重 |
 | Stripe 异步拉取完整事件 | 控制器快速返回 200，降低超时风险；thin event 体积小 | 需要额外 API 调用拉取完整事件 |
 | Sync 去重 + 窗口扩展 | 避免重复 sync，合并相邻时间范围 | 逻辑复杂度增加 |
-| 所有异常捕获不抛出 | 保证外部供应商收到 200，端点不被标记不健康 | 问题可能被掩盖，依赖 Sentry 告警 |
+| Plaid 全局异常捕获 | 保证外部供应商收到 400，端点健康状态良好 | 问题类型被统一掩盖，难以区分是签名错误还是系统错误 |
+| Stripe 特定异常捕获 | 签名/格式错误快速反馈，不触发不必要的重试 | 系统错误返回 500，观测性依赖 Rails 全局处理 |
+| Registry 静默返回 nil | 配置缺失时不崩溃 | 延迟失败，增加调试复杂度 |
 
 ---
 
-## 9. 扩展点与建议
+## 10. 扩展点与建议
 
-### 9.1 潜在扩展方向
+### 10.1 潜在扩展方向
 1. **新增供应商**：在 `Provider::Registry` 添加新方法，实现对应 `validate_webhook!` 和处理器
 2. **新事件类型**：在对应 Processor 的 case 语句中增加新分支
 3. **死信队列**：为 webhook 处理失败增加专门的死信队列和人工重试界面
 
-### 9.2 可观测性增强建议
+### 10.2 缺陷修复建议
+
+**高优先级：**
+1. **统一 Stripe 异常处理**：在 Stripe 控制器增加 `rescue => error` 兜底，或在 Registry 中增加 nil 检查
+2. **Registry 失败快速**：配置缺失时抛出明确异常而非返回 nil，便于及早发现问题
+3. **Stripe 入队失败保护**：对 `perform_later` 增加异常捕获，避免 500 错误
+
+**中优先级：**
+4. **未处理事件告警**：对未匹配路由的 webhook 类型增加 Sentry warning 级别上报
+5. **幂等性校验**：增加 webhook event_id 去重机制，避免重复处理
+
+### 10.3 可观测性增强建议
 1. 增加 webhook 处理延迟指标（从接收到处理完成的时间）
 2. 按供应商/事件类型统计成功率和失败率
 3. 增加 webhook 幂等性校验（处理过的 event_id 不重复处理）
+4. 为 Stripe 500 错误场景增加专门的告警规则
