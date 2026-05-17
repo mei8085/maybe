@@ -324,97 +324,119 @@ Rails 约定自动映射到对应类型的部分模板：
 
 ### 8.6 加载失败场景
 
-#### 8.6.1 失败触发原因
+#### 8.6.1 组件超时错误态确认
 
-加载失败主要由以下几类异常触发：
+**ActivityFeed 组件本体不存在独立的超时错误态**。代码证据：
 
-| 失败类型 | 触发源 | 典型场景 |
-|----------|--------|----------|
-| **网络超时** | 前端 Stimulus 控制器 | 服务器响应超过 10 秒未返回 |
-| **数据库异常** | `AccountsController#show` | 查询超时、连接断开、锁等待 |
-| **服务器内部错误** | 应用代码执行 | NPE、数组越界、第三方服务调用失败 |
-| **数据同步失败** | 后台 Sync Job | Plaid 连接失败、市场数据导入错误 |
+- `app/components/UI/account/activity_feed.html.erb:1` 中的 Turbo Frame 定义：
+  ```erb
+  <%= turbo_frame_tag dom_id(account, "entries") do %>
+  ```
+  未添加 `data: { controller: "turbo-frame-timeout" }` 属性，因此不会触发前端超时检测。
 
-**关键代码说明：**
+**仅 sparkline 组件使用超时机制**：
 
-1. **前端超时检测**：`app/javascript/controllers/turbo_frame_timeout_controller.js:5-41`
+- `app/views/accounts/_accountable_group.html.erb:16` 和 `:43` 两处 sparkline 配置：
+  ```erb
+  <%= turbo_frame_tag dom_id(account, :sparkline), 
+      src: sparkline_account_path(account), 
+      loading: "lazy", 
+      data: { controller: "turbo-frame-timeout", turbo_frame_timeout_timeout_value: 10000 } do %>
+  ```
+  这是仓内唯一使用 `turbo-frame-timeout` 控制器的场景，与 Activity Feed 组件无关联。
 
-```javascript
-// 默认 10 秒超时，监听 turbo:frame-load 事件清除定时器
-static values = { timeout: { type: Number, default: 10000 } }
+#### 8.6.2 失败触发原因
 
-handleTimeout() {
-  // 直接替换 innerHTML 为错误状态
-  this.element.innerHTML = `...错误UI...`
-}
-```
+Activity Feed 加载失败仅能通过 Rails 全局异常处理机制触发，仓内可定位的触发点：
 
-2. **后端异常类型**：
-   - `ActiveRecord::QueryCanceled`：数据库查询超时
-   - `ActiveRecord::ConnectionNotEstablished`：数据库连接失败
-   - `PG::ConnectionBad`：PostgreSQL 连接异常
-   - 通用 `StandardError`：应用代码异常
-
-#### 8.6.2 状态切换链路
-
-```
-用户访问账户页面
-        ↓
-[浏览器] 发送 HTTP 请求 → 显示 Turbo Frame 加载态
-        ↓
-[Rails] 路由 → AccountsController#show
-        ├─ 成功 → 渲染 ActivityFeed 组件 → 页面展示
-        └─ 失败（异常抛出）
-            ├─ 开发环境：显示 Rails 错误栈页面
-            └─ 生产环境：
-                ├─ 响应状态码 500
-                ├─ 渲染 public/500.html 静态错误页
-                └─ 或被 Turbo 捕获显示局部错误
-```
-
-**前端超时切换流程**：
-```
-页面加载 → Turbo Frame 显示 loading 内容
-        ↓
-setTimeout(handleTimeout, 10000) 启动
-        ├─ 10秒内收到 turbo:frame-load → 清除定时器 → 正常展示
-        └─ 10秒内未收到响应 → 触发 handleTimeout → 替换 innerHTML 为错误UI
-```
-
-#### 8.6.3 用户可见提示
-
-根据失败类型不同，用户会看到不同的提示：
-
-| 失败类型 | 用户可见内容 | 视觉样式 |
+| 失败类型 | 触发代码位置 | 触发条件 |
 |----------|--------------|----------|
-| **前端超时** | ⚠️ 黄色警告图标 + "Timeout" 文本 | 右对齐，小字体，警告色 |
-| **服务器500错误** | "We're sorry, but something went wrong (500)" | 全屏静态错误页，红色标题 |
-| **同步失败** | 同步状态区显示错误详情 | Plaid 账户卡片显示错误徽章 |
+| **账户不存在** | `app/controllers/accounts_controller.rb:70-72` | `family.accounts.find(params[:id])` 查找失败 |
+| **控制器执行异常** | `app/controllers/accounts_controller.rb:17-26` | `show` 动作中任意代码抛出未捕获异常 |
+| **模板渲染异常** | `app/components/UI/account/activity_feed.html.erb` | 模板渲染过程中发生错误 |
 
-**超时错误 UI 代码**：`app/javascript/controllers/turbo_frame_timeout_controller.js:29-40`
+**关键代码证据：**
 
-```html
-<div class="flex items-center justify-end gap-1">
-  <div class="w-8 h-4 flex items-center justify-center">
-    <svg ... class="text-warning">⚠️</svg>
-  </div>
-  <p class="font-mono text-right text-xs text-warning">Timeout</p>
-</div>
+1. **账户查找**：`app/controllers/accounts_controller.rb:70-72`
+   ```ruby
+   def set_account
+     @account = family.accounts.find(params[:id])
+   end
+   ```
+
+2. **全局异常配置**：
+   - 开发环境：`config/environments/development.rb:15` → `config.consider_all_requests_local = true`
+   - 生产环境：`config/environments/production.rb:16` → `config.consider_all_requests_local = false`
+
+#### 8.6.3 状态切换链路
+
+```
+用户点击账户链接 / 输入账户 URL
+        ↓
+[浏览器] 发送 GET /accounts/:id 请求
+        ↓
+[Rails 路由] 匹配到 AccountsController#show
+        ↓
+[过滤器] 执行 set_account
+        ├─ 成功 → 继续执行 show 动作
+        └─ 失败（ActiveRecord::RecordNotFound）
+            ├─ 被 StoreLocation concern 捕获
+            ├─ 调用 handle_not_found 方法
+            └─ 返回 404 响应或重定向
+        ↓
+[控制器] 执行 show 动作
+        ├─ entries 查询、分页、构建 ActivityFeedData
+        ├─ 成功 → 渲染 accounts/show.html.erb 模板
+        └─ 失败（任意未捕获异常）
+            ├─ 开发环境：渲染 Rails 错误栈页面
+            └─ 生产环境：
+                ├─ 设置响应状态码 500
+                └─ 渲染 public/500.html 静态错误页
+        ↓
+[模板渲染] 渲染 ActivityFeed 组件
+        ├─ 成功 → 输出完整 HTML 到浏览器
+        └─ 失败（模板错误）→ 同上异常处理流程
 ```
 
-#### 8.6.4 与其他边界场景的边界区别
+**无前端超时切换**：由于 ActivityFeed 未绑定 `turbo-frame-timeout` 控制器，不存在从加载态自动切换到错误态的前端逻辑。
 
-| 场景 | 触发阶段 | 数据状态 | HTTP 状态码 | 用户感知 |
-|------|----------|----------|-------------|----------|
-| **空 Feed** | 数据查询后 | 查询成功，返回 0 条记录 | 200 OK | 正常页面，显示 "No entries yet" |
-| **无权限** | 数据查询前 | 认证/授权失败，不执行查询 | 404 Not Found / 重定向 | 无法访问页面或跳转到首页 |
-| **搜索无结果** | 数据查询后 | 查询成功，过滤后 0 条 | 200 OK | 正常页面，显示 "No entries yet" |
-| **加载失败** | 数据查询中 | 查询未完成/异常终止 | 500 Internal Server Error / 无响应 | 错误页面或局部超时提示 |
+#### 8.6.4 用户可见提示
 
-**关键区分点：**
-- **空 Feed vs 加载失败**：空 Feed 是**查询成功但无数据**，页面完整渲染；加载失败是**查询过程异常**，页面渲染中断
-- **无权限 vs 加载失败**：无权限是**主动拒绝访问**，失败发生在业务逻辑之前；加载失败是**被动异常**，失败发生在业务逻辑执行中
-- **搜索无结果 vs 加载失败**：搜索无结果是**过滤后无匹配**，属于正常业务逻辑分支；加载失败是**系统级异常**
+根据失败阶段不同，用户可见内容：
+
+| 失败阶段 | 代码位置 | 用户可见内容 |
+|----------|----------|--------------|
+| **账户不存在** | `app/controllers/concerns/store_location.rb:17-22` | 空白页面（`head :not_found`）或重定向到首页 |
+| **控制器/模板异常** | `public/500.html` | 全屏静态错误页："We're sorry, but something went wrong (500)" |
+| **开发环境异常** | Rails 中间件 | 完整错误栈追踪页面，包含异常类型、调用链、请求参数 |
+
+**无专用错误 UI 组件**：仓内未发现 ActivityFeed 专用的错误态模板或组件。
+
+#### 8.6.5 与其他边界场景的边界区别
+
+| 场景 | 代码判断位置 | 判断逻辑 | HTTP 状态 | 页面完整性 |
+|------|--------------|----------|-----------|------------|
+| **空 Feed** | `app/components/UI/account/activity_feed.html.erb:53-54` | `activity_dates.empty?` 为 true | 200 OK | 完整页面，仅 feed 区域显示提示 |
+| **搜索无结果** | `app/components/UI/account/activity_feed.html.erb:53-54` | 搜索过滤后 `activity_dates.empty?` 为 true | 200 OK | 完整页面，仅 feed 区域显示提示 |
+| **无权限** | `app/controllers/concerns/store_location.rb:9,17-22` | `family.accounts.find` 抛出 `ActiveRecord::RecordNotFound` | 404 / 302 重定向 | 空白页面或跳转到首页 |
+| **加载失败** | Rails 全局异常处理 | 控制器/模板执行中抛出未捕获异常 | 500 Internal Server Error | 全屏错误页，无应用布局 |
+
+**边界区分代码证据：**
+
+1. **空 Feed 与加载失败的边界**：
+   - 空 Feed 是**条件分支**：`if activity_dates.empty?` 明确判断数据存在性
+   - 加载失败是**异常抛出**：无代码判断，直接中断执行流
+   - 关键区分：空 Feed 会完整渲染搜索框、标题等页面元素；加载失败会完全跳过这些渲染
+
+2. **无权限与加载失败的边界**：
+   - 无权限是**预期内的查找失败**：`find` 方法语义上允许找不到记录
+   - 加载失败是**预期外的执行错误**：如数据库连接断开、代码 bug 等
+   - 关键区分：无权限由 `rescue_from ActiveRecord::RecordNotFound` 显式处理；加载失败由 Rails 全局异常兜底
+
+3. **搜索无结果与加载失败的边界**：
+   - 搜索无结果是**过滤后的正常空集**：`EntrySearch` 正常执行，返回 0 条匹配
+   - 加载失败是**搜索过程本身出错**：如 SQL 语法错误、数据库超时
+   - 关键区分：搜索无结果仍会显示搜索框，用户可修改搜索条件；加载失败无交互元素
 
 ## 9. 实时刷新机制
 
@@ -446,3 +468,5 @@ end
 4. **账户类型差异化**：BalanceReconciliation 根据账户类型动态展示对账项目
 5. **实时更新**：Turbo Stream 支持无刷新更新活动列表
 6. **批量操作**：内置 bulk-select 控制器支持批量编辑条目
+7. **前端超时保护**：Stimulus 控制器实现 Turbo Frame 超时检测，避免无限加载
+8. **边界场景分层处理**：空状态、无权限、加载失败等场景在不同层级处理，职责清晰
