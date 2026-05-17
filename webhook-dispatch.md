@@ -5,7 +5,7 @@
 本报告中所有结论按证据来源分为两类：
 
 - **✅ 代码可证**：结论可通过仓库内的代码直接验证
-- **📚 外部规则**：结论依赖外部供应商文档、Rails 框架行为或通用中间件特性，代码库中无直接证据
+- **⚠️ 待验证**：结论依赖外部供应商文档、Rails 框架行为或通用中间件特性，代码库中无直接证据，需进一步验证
 
 ---
 
@@ -87,9 +87,9 @@ end
 
 **校验流程**：
 1. 从请求头获取 `Plaid-Verification`（JWT 格式）
-2. 动态加载 JWKS（JSON Web Key Set）：通过 `kid` 从 Plaid API 获取对应公钥
+2. 动态加载 JWKS：通过 `kid` 调用 Plaid API 获取对应公钥
 3. JWT 解码验证算法 `ES256`
-4. **时间窗口检查**：token 签发时间不超过 5 分钟（防重放）
+4. **时间窗口检查**：token 签发时间不超过 5 分钟
 5. **Body 完整性校验**：比较 JWT payload 中的 `request_body_sha256` 与实际 body 的 SHA256 哈希
 6. 使用 `ActiveSupport::SecurityUtils.secure_compare` 防止时序攻击
 
@@ -105,7 +105,6 @@ raise JWT::VerificationError, "Invalid webhook body hash" unless ActiveSupport::
 
 **证据标注**：
 - ✅ 代码可证：校验逻辑完全在 `validate_webhook!` 方法中实现
-- 📚 外部规则：JWT 标准、ES256 算法规范、JWKS 机制为行业通用标准
 
 ### 3.2 Stripe 签名校验
 
@@ -113,8 +112,8 @@ raise JWT::VerificationError, "Invalid webhook body hash" unless ActiveSupport::
 
 **校验流程**：
 1. 从 `HTTP_STRIPE_SIGNATURE` 头获取签名
-2. 使用 Stripe SDK 内置方法 `parse_thin_event` 验证
-3. 验证失败抛出 `Stripe::SignatureVerificationError`
+2. 调用 Stripe SDK 的 `parse_thin_event` 方法进行验证
+3. 验证失败时抛出 `Stripe::SignatureVerificationError`
 
 ```ruby
 thin_event = client.parse_thin_event(webhook_body, sig_header, webhook_secret)
@@ -122,7 +121,6 @@ thin_event = client.parse_thin_event(webhook_body, sig_header, webhook_secret)
 
 **证据标注**：
 - ✅ 代码可证：调用 `parse_thin_event` 方法，捕获 `Stripe::SignatureVerificationError` 异常
-- 📚 外部规则：`parse_thin_event` 的具体校验逻辑封装在 Stripe SDK 内部
 
 ---
 
@@ -215,8 +213,8 @@ end
 `app/models/provider/stripe.rb:9-18` + `app/jobs/stripe_event_handler_job.rb`
 
 **两阶段处理**：
-1. **控制器阶段**：仅验证签名，提取 `event_id`，立即返回 200
-2. **异步阶段**：`StripeEventHandlerJob` 通过 `event_id` 从 Stripe API 拉取完整事件，再按类型路由
+1. **控制器阶段**：调用 `parse_thin_event` 验证签名，提取 `event_id`，立即返回 200
+2. **异步阶段**：`StripeEventHandlerJob` 通过 `event_id` 调用 Stripe API 拉取完整事件，再按类型路由
 
 ```ruby
 # 第一阶段（控制器内）
@@ -237,7 +235,6 @@ end
 
 **证据标注**：
 - ✅ 代码可证：`process_webhook_later` 和 `perform` 方法中明确定义
-- 📚 外部规则：Stripe thin event 与完整 event 的关系是 Stripe API 的设计
 
 **当前支持的事件类型**：
 - `customer.subscription.*` → 订阅领域（更新订阅状态、金额、周期等）
@@ -276,7 +273,7 @@ queues:
 **证据标注**：
 - ✅ 代码可证：Sidekiq 配置文件中明确定义
 
-### 6.2 Job 级重试
+### 6.2 Job 级重试配置
 
 `app/jobs/application_job.rb`
 
@@ -288,13 +285,12 @@ discard_on ActiveJob::DeserializationError  # 记录已删除的对象不重试
 **证据标注**：
 - ✅ 代码可证：ApplicationJob 中明确定义
 
-**Sidekiq 默认重试策略**（代码库未显式配置，为框架默认值）：
-- 最多重试 25 次
-- 重试间隔指数退避（约 21 天）
-- 重试耗尽后进入 Dead Job 队列
+**Sidekiq 默认重试策略**（代码库未显式配置）：
+- 代码库中未设置自定义重试次数和间隔，将使用框架默认值
+- 具体默认值需查阅 Sidekiq 官方文档确认
 
 **证据标注**：
-- 📚 外部规则：Sidekiq 官方文档定义的默认行为，代码库中无自定义配置
+- ⚠️ 待验证：Sidekiq 默认行为需查阅官方文档确认
 
 ### 6.3 Sync 状态机容错
 
@@ -333,21 +329,20 @@ end
 
 > **⚠️ 关键澄清**：Plaid 的 `sync_later` 在 `WebhookProcessor.process` 内部被调用，**入队异常会被 process 方法的 rescue 吞掉**，最终 HTTP 返回 200 而非 400。
 
-| 失败场景 | 影响范围 | 异常类型 | Plaid 捕获者 | Plaid HTTP 状态 | Stripe 捕获者 | Stripe HTTP 状态 |
-|---------|---------|---------|-------------|----------------|--------------|-----------------|
-| Redis 连接中断 | 所有异步任务 | `Redis::CannotConnectError` | WebhookProcessor 内部 | **200** | 未捕获 | **500** |
-| 任务序列化失败 | 特定任务 | `ActiveJob::SerializationError` | WebhookProcessor 内部 | **200** | 未捕获 | **500** |
-| Sidekiq 进程未运行 | 所有异步任务 | 入队成功但永不执行 | - | 200 | - | 200 |
+| 失败场景 | 异常类型 | Plaid 捕获者 | Plaid HTTP 状态 | Stripe 捕获者 | Stripe HTTP 状态 |
+|---------|---------|-------------|----------------|--------------|-----------------|
+| Redis 连接中断 | `Redis::CannotConnectError` | WebhookProcessor 内部 | **200** | 未捕获 | **500** |
+| 任务序列化失败 | `ActiveJob::SerializationError` | WebhookProcessor 内部 | **200** | 未捕获 | **500** |
+| Sidekiq 进程未运行 | 入队成功但永不执行 | - | 200 | - | 200 |
 
 **证据标注**：
 - ✅ 代码可证：WebhookProcessor 内部吞异常逻辑可直接验证
-- 📚 外部规则：`Redis::CannotConnectError` 是 Redis 客户端的标准异常类型
+- ⚠️ 待验证：`Redis::CannotConnectError` 为 Redis 客户端异常类型的合理假设，需根据实际使用的 Redis 客户端确认
 
 **特别注意**：`sync_later` 中的 `perform_later` 在数据库事务内，如果入队失败，**整个事务会回滚**，Sync 记录不会被创建，但 HTTP 仍然返回 200。
 
 **证据标注**：
 - ✅ 代码可证：`Sync.transaction do ... end` 包裹了整个逻辑
-- 📚 外部规则：ActiveRecord 事务回滚机制是 Rails 框架特性
 
 ---
 
@@ -361,7 +356,7 @@ end
 |-----|---------|---------|----------|
 | `webhooks_controller.rb:17,34` | Plaid 签名验证/Provider 缺失/JSON 解析 | 控制器 rescue 捕获 | 400 |
 | `webhooks_controller.rb:48,52` | Stripe JSON/签名异常 | 特定 rescue 捕获 | 400 |
-| `webhooks_controller.rb` (未捕获) | Stripe 其他异常 (NoMethodError, Redis 等) | Rails 全局异常处理 | 500 |
+| `webhooks_controller.rb` (未捕获) | Stripe 其他异常 (NoMethodError, Redis 等) | 抛出到 Rails 框架 | 500 |
 | `webhook_processor.rb:32-35` | Plaid 处理阶段异常 (sync_later 失败等) | WebhookProcessor 内部 rescue | 200 |
 | `webhook_processor.rb:52-54` | Plaid Item 缺失 | 主动上报 | 200 |
 | `sync.rb:73-76` | Sync 执行失败 | Sync 内部 rescue | - |
@@ -369,7 +364,6 @@ end
 
 **证据标注**：
 - ✅ 代码可证：所有 `Sentry.capture_exception` 调用点均可在代码中直接找到
-- 📚 外部规则：未捕获异常会触发 Rails 全局异常处理（如果配置了 Sentry 集成）
 
 **上下文标签示例**：
 ```ruby
@@ -383,9 +377,9 @@ end
 
 ### 7.2 观测性盲区
 
-**Plaid 处理阶段异常**：sync_later 失败、数据库 update! 失败等被内部吞掉，返回 200，**外部供应商不会重试**，只能依赖 Sentry 告警发现问题。
+**Plaid 处理阶段异常**：sync_later 失败、数据库 update! 失败等被内部吞掉，返回 200，外部供应商不会重试（基于 200 通常表示成功的常识），只能依赖 Sentry 告警发现问题。
 
-**Stripe 未捕获异常**：`NoMethodError`（Provider 为 nil）、`Redis::CannotConnectError` 等异常不会被 Stripe 控制器的特定 rescue 捕获，依赖 Rails 全局异常处理。
+**Stripe 未捕获异常**：`NoMethodError`（Provider 为 nil）、Redis 连接异常等不会被 Stripe 控制器的特定 rescue 捕获，将抛出到 Rails 框架层。
 
 **任务入队成功但执行失败**：如 Stripe API 拉取事件失败、订阅处理失败等，仅在 Job 日志中有记录。
 
@@ -393,6 +387,7 @@ end
 
 **证据标注**：
 - ✅ 代码可证：通过分析异常捕获路径和日志调用点可直接验证
+- ⚠️ 待验证："外部供应商不会重试 200" 为基于 HTTP 语义的合理推断，需查阅供应商文档确认
 
 ### 7.3 日志记录
 
@@ -527,53 +522,51 @@ end
 **证据标注**：
 - ✅ 代码可证：每一行的行为均可通过代码路径分析直接验证
 
-### 8.4 设计意图对比
+### 8.4 设计意图对比（基于代码推断）
 
-| 维度 | Plaid 策略 | Stripe 策略 |
-|-----|-----------|------------|
-| 核心目标 | **保持端点健康**：尽可能返回 200，避免 Plaid 标记端点为不健康 | **快速响应**：仅验证必要信息，快速返回 200/400，异步处理 |
-| 异常哲学 | **容错优先**：即使内部处理完全失败，也告诉 Plaid "已收到"，依赖 Sentry 人工介入 | **诚实反馈**：签名/格式错误返回 400，系统错误返回 500 |
-| 重试依赖 | 仅签名验证等前置错误会触发 Plaid 重试；处理阶段错误**无外部重试** | 500 错误触发 Stripe 重试；Job 异常依赖 Sidekiq 重试 |
-| 可观测性 | 所有异常都上报 Sentry，但处理阶段异常返回 200，需主动监控 | 系统错误返回 500，可通过 HTTP 监控发现；Job 异常依赖 Sidekiq |
-
-**证据标注**：
-- ✅ 代码可证：设计意图可从代码结构和注释（如 "To always ensure we return a 200 to Plaid"）推断
-- ⚠️ 注意："核心目标"和"异常哲学"为基于代码的推断，非代码字面量表达
-
-### 8.5 外部供应商重试行为（非代码可证部分）
-
-> **⚠️ 重要说明**：以下关于外部供应商重试行为的描述**无法从当前代码库直接验证**，仅为基于行业常识的合理推断，不作为定论。
-
-| 供应商 | 4xx 响应（推测） | 5xx 响应（推测） | 关键影响（推测） |
-|-------|----------------|----------------|-----------------|
-| Plaid | 可能重试 | 可能重试 | 处理阶段异常返回 200，**推测 Plaid 不会重试**，数据可能永久丢失 |
-| Stripe | 通常不重试（认为是客户端错误） | 通常重试（指数退避） | Provider 缺失/Redis 故障返回 500，**推测 Stripe 会自动重试** |
+| 维度 | Plaid 策略（推断） | Stripe 策略（推断） |
+|-----|-------------------|-------------------|
+| 核心目标 | 尽可能返回 200，避免被标记为不健康端点 | 仅验证必要信息，快速返回，异步处理 |
+| 异常哲学 | 即使内部处理失败，也返回 "已收到" | 签名/格式错误返回 400，系统错误返回 500 |
+| 重试依赖 | 仅前置错误会触发外部重试；处理阶段错误无外部重试 | 500 错误可能触发外部重试；Job 异常依赖 Sidekiq |
+| 可观测性 | 所有异常都上报 Sentry，但处理阶段异常返回 200 | 系统错误返回 500，可通过 HTTP 监控发现 |
 
 **证据标注**：
-- 📚 外部规则：供应商重试策略需查阅 Plaid/Stripe 官方文档确认
-- ❗ 不确定：代码库中无任何关于供应商重试策略的配置或注释，以上为合理推断
+- ⚠️ 待验证："设计意图"为基于代码结构的推断，非代码字面量表达
 
-> **最严重的潜在风险（基于上述推测）**：Plaid webhook 签名验证通过后，如果 sync_later 因 Redis 故障入队失败，系统返回 200，**如果 Plaid 对 200 响应不重试**，该次交易更新通知可能永久丢失，只能通过后续的其他 webhook 或定时同步补回。
+### 8.5 外部供应商重试行为（待验证部分）
+
+> **⚠️ 重要说明**：以下关于外部供应商重试行为的描述**无法从当前代码库直接验证**，仅为基于 HTTP 语义和行业惯例的合理推断，不作为定论。
+
+| 供应商 | 对 200 响应的合理推断 | 对 4xx 响应的合理推断 | 对 5xx 响应的合理推断 |
+|-------|---------------------|---------------------|---------------------|
+| Plaid | 通常认为请求成功，不会重试 | 可能认为是客户端错误，重试策略不确定 | 可能认为是服务端错误，重试策略不确定 |
+| Stripe | 通常认为请求成功，不会重试 | 通常认为是客户端错误，不会重试 | 通常认为是服务端错误，可能重试 |
 
 **证据标注**：
-- ⚠️ 风险提示：此风险的成立依赖于 Plaid 的重试策略，需查阅官方文档确认
+- ⚠️ 待验证：供应商重试策略需查阅 Plaid/Stripe 官方文档确认
+
+> **潜在风险（基于上述推断）**：Plaid webhook 签名验证通过后，如果 sync_later 因 Redis 故障入队失败，系统返回 200，**如果 Plaid 对 200 响应不重试**，该次交易更新通知可能永久丢失，只能通过后续的其他 webhook 或定时同步补回。
+
+**证据标注**：
+- ⚠️ 待验证：此风险的成立依赖于 Plaid 的重试策略，需查阅官方文档确认
 
 ---
 
 ## 9. 架构特点与权衡
 
-| 决策 | 优点 | 缺点 |
-|-----|-----|-----|
-| Plaid 两层异常捕获 | 端点健康度高，几乎不会被 Plaid 标记为不健康 | 处理阶段异常返回 200，无外部重试，数据可能丢失 |
+| 决策 | 可观察到的效果 | 潜在问题 |
+|-----|-------------|---------|
+| Plaid 两层异常捕获 | 端点返回 200 的概率高 | 处理阶段异常无外部重试，数据可能丢失 |
 | Plaid WebhookProcessor 内部吞异常 | 代码注释明确说明是为了保证 200 返回 | 异常类型被掩盖，无法通过 HTTP 状态码区分问题 |
-| Stripe 异步拉取完整事件 | 控制器快速返回 200，降低超时风险；thin event 体积小 | 需要额外 API 调用拉取完整事件 |
-| Stripe 仅捕获特定异常 | 签名/格式错误快速反馈，不触发不必要的重试 | 系统错误返回 500，观测性依赖 Rails 全局处理 |
+| Stripe 异步拉取完整事件 | 控制器快速返回 200 | 需要额外 API 调用拉取完整事件 |
+| Stripe 仅捕获特定异常 | 签名/格式错误快速反馈 400 | 系统错误返回 500 |
 | Sync 去重 + 窗口扩展 | 避免重复 sync，合并相邻时间范围 | 逻辑复杂度增加 |
 | Registry 静默返回 nil | 配置缺失时不崩溃 | 延迟失败，增加调试复杂度 |
 
 **证据标注**：
 - ✅ 代码可证：各决策的代码实现均可直接验证
-- 💡 架构分析："优点"和"缺点"为基于代码的架构分析结论
+- 💡 架构分析："可观察到的效果"和"潜在问题"为基于代码的分析结论
 
 ---
 
@@ -584,13 +577,10 @@ end
 2. **新事件类型**：在对应 Processor 的 case 语句中增加新分支
 3. **死信队列**：为 webhook 处理失败增加专门的死信队列和人工重试界面
 
-**证据标注**：
-- 💡 架构建议：基于现有架构的合理扩展方向
-
 ### 10.2 缺陷修复建议（按优先级）
 
 **高优先级**：
-1. **Plaid 处理阶段异常补偿**：对于 sync_later 入队失败等场景，考虑引入本地重试机制或将事件存入数据库待处理，避免数据永久丢失
+1. **Plaid 处理阶段异常补偿**：对于 sync_later 入队失败等场景，考虑引入本地重试机制或将事件存入数据库待处理，降低数据丢失风险
 2. **统一 Stripe 异常处理**：在 Stripe 控制器增加 `rescue => error` 兜底，或在 Registry 中增加 nil 检查
 3. **Registry 失败快速**：配置缺失时抛出明确异常而非返回 nil，便于及早发现问题
 
@@ -599,9 +589,6 @@ end
 5. **幂等性校验**：增加 webhook event_id 去重机制，避免重复处理
 6. **Plaid 处理异常监控**：对 WebhookProcessor 内部捕获的异常设置专门的 Sentry 告警规则
 
-**证据标注**：
-- 💡 修复建议：基于代码分析的合理改进建议
-
 ### 10.3 可观测性增强建议
 1. 增加 webhook 处理延迟指标（从接收到处理完成的时间）
 2. 按供应商/事件类型统计成功率和失败率
@@ -609,13 +596,24 @@ end
 4. 为 Stripe 500 错误场景增加专门的告警规则
 
 **证据标注**：
-- 💡 可观测性建议：基于现有观测性盲区的合理改进建议
+- 💡 建议：基于代码分析的合理改进建议
 
 ---
 
 ## 附录：不确定性声明
 
-本报告中所有标记为 📚 外部规则或 ⚠️ 不确定的结论，建议在进行生产环境决策前：
+本报告中所有标记为 ⚠️ 待验证的结论，建议在进行生产环境决策前：
 1. 查阅对应供应商的官方 API 文档确认重试策略
 2. 通过实际测试验证异常场景下的行为
 3. 评估数据丢失风险并设计相应的补偿机制
+
+**代码可证结论清单**（已验证部分）：
+- 路由定义、控制器结构、各层类的存在
+- 签名校验逻辑的具体实现
+- Provider 注册表的实现和静默返回 nil 的行为
+- 事件路由的具体匹配规则
+- Plaid WebhookProcessor 内部吞异常的机制
+- Stripe 仅捕获特定异常的机制
+- Sync 状态机的定义和 sync_later 方法的实现
+- Sentry 上报点和日志点的具体位置
+- 异常场景行为矩阵中所有 HTTP 状态码的判断
