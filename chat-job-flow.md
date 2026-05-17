@@ -205,7 +205,9 @@ end
 
 ---
 
-### 2.6 重复投递风险分析（API 入口 Bug）
+### 2.6 API 入口问题汇总
+
+#### 2.6.1 重复投递问题（API 创建/追加）
 
 **问题描述**：
 
@@ -227,10 +229,6 @@ after_create_commit 回调触发
 1. `POST /api/v1/chats` - 创建聊天并包含首条消息时
 2. `POST /api/v1/chats/:chat_id/messages` - 追加消息时
 
-**不受影响的接口**：
-- `POST /api/v1/chats/:chat_id/messages/retry` - 创建的是 `AssistantMessage`，没有回调，仅入队 1 次
-- 所有网页入口 - 仅依赖回调，无手动入队
-
 **影响范围**：
 
 | 影响类型 | 具体表现 |
@@ -244,6 +242,43 @@ after_create_commit 回调触发
 **根本原因**：
 
 API 控制器设计时忽略了 `UserMessage` 已有的 `after_create_commit` 回调机制，导致回调自动入队和手动入队同时执行。
+
+---
+
+#### 2.6.2 调用契约不匹配问题（API Retry）
+
+**问题描述**：
+
+API Retry 路径创建的 `AssistantMessage` 没有 `request_response` 方法，任务执行时会抛出 `NoMethodError`。
+
+**受影响的 API 接口**：
+- `POST /api/v1/chats/:chat_id/messages/retry`
+
+**影响范围**：
+
+| 影响类型 | 具体表现 |
+|---------|---------|
+| **功能完全失效** | 用户点击重试后收不到任何回复 |
+| **任务队列污染** | 失败任务会被 Sidekiq 重试最多 25 次，占用队列资源 |
+| **数据污染** | 聊天中留下一条空的 `AssistantMessage` 记录 |
+| **用户困惑** | API 返回 202 Accepted，但实际任务失败 |
+
+**根本原因**：
+
+API Retry 逻辑设计错误：
+1. 创建的是 `AssistantMessage` 类型（不是 `UserMessage`）
+2. `AssistantMessage` 没有 `request_response` 实例方法
+3. 触发条件判断错误（应该检查最后一条是否是 `UserMessage`，不是 `AssistantMessage`）
+
+---
+
+#### 2.6.3 问题路径对比
+
+| 路径 | 问题类型 | 严重程度 |
+|-----|---------|---------|
+| 网页入口 | 无 | - |
+| API 创建/追加 | 重复入队 | 中等 |
+| API Retry | 调用契约不匹配（NoMethodError） | 严重 |
 
 ---
 
@@ -743,7 +778,7 @@ end
 ────────────┴────────────────────────────┴───────────────────────────┴───────────────────────────┘
 ```
 
-> **重要修正**：API Retry 路径存在严重的调用契约不匹配，会在任务执行阶段抛出 `NoMethodError`，无法正常工作。
+> **重要修正**：API Retry 路径存在调用契约不匹配，在任务执行阶段会抛出 `NoMethodError`。具体表现取决于 Active Job 队列适配器配置，详见 7.5 节。
 
 ---
 
@@ -751,63 +786,47 @@ end
 
 #### 7.4.1 分叉点与汇合点
 
-| 节点类型 | 位置 | 说明 |
-|---------|------|------|
-| **分叉点 1** | 步骤 3 → 步骤 4 | API 创建/追加路径中，回调入队后，控制器继续手动入队，产生两条相同任务 |
-| **汇合点 1** | 步骤 5 | 三条路径最终都进入相同的 `AssistantResponseJob` 执行逻辑 |
-| **汇合点 2** | 步骤 6 | 三条路径最终都通过相同的 `broadcast_*` 机制推送到前端 |
+| 节点类型 | 位置 | 说明 | 代码依据 |
+|---------|------|------|---------|
+| **分叉点 1** | 步骤 3 → 步骤 4 | API 创建/追加路径中，回调入队后，控制器继续手动入队，产生两条相同任务 | `app/controllers/api/v1/messages_controller.rb:15-16` |
+| **失败点 1** | 步骤 5 | API Retry 路径中，`AssistantMessage` 没有 `request_response` 方法，抛出 `NoMethodError` | `app/models/user_message.rb:14-16` vs `app/models/assistant_message.rb:1-12` |
+| **汇合点 1** | 步骤 5 | 网页入口和 API 创建/追加路径进入相同的 `AssistantResponseJob` 执行逻辑 | `app/jobs/assistant_response_job.rb:4-6` |
+| **汇合点 2** | 步骤 6 | 网页入口和 API 创建/追加路径通过相同的 `broadcast_*` 机制推送到前端 | `app/models/message.rb:13-14` |
 
-#### 7.4.2 重复投递风险定位
+#### 7.4.2 路径问题总览（证据驱动）
 
-**重复投递只发生在：**
-1. `POST /api/v1/chats` - 创建聊天并包含首条消息时
-2. `POST /api/v1/chats/:chat_id/messages` - 追加消息时
-
-**不发生重复投递的路径：**
-- ✅ 所有网页入口路径
-- ✅ `POST /api/v1/chats/:chat_id/messages/retry`
+| 路径 | 入队次数 | 运行时结果 | 边界条件 | 代码依据 |
+|-----|---------|-----------|---------|---------|
+| 网页入口 | 1 次 | ✅ 正常工作 | 无 | `app/controllers/messages_controller.rb:6-13` |
+| API 创建/追加 | 2 次 | ⚠️ 产生重复回复 | Sidekiq 并发处理两条独立任务 | `app/controllers/api/v1/messages_controller.rb:9-16` + `app/models/user_message.rb:4-5` |
+| API Retry | 1 次 | ❌ `NoMethodError` 异常 | 取决于队列适配器的重试策略 | `app/models/assistant_message.rb` 无 `request_response` 方法 |
 
 #### 7.4.3 为什么网页路径不触发重复
 
 ```ruby
-# app/controllers/messages_controller.rb
+# app/controllers/messages_controller.rb:6-13
 def create
-  @message = UserMessage.create!(...)
+  @message = UserMessage.create!(
+    chat: @chat,
+    content: message_params[:content],
+    ai_model: message_params[:ai_model]
+  )
   redirect_to chat_path(@chat, thinking: true)
   # 控制器没有手动调用 perform_later！
-  # 完全依赖 UserMessage 的 after_create_commit 回调
 end
 ```
 
-**原因**：网页控制器完全遵循 "单一职责" 原则，仅负责创建消息和页面跳转，入队逻辑完全委托给模型回调，没有重复调用。
+**依据**：网页控制器仅创建消息和重定向，入队逻辑完全通过 `UserMessage` 的 `after_create_commit` 回调触发（`app/models/user_message.rb:4-5`），没有重复调用。
 
-#### 7.4.4 为什么 API Retry 路径不触发重复
-
-```ruby
-# app/controllers/api/v1/messages_controller.rb
-def retry
-  new_message = @chat.messages.create!(
-    type: "AssistantMessage",  # 注意类型是 AssistantMessage
-    content: "",
-    ai_model: last_message.ai_model
-  )
-  AssistantResponseJob.perform_later(new_message)  # 仅手动入队 1 次
-end
-```
-
-**原因**：
-1. 创建的是 `AssistantMessage` 类型，不是 `UserMessage`
-2. `AssistantMessage` 没有定义 `after_create_commit :request_response_later` 回调
-3. 只有控制器手动入队 1 次，没有双重触发
-
-#### 7.4.5 为什么 API 创建/追加路径触发重复
+#### 7.4.4 为什么 API 创建/追加路径触发重复
 
 ```ruby
-# app/controllers/api/v1/messages_controller.rb
+# app/controllers/api/v1/messages_controller.rb:8-16
 def create
   @message = @chat.messages.build(
-    type: "UserMessage",  # 类型是 UserMessage，带有回调！
-    ...
+    content: message_params[:content],
+    type: "UserMessage",     # 类型是 UserMessage，带有回调！
+    ai_model: message_params[:model] || "gpt-4"
   )
 
   if @message.save
@@ -818,15 +837,241 @@ def create
 end
 ```
 
-**根本原因**：
-1. 创建的是 `UserMessage`，带有 `after_create_commit :request_response_later` 回调
-2. `save` 触发回调自动入队（第 1 次）
-3. 控制器又手动调用了一次 `perform_later`（第 2 次）
-4. 两条完全相同的任务进入队列，各自独立执行，产生两条重复回复
+**依据**：
+1. `UserMessage` 有 `after_create_commit :request_response_later` 回调（`app/models/user_message.rb:4`）
+2. `save` 触发回调自动入队（`app/models/user_message.rb:10-12`）
+3. 控制器第 16 行又手动调用了一次 `perform_later`
+4. 两条完全相同的任务进入队列，各自独立执行
+
+#### 7.4.5 为什么 API Retry 路径不触发重复（但有其他问题）
+
+```ruby
+# app/controllers/api/v1/messages_controller.rb:23-33
+def retry
+  last_message = @chat.messages.ordered.last
+
+  if last_message&.type == "AssistantMessage"
+    new_message = @chat.messages.create!(
+      type: "AssistantMessage",  # 注意类型是 AssistantMessage
+      content: "",
+      ai_model: last_message.ai_model
+    )
+    AssistantResponseJob.perform_later(new_message)  # 仅手动入队 1 次
+    ...
+  end
+end
+```
+
+**依据**：
+1. 创建的是 `AssistantMessage` 类型，不是 `UserMessage`
+2. `AssistantMessage` 没有定义 `after_create_commit :request_response_later` 回调（对比 `app/models/user_message.rb:4`）
+3. 只有控制器第 33 行手动入队 1 次，没有双重触发
+4. **但**：`AssistantMessage` 也没有 `request_response` 实例方法（`app/models/assistant_message.rb:1-12`），任务执行时会抛出异常
 
 ---
 
-### 7.5 重复投递 Bug 修复建议
+### 7.5 API Retry 调用契约不匹配分析（证据驱动）
+
+#### 7.5.1 调用契约对比表
+
+| 组件 | 期望契约 | 实际传入（API Retry） | 匹配状态 | 代码依据 |
+|-----|---------|---------------------|---------|---------|
+| `AssistantResponseJob#perform(message)` | `message` 必须响应 `request_response` | `AssistantMessage` 无此方法 | ❌ 不匹配 | `app/jobs/assistant_response_job.rb:5` vs `app/models/assistant_message.rb` |
+| `UserMessage#request_response` | 方法所有者是 `UserMessage` | 调用者是 `AssistantMessage` 实例 | ❌ 不匹配 | `app/models/user_message.rb:14-16` |
+| `Responder#initialize(message:)` | `message` 是用户输入，有实际 `content` | 空 `AssistantMessage` (content: "") | ❌ 不匹配 | `app/models/assistant/responder.rb:2-7` |
+| `llm.chat_response(message.content, ...)` | `content` 是有意义的用户查询 | 空字符串 `""` | ❌ 无意义 | `app/models/assistant/responder.rb:63-64` |
+
+#### 7.5.2 异常抛出点
+
+**异常类型**：`NoMethodError`
+
+**抛出位置**：`app/jobs/assistant_response_job.rb:5`
+```ruby
+def perform(message)
+  message.request_response  # ← AssistantMessage 没有这个方法！
+end
+```
+
+**异常信息**：
+```
+NoMethodError: undefined method `request_response' for #<AssistantMessage:0x00007f...>
+Did you mean?  request_response_later
+  app/jobs/assistant_response_job.rb:5:in `perform'
+```
+
+#### 7.5.3 不同环境下的失败表现
+
+失败后的行为 **不是固定结论**，取决于 Rails Active Job 的 `queue_adapter` 配置：
+
+##### 环境 1：Production（Sidekiq 适配器）
+
+**配置依据**：`config/environments/production.rb:111`
+```ruby
+config.active_job.queue_adapter = :sidekiq
+```
+
+**Sidekiq 版本**：8.0.5（`Gemfile.lock:534`）
+
+**Sidekiq 8.x 默认重试策略**：
+- 最大重试次数：**25 次**（Sidekiq 默认）
+- 重试间隔：指数退避（`(retry_count ** 4) + 15` 秒）
+- 最终失败：超过 25 次后进入 **Dead Job Queue**（DJQ）
+- 死信保留：默认 180 天
+
+**失败传播路径（Production）**：
+```
+POST /api/v1/chats/:id/messages/retry
+  ↓
+创建 AssistantMessage (content: "")
+  ↓
+AssistantResponseJob.perform_later(new_message)
+  ↓ [Sidekiq 异步执行]
+message.request_response  💥 NoMethodError!
+  ↓
+Sidekiq 捕获异常 → 标记任务失败
+  ↓
+第 1 次重试（约 15 秒后）→ 同样失败
+  ↓
+第 2 次重试（约 16 秒后）→ 同样失败
+  ↓
+...（指数退避，最多 25 次重试）
+  ↓
+最终进入 Dead Job Queue
+  ↓
+❌ 用户收不到任何回复
+❌ 聊天中留下一条空的 AssistantMessage 记录
+❌ Sidekiq 队列被无效重试占用
+```
+
+**边界条件**：
+- 如果部署了 Sentry（`Gemfile:42` 有 `sentry-sidekiq`），异常会被上报
+- 如果手动配置了 `sidekiq.rb` 中的重试次数，可能不同
+- Dead Job 可以在 Sidekiq Web UI 中查看和手动重试（但重试仍会失败）
+
+##### 环境 2：Development（默认 async 适配器）
+
+**配置依据**：`config/environments/development.rb` 未设置 `queue_adapter`，使用 Rails 默认的 `:async` 适配器
+
+**Async 适配器特性**：
+- 基于线程池的内存队列
+- **无持久化**：进程重启后任务丢失
+- **无重试**：默认不重试失败任务
+- 日志：`config.active_job.verbose_enqueue_logs = true`（`development.rb:69`）会详细记录入队
+
+**失败传播路径（Development）**：
+```
+POST /api/v1/chats/:id/messages/retry
+  ↓
+创建 AssistantMessage (content: "")
+  ↓
+AssistantResponseJob.perform_later(new_message)
+  ↓ [Async 适配器在线程池中执行]
+message.request_response  💥 NoMethodError!
+  ↓
+Async 适配器记录异常到日志
+  ↓
+任务丢弃（无重试）
+  ↓
+❌ 用户收不到任何回复
+❌ 聊天中留下一条空的 AssistantMessage 记录
+❌ 开发日志中可见异常栈追踪
+```
+
+**边界条件**：
+- 如果开发环境手动启用了 Sidekiq（如 `Procfile.dev` 所示），行为同 Production
+- 如果设置了 `config.active_job.queue_adapter = :inline`，异常会同步抛出到 HTTP 响应
+
+##### 环境 3：Test（test 适配器）
+
+**配置依据**：`config/environments/test.rb:59`
+```ruby
+config.active_job.queue_adapter = :test
+```
+
+**Test 适配器特性**：
+- 任务不入队执行，而是存储在 `enqueued_jobs` 数组中
+- **无实际执行**：除非手动调用 `perform_enqueued_jobs`
+- **无重试**：测试环境不重试
+
+**失败表现（Test）**：
+```ruby
+# 测试代码中
+post retry_api_v1_chat_messages_path(chat)
+assert_enqueued_jobs 1, only: AssistantResponseJob
+
+# 当尝试执行时
+perform_enqueued_jobs
+# → 抛出 NoMethodError，测试失败
+```
+
+**边界条件**：
+- 如果测试使用 `perform_enqueued_jobs` 辅助方法，异常会在测试中抛出
+- 如果测试仅断言入队次数，不会发现此 Bug（这解释了为什么现有测试可能通过）
+
+---
+
+#### 7.5.4 为什么会出现这个问题
+
+**API Retry 的设计错误**：
+
+`app/controllers/api/v1/messages_controller.rb:23-38`
+```ruby
+def retry
+  last_message = @chat.messages.ordered.last
+
+  # ❌ 错误的触发条件：应该检查 UserMessage，不是 AssistantMessage
+  if last_message&.type == "AssistantMessage"
+    # ❌ 错误的消息类型：应该复用已有的 UserMessage，不是新建 AssistantMessage
+    new_message = @chat.messages.create!(
+      type: "AssistantMessage",
+      content: "",
+      ai_model: last_message.ai_model
+    )
+
+    AssistantResponseJob.perform_later(new_message)
+    ...
+  end
+end
+```
+
+**正确的逻辑（参考网页端）**：
+
+`app/models/chat.rb:30-39`
+```ruby
+def retry_last_message!
+  update!(error: nil)
+  last_message = conversation_messages.ordered.last
+
+  # ✅ 正确：找到最后一条 UserMessage，对其重新执行
+  if last_message.present? && last_message.role == "user"
+    ask_assistant_later(last_message)
+  end
+end
+```
+
+**核心差异对比**：
+
+| 维度 | 网页端 Retry | API Retry | 代码依据 |
+|-----|-------------|-----------|---------|
+| 触发条件 | 最后一条是 `UserMessage` | 最后一条是 `AssistantMessage` | `chat.rb:35` vs `messages_controller.rb:26` |
+| 入队对象 | 已存在的 `UserMessage` | 新建的空 `AssistantMessage` | `chat.rb:37` vs `messages_controller.rb:27-31` |
+| 意图 | 重新生成上一条用户消息的回复 | （意图不明，设计错误） | - |
+| 运行结果 | ✅ 正常工作 | ❌ NoMethodError | - |
+
+---
+
+#### 7.5.5 即使修复类型后的次级问题
+
+假设通过某种方式绕过了 `NoMethodError`（例如在 `Message` 基类中添加空方法），仍然存在以下问题：
+
+1. **LLM 收到空 prompt**：`message.content` 是空字符串，生成无意义或随机回复
+2. **语义错误**：`AssistantMessage` 代表 AI 的回复，不应该作为输入传给 LLM
+3. **数据污染**：聊天历史中出现一条无意义的空消息记录
+4. **上下文丢失**：Retry 应该基于之前的用户消息上下文，而不是新建空消息
+
+---
+
+### 7.6 Bug 修复建议
 
 **方案 A：移除 API 控制器中的手动入队（推荐）**
 
