@@ -416,27 +416,47 @@ Activity Feed 加载失败仅能通过 Rails 全局异常处理机制触发，�
 
 | 入口场景 | 请求路径 | 命中代码分支 | HTTP 状态码 | 页面可见结果 |
 |----------|----------|--------------|-------------|--------------|
-| **不存在账户直连** | `GET /accounts/999999999` | `accounts_controller.rb:70` → `family.accounts.find` 抛出 `ActiveRecord::RecordNotFound` → `store_location.rb:9,17-22` → `handle_not_found` → 进入 `else` 分支 | `404 Not Found` | 空白页面，无任何内容 |
-| **带 return_to 的不存在账户** | `GET /accounts/999999999?return_to=/accounts/999999999` | 同上，但 `request.fullpath == session[:return_to]` 条件成立 → 进入 `if` 分支 | `302 Found` 重定向 | 跳转到首页（`/`），无错误提示 |
+| **不存在账户直连** | `GET /accounts/999999999` | `accounts_controller.rb:70` → `family.accounts.find` 抛出 `ActiveRecord::RecordNotFound` → `rescue_from` 触发 `handle_not_found` → 比较 `request.fullpath == session[:return_to]`（session 为空）→ `else` 分支 | `404 Not Found` | 空白页面，无任何内容 |
+| **单请求带 return_to** | `GET /accounts/999999999?return_to=/accounts/999999999` | `before_action :store_return_to` 执行 → `session[:return_to] = "/accounts/999999999"` → 执行 `set_account` → `find` 抛出 `RecordNotFound` → `handle_not_found` 比较 `request.fullpath == session[:return_to]`（两者相等）→ `if` 分支 | `302 Found` 重定向 | 跳转到首页（`/`），无错误提示 |
+| **跨请求带 return_to** | 请求1：`GET /any_page?return_to=/accounts/999999999`<br>请求2：`GET /accounts/999999999` | 请求1：`store_return_to` 写入 session → 请求2：`store_return_to` 不修改 session → `set_account` 抛出 `RecordNotFound` → `handle_not_found` 比较相等 → `if` 分支 | `302 Found` 重定向 | 跳转到首页（`/`），无错误提示 |
 | **控制器异常导致 500** | `GET /accounts/:id`（在 `show` 动作中人为触发异常） | `accounts_controller.rb:17-26` 中任意代码抛出未捕获异常 → Rails 全局异常处理 | `500 Internal Server Error` | 全屏静态错误页："We're sorry, but something went wrong (500)" |
 
 **复现步骤说明：**
 
 1. **不存在账户直连**：
    - 登录后直接在浏览器地址栏输入 `/accounts/999999999`（确保该 ID 不存在）
+   - 执行顺序：`store_return_to`（无操作，无 return_to 参数）→ `set_account` → 抛出 `RecordNotFound` → `handle_not_found` → `session[:return_to]` 为 nil → 进入 `else` 分支
    - 代码分支：`store_location.rb:22` → `head :not_found`
    - 验证：浏览器开发者工具 Network 面板显示 404 状态，页面空白
 
-2. **带 return_to 的不存在账户**：
+2. **单请求带 return_to（真实触发场景）**：
    - 登录后访问 `/accounts/999999999?return_to=/accounts/999999999`
-   - 代码分支：`store_location.rb:18-20` → 条件成立，删除 session 并重定向
+   - 执行顺序：`store_return_to` 写入 session → `set_account` 抛出异常 → `handle_not_found` 比较相等
+   - 代码分支：`store_location.rb:18-20` → `redirect_to fallback_path`
    - 验证：浏览器 Network 面板显示 302，随后跳转到首页
 
-3. **控制器异常导致 500**（开发环境验证）：
+3. **跨请求带 return_to（真实触发场景）**：
+   - 先访问任意页面并携带 return_to 参数：`/dashboard?return_to=/accounts/999999999`
+   - 再访问不存在的账户：`/accounts/999999999`（不带 return_to 参数）
+   - 执行顺序：请求1写入 session → 请求2的 `store_return_to` 不修改 → `set_account` 抛出异常 → 比较相等
+   - 代码分支：`store_location.rb:18-20` → 重定向到首页
+   - 验证：Network 面板显示 302 重定向
+
+4. **控制器异常导致 500**（开发环境验证）：
    - 在 `accounts_controller.rb:17` 的 `show` 方法第一行添加 `raise "test error"`
    - 访问任意存在的账户详情页
    - 代码分支：Rails 异常中间件捕获，开发环境显示错误栈，生产环境渲染 `public/500.html`
    - 验证：Network 面板显示 500，页面显示静态错误页
+
+**关键执行顺序说明（基于 store_location.rb）：**
+```
+[过滤器链] before_action :store_return_to → 其他 before_action（如 set_account）
+                                                          ↓
+                                                    抛出 RecordNotFound
+                                                          ↓
+[异常处理] rescue_from 捕获 → handle_not_found → 比较 request.fullpath == session[:return_to]
+```
+由于 `store_return_to` 是 `before_action`，且在 `included` 块中最先声明，因此它总是在 `set_account` 之前执行。
 
 #### 8.6.6 与其他边界场景的边界区别
 
@@ -444,8 +464,8 @@ Activity Feed 加载失败仅能通过 Rails 全局异常处理机制触发，�
 |------|--------------|----------|-----------|------------|
 | **空 Feed** | `app/components/UI/account/activity_feed.html.erb:53-54` | `activity_dates.empty?` 为 true | 200 OK | 完整页面，仅 feed 区域显示提示 |
 | **搜索无结果** | `app/components/UI/account/activity_feed.html.erb:53-54` | 搜索过滤后 `activity_dates.empty?` 为 true | 200 OK | 完整页面，仅 feed 区域显示提示 |
-| **无权限（无 return_to）** | `app/controllers/concerns/store_location.rb:22` | `find` 抛出 `RecordNotFound`，`request.fullpath != session[:return_to]` | 404 Not Found | 空白页面 |
-| **无权限（带 return_to）** | `app/controllers/concerns/store_location.rb:18-20` | `find` 抛出 `RecordNotFound`，`request.fullpath == session[:return_to]` | 302 Found 重定向 | 跳转到首页 |
+| **无权限（无 return_to）** | `app/controllers/concerns/store_location.rb:22` | `find` 抛出 `RecordNotFound`，session 无 return_to | 404 Not Found | 空白页面 |
+| **无权限（带 return_to）** | `app/controllers/concerns/store_location.rb:18-20` | `find` 抛出 `RecordNotFound`，请求路径与 session 中 return_to 相等 | 302 Found 重定向 | 跳转到首页 |
 | **加载失败** | Rails 全局异常中间件 | 控制器/模板执行中抛出未捕获异常 | 500 Internal Server Error | 全屏错误页，无应用布局 |
 
 **边界区分代码证据：**
