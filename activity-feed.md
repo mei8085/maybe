@@ -412,14 +412,41 @@ Activity Feed 加载失败仅能通过 Rails 全局异常处理机制触发，�
 
 **无专用错误 UI 组件**：仓内未发现 ActivityFeed 专用的错误态模板或组件。
 
-#### 8.6.5 与其他边界场景的边界区别
+#### 8.6.5 可复现证据矩阵
+
+| 入口场景 | 请求路径 | 命中代码分支 | HTTP 状态码 | 页面可见结果 |
+|----------|----------|--------------|-------------|--------------|
+| **不存在账户直连** | `GET /accounts/999999999` | `accounts_controller.rb:70` → `family.accounts.find` 抛出 `ActiveRecord::RecordNotFound` → `store_location.rb:9,17-22` → `handle_not_found` → 进入 `else` 分支 | `404 Not Found` | 空白页面，无任何内容 |
+| **带 return_to 的不存在账户** | `GET /accounts/999999999?return_to=/accounts/999999999` | 同上，但 `request.fullpath == session[:return_to]` 条件成立 → 进入 `if` 分支 | `302 Found` 重定向 | 跳转到首页（`/`），无错误提示 |
+| **控制器异常导致 500** | `GET /accounts/:id`（在 `show` 动作中人为触发异常） | `accounts_controller.rb:17-26` 中任意代码抛出未捕获异常 → Rails 全局异常处理 | `500 Internal Server Error` | 全屏静态错误页："We're sorry, but something went wrong (500)" |
+
+**复现步骤说明：**
+
+1. **不存在账户直连**：
+   - 登录后直接在浏览器地址栏输入 `/accounts/999999999`（确保该 ID 不存在）
+   - 代码分支：`store_location.rb:22` → `head :not_found`
+   - 验证：浏览器开发者工具 Network 面板显示 404 状态，页面空白
+
+2. **带 return_to 的不存在账户**：
+   - 登录后访问 `/accounts/999999999?return_to=/accounts/999999999`
+   - 代码分支：`store_location.rb:18-20` → 条件成立，删除 session 并重定向
+   - 验证：浏览器 Network 面板显示 302，随后跳转到首页
+
+3. **控制器异常导致 500**（开发环境验证）：
+   - 在 `accounts_controller.rb:17` 的 `show` 方法第一行添加 `raise "test error"`
+   - 访问任意存在的账户详情页
+   - 代码分支：Rails 异常中间件捕获，开发环境显示错误栈，生产环境渲染 `public/500.html`
+   - 验证：Network 面板显示 500，页面显示静态错误页
+
+#### 8.6.6 与其他边界场景的边界区别
 
 | 场景 | 代码判断位置 | 判断逻辑 | HTTP 状态 | 页面完整性 |
 |------|--------------|----------|-----------|------------|
 | **空 Feed** | `app/components/UI/account/activity_feed.html.erb:53-54` | `activity_dates.empty?` 为 true | 200 OK | 完整页面，仅 feed 区域显示提示 |
 | **搜索无结果** | `app/components/UI/account/activity_feed.html.erb:53-54` | 搜索过滤后 `activity_dates.empty?` 为 true | 200 OK | 完整页面，仅 feed 区域显示提示 |
-| **无权限** | `app/controllers/concerns/store_location.rb:9,17-22` | `family.accounts.find` 抛出 `ActiveRecord::RecordNotFound` | 404 / 302 重定向 | 空白页面或跳转到首页 |
-| **加载失败** | Rails 全局异常处理 | 控制器/模板执行中抛出未捕获异常 | 500 Internal Server Error | 全屏错误页，无应用布局 |
+| **无权限（无 return_to）** | `app/controllers/concerns/store_location.rb:22` | `find` 抛出 `RecordNotFound`，`request.fullpath != session[:return_to]` | 404 Not Found | 空白页面 |
+| **无权限（带 return_to）** | `app/controllers/concerns/store_location.rb:18-20` | `find` 抛出 `RecordNotFound`，`request.fullpath == session[:return_to]` | 302 Found 重定向 | 跳转到首页 |
+| **加载失败** | Rails 全局异常中间件 | 控制器/模板执行中抛出未捕获异常 | 500 Internal Server Error | 全屏错误页，无应用布局 |
 
 **边界区分代码证据：**
 
@@ -462,11 +489,10 @@ end
 
 ## 10. 关键设计决策总结
 
-1. **多态设计**：使用 delegated_type 统一三种活动类型，便于扩展新类型
-2. **数据聚合对象**：ActivityFeedData 解决 N+1 问题，提供清晰的数据边界
-3. **组件化视图**：将复杂 UI 拆分为 ActivityFeed → ActivityDate → BalanceReconciliation 三层组件
-4. **账户类型差异化**：BalanceReconciliation 根据账户类型动态展示对账项目
-5. **实时更新**：Turbo Stream 支持无刷新更新活动列表
-6. **批量操作**：内置 bulk-select 控制器支持批量编辑条目
-7. **前端超时保护**：Stimulus 控制器实现 Turbo Frame 超时检测，避免无限加载
-8. **边界场景分层处理**：空状态、无权限、加载失败等场景在不同层级处理，职责清晰
+1. **多态设计**：使用 delegated_type 统一三种活动类型（Valuation/Transaction/Trade），便于扩展新类型
+2. **数据聚合对象**：ActivityFeedData 解决 N+1 问题，按日期预加载 balance 和 transfer 数据，提供清晰的数据边界
+3. **组件化视图**：将复杂 UI 拆分为 ActivityFeed → ActivityDate → BalanceReconciliation 三层组件，职责分离
+4. **账户类型差异化**：BalanceReconciliation 根据 7 种账户类型动态生成对账项目，提供针对性展示
+5. **实时更新**：Turbo Stream 支持无刷新更新活动列表，频道标识复用 account 对象
+6. **批量操作**：内置 bulk-select 控制器支持全选/按日期分组选择，方便批量编辑
+7. **边界场景分层处理**：空状态在组件层判断，无权限在过滤器层处理，加载失败由 Rails 全局异常兜底
