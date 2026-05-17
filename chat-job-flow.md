@@ -24,11 +24,22 @@
 
 ## 二、用户消息入队流程
 
-### 2.1 消息创建入口
+### 2.1 消息创建入口总览
 
-用户发送消息有两个入口：
+用户发送消息有 **四条独立入口**，分为两类：
 
-**入口1：创建新聊天** (`chats#create`)
+| 入口类型 | 路由 | 控制器 | 适用场景 |
+|---------|------|--------|---------|
+| 网页入口 | `POST /chats` | `ChatsController#create` | 网页端创建新聊天 |
+| 网页入口 | `POST /chats/:chat_id/messages` | `MessagesController#create` | 网页端追加消息 |
+| API 入口 | `POST /api/v1/chats` | `Api::V1::ChatsController#create` | API 创建新聊天（含首条消息） |
+| API 入口 | `POST /api/v1/chats/:chat_id/messages` | `Api::V1::MessagesController#create` | API 追加消息 |
+
+---
+
+### 2.2 网页入口分析
+
+**网页入口1：创建新聊天** (`chats#create`)
 
 `app/controllers/chats_controller.rb:19-23`
 ```ruby
@@ -39,7 +50,7 @@ def create
 end
 ```
 
-**入口2：在现有聊天中追加消息** (`messages#create`)
+**网页入口2：在现有聊天中追加消息** (`messages#create`)
 
 `app/controllers/messages_controller.rb:6-13`
 ```ruby
@@ -53,9 +64,97 @@ def create
 end
 ```
 
-### 2.2 消息自动入队机制
+**网页入口入队机制**：完全依赖 `UserMessage` 的 `after_create_commit` 回调自动触发，控制器不手动入队。
 
-消息入队通过 **Active Record 回调** 自动触发，无需控制器手动调用：
+---
+
+### 2.3 API 入口分析
+
+**API 认证机制**：
+
+`app/controllers/api/v1/base_controller.rb:41-104`
+
+API 支持两种认证方式：
+1. **OAuth 2.0 Bearer Token**：通过 Doorkeeper 管理，支持 `read` / `read_write` 作用域
+2. **API Key**：通过 `X-Api-Key` 请求头，支持速率限制
+
+认证成功后通过 `setup_current_context_for_api` 设置 `Current.session` 和 `Current.user`。
+
+**API 入口1：创建新聊天** (`api/v1/chats#create`)
+
+`app/controllers/api/v1/chats_controller.rb:19-43`
+```ruby
+def create
+  @chat = Current.user.chats.build(title: chat_params[:title])
+
+  if @chat.save
+    if chat_params[:message].present?
+      @message = @chat.messages.build(
+        content: chat_params[:message],
+        type: "UserMessage",           # 注意：创建的是 UserMessage 类型
+        ai_model: chat_params[:model] || "gpt-4"
+      )
+
+      if @message.save
+        AssistantResponseJob.perform_later(@message)  # 手动入队
+        render :show, status: :created
+      else
+        # ... 错误处理
+      end
+    else
+      render :show, status: :created
+    end
+  else
+    # ... 错误处理
+  end
+end
+```
+
+**API 入口2：在现有聊天中追加消息** (`api/v1/messages#create`)
+
+`app/controllers/api/v1/messages_controller.rb:8-21`
+```ruby
+def create
+  @message = @chat.messages.build(
+    content: message_params[:content],
+    type: "UserMessage",             # 注意：创建的是 UserMessage 类型
+    ai_model: message_params[:model] || "gpt-4"
+  )
+
+  if @message.save
+    AssistantResponseJob.perform_later(@message)  # 手动入队
+    render :show, status: :created
+  else
+    # ... 错误处理
+  end
+end
+```
+
+**API 入口3：重试消息** (`api/v1/messages#retry`)
+
+`app/controllers/api/v1/messages_controller.rb:23-38`
+```ruby
+def retry
+  last_message = @chat.messages.ordered.last
+
+  if last_message&.type == "AssistantMessage"
+    new_message = @chat.messages.create!(
+      type: "AssistantMessage",      # 注意：创建的是 AssistantMessage 类型
+      content: "",
+      ai_model: last_message.ai_model
+    )
+
+    AssistantResponseJob.perform_later(new_message)  # 手动入队
+    render json: { message: "Retry initiated", message_id: new_message.id }, status: :accepted
+  else
+    # ... 错误处理
+  end
+end
+```
+
+---
+
+### 2.4 消息自动入队机制（回调）
 
 `app/models/user_message.rb:4-12`
 ```ruby
@@ -76,7 +175,69 @@ def ask_assistant_later(message)
 end
 ```
 
-### 2.3 任务队列配置
+**关键点**：
+- `after_create_commit` 回调在消息持久化到数据库后触发
+- 仅 `UserMessage` 有此回调，`AssistantMessage` 没有
+- 入队前调用 `clear_error` 清除之前的错误状态
+
+---
+
+### 2.5 两类入队机制对比
+
+| 对比项 | 网页入口 | API 入口 |
+|-------|---------|---------|
+| 消息类型 | `UserMessage` | `UserMessage`（创建/追加）/ `AssistantMessage`（重试） |
+| 入队触发方式 | 仅依赖 `after_create_commit` 回调 | `after_create_commit` 回调 + **控制器手动调用** |
+| 入队次数 | 1 次 | **2 次**（`UserMessage` 场景） / 1 次（`AssistantMessage` 重试场景） |
+| 认证方式 | Session Cookie | OAuth Token / API Key |
+| 响应格式 | HTML 重定向 | JSON |
+| 作用域检查 | 无 | 需要 `read_write` 作用域 |
+
+---
+
+### 2.6 重复投递风险分析（API 入口 Bug）
+
+**问题描述**：
+
+API 入口创建 `UserMessage` 时存在 **重复入队** 问题：
+
+```
+@message.save
+  ↓
+after_create_commit 回调触发
+  → request_response_later
+    → chat.ask_assistant_later(self)
+      → AssistantResponseJob.perform_later(@message)  // 第 1 次入队
+  ↓
+控制器继续执行
+  → AssistantResponseJob.perform_later(@message)      // 第 2 次入队
+```
+
+**受影响的 API 接口**：
+1. `POST /api/v1/chats` - 创建聊天并包含首条消息时
+2. `POST /api/v1/chats/:chat_id/messages` - 追加消息时
+
+**不受影响的接口**：
+- `POST /api/v1/chats/:chat_id/messages/retry` - 创建的是 `AssistantMessage`，没有回调，仅入队 1 次
+- 所有网页入口 - 仅依赖回调，无手动入队
+
+**影响范围**：
+
+| 影响类型 | 具体表现 |
+|---------|---------|
+| **用户体验** | 同一条用户消息会收到两条重复的 AI 回复 |
+| **资源浪费** | LLM API 调用次数翻倍，增加成本 |
+| **任务队列压力** | 任务数量翻倍，可能导致队列阻塞 |
+| **数据一致性** | 聊天历史中出现重复的助手消息 |
+| **副作用放大** | 如果 AI 响应包含工具调用（如修改交易分类），可能导致重复执行 |
+
+**根本原因**：
+
+API 控制器设计时忽略了 `UserMessage` 已有的 `after_create_commit` 回调机制，导致回调自动入队和手动入队同时执行。
+
+---
+
+### 2.7 任务队列配置
 
 `app/jobs/assistant_response_job.rb:1-6`
 ```ruby
@@ -89,10 +250,9 @@ class AssistantResponseJob < ApplicationJob
 end
 ```
 
-**关键点**：
-- 使用 `after_create_commit` 回调确保消息持久化后才入队
 - 任务进入 `high_priority` 队列优先处理
-- 入队前调用 `clear_error` 清除之前的错误状态
+- 任务携带完整的 `message` 对象（通过 Global ID 序列化）
+- 执行时调用 `message.request_response` 触发响应生成
 
 ---
 
