@@ -322,6 +322,100 @@ Rails 约定自动映射到对应类型的部分模板：
 
 与空 Feed 场景复用相同逻辑，搜索过滤后无结果时显示 "No entries yet"
 
+### 8.6 加载失败场景
+
+#### 8.6.1 失败触发原因
+
+加载失败主要由以下几类异常触发：
+
+| 失败类型 | 触发源 | 典型场景 |
+|----------|--------|----------|
+| **网络超时** | 前端 Stimulus 控制器 | 服务器响应超过 10 秒未返回 |
+| **数据库异常** | `AccountsController#show` | 查询超时、连接断开、锁等待 |
+| **服务器内部错误** | 应用代码执行 | NPE、数组越界、第三方服务调用失败 |
+| **数据同步失败** | 后台 Sync Job | Plaid 连接失败、市场数据导入错误 |
+
+**关键代码说明：**
+
+1. **前端超时检测**：`app/javascript/controllers/turbo_frame_timeout_controller.js:5-41`
+
+```javascript
+// 默认 10 秒超时，监听 turbo:frame-load 事件清除定时器
+static values = { timeout: { type: Number, default: 10000 } }
+
+handleTimeout() {
+  // 直接替换 innerHTML 为错误状态
+  this.element.innerHTML = `...错误UI...`
+}
+```
+
+2. **后端异常类型**：
+   - `ActiveRecord::QueryCanceled`：数据库查询超时
+   - `ActiveRecord::ConnectionNotEstablished`：数据库连接失败
+   - `PG::ConnectionBad`：PostgreSQL 连接异常
+   - 通用 `StandardError`：应用代码异常
+
+#### 8.6.2 状态切换链路
+
+```
+用户访问账户页面
+        ↓
+[浏览器] 发送 HTTP 请求 → 显示 Turbo Frame 加载态
+        ↓
+[Rails] 路由 → AccountsController#show
+        ├─ 成功 → 渲染 ActivityFeed 组件 → 页面展示
+        └─ 失败（异常抛出）
+            ├─ 开发环境：显示 Rails 错误栈页面
+            └─ 生产环境：
+                ├─ 响应状态码 500
+                ├─ 渲染 public/500.html 静态错误页
+                └─ 或被 Turbo 捕获显示局部错误
+```
+
+**前端超时切换流程**：
+```
+页面加载 → Turbo Frame 显示 loading 内容
+        ↓
+setTimeout(handleTimeout, 10000) 启动
+        ├─ 10秒内收到 turbo:frame-load → 清除定时器 → 正常展示
+        └─ 10秒内未收到响应 → 触发 handleTimeout → 替换 innerHTML 为错误UI
+```
+
+#### 8.6.3 用户可见提示
+
+根据失败类型不同，用户会看到不同的提示：
+
+| 失败类型 | 用户可见内容 | 视觉样式 |
+|----------|--------------|----------|
+| **前端超时** | ⚠️ 黄色警告图标 + "Timeout" 文本 | 右对齐，小字体，警告色 |
+| **服务器500错误** | "We're sorry, but something went wrong (500)" | 全屏静态错误页，红色标题 |
+| **同步失败** | 同步状态区显示错误详情 | Plaid 账户卡片显示错误徽章 |
+
+**超时错误 UI 代码**：`app/javascript/controllers/turbo_frame_timeout_controller.js:29-40`
+
+```html
+<div class="flex items-center justify-end gap-1">
+  <div class="w-8 h-4 flex items-center justify-center">
+    <svg ... class="text-warning">⚠️</svg>
+  </div>
+  <p class="font-mono text-right text-xs text-warning">Timeout</p>
+</div>
+```
+
+#### 8.6.4 与其他边界场景的边界区别
+
+| 场景 | 触发阶段 | 数据状态 | HTTP 状态码 | 用户感知 |
+|------|----------|----------|-------------|----------|
+| **空 Feed** | 数据查询后 | 查询成功，返回 0 条记录 | 200 OK | 正常页面，显示 "No entries yet" |
+| **无权限** | 数据查询前 | 认证/授权失败，不执行查询 | 404 Not Found / 重定向 | 无法访问页面或跳转到首页 |
+| **搜索无结果** | 数据查询后 | 查询成功，过滤后 0 条 | 200 OK | 正常页面，显示 "No entries yet" |
+| **加载失败** | 数据查询中 | 查询未完成/异常终止 | 500 Internal Server Error / 无响应 | 错误页面或局部超时提示 |
+
+**关键区分点：**
+- **空 Feed vs 加载失败**：空 Feed 是**查询成功但无数据**，页面完整渲染；加载失败是**查询过程异常**，页面渲染中断
+- **无权限 vs 加载失败**：无权限是**主动拒绝访问**，失败发生在业务逻辑之前；加载失败是**被动异常**，失败发生在业务逻辑执行中
+- **搜索无结果 vs 加载失败**：搜索无结果是**过滤后无匹配**，属于正常业务逻辑分支；加载失败是**系统级异常**
+
 ## 9. 实时刷新机制
 
 ### 9.1 Turbo Stream 广播
