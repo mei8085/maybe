@@ -41,24 +41,34 @@ API 响应字段在 `app/views/api/v1/transactions/_transaction.json.jbuilder:1-
 |---------|------|------|
 | `id` | `transaction.id` | 交易ID |
 | `date` | `transaction.entry.date` | 交易日期 |
-| `amount` | `transaction.entry.amount_money.format` | 格式化金额字符串（如 "$10.00"） |
+| `amount` | `transaction.entry.amount_money.format` | **格式化金额字符串**（如 "$10.00"、"-$10.00"），包含货币符号和正负号，非原始数值 |
 | `currency` | `transaction.entry.currency` | 币种代码（如 "USD"） |
 | `name` | `transaction.entry.name` | 交易名称 |
 | `notes` | `transaction.entry.notes` | 备注 |
-| `classification` | `transaction.entry.classification` | 类型：income/expense（根据金额正负判断） |
+| `classification` | `transaction.entry.classification` | 交易类型：`"income"`（收入）或 `"expense"`（支出），根据数据库存储的金额正负判断 |
 | `account.id` | `transaction.entry.account.id` | 账户ID |
 | `account.name` | `transaction.entry.account.name` | 账户名称 |
 | `account.account_type` | `transaction.entry.account.accountable_type.underscore` | 账户类型（如 "depository"） |
 | `category` | `transaction.category` | 分类对象（可选） |
 | `merchant` | `transaction.merchant` | 商户对象（可选） |
 | `tags` | `transaction.tags` | 标签数组 |
-| `transfer` | `transaction.transfer` | 转账信息（可选） |
+| `transfer` | `transaction.transfer` | 转账信息（可选），其中 `transfer.amount` 为绝对金额（无符号） |
 | `created_at` | `transaction.created_at.iso8601` | 创建时间（ISO8601格式） |
 | `updated_at` | `transaction.updated_at.iso8601` | 更新时间（ISO8601格式） |
 
-### 2.3 金额处理机制
+> **重要提示**：`amount` 字段是格式化后的字符串，不是数值类型。如需进行数值计算，请调用方自行解析字符串提取数值部分，或通过 `currency` 字段结合自定义逻辑处理。
 
-金额在数据库中以**整数分**存储，通过 `Monetizable` concern 转换：
+### 2.3 金额处理机制与符号规则
+
+#### 2.3.1 数据库存储
+
+金额在数据库中以**整数分**存储（`entry.amount` 字段），符号规则为：
+- **收入**（income）：存储为**负数**（如 -1000 表示 $10.00 收入）
+- **支出**（expense）：存储为**正数**（如 1000 表示 $10.00 支出）
+
+#### 2.3.2 金额转换流程
+
+通过 `Monetizable` concern 将整数分转换为 `Money` 对象：
 
 ```ruby
 # app/models/concerns/monetizable.rb:1-22
@@ -66,14 +76,42 @@ module Monetizable
   def monetize(*fields)
     fields.each do |field|
       define_method("#{field}_money") do
-        Money.new(value, monetizable_currency)
+        Money.new(value, monetizable_currency)  # value 为数据库存储的整数分
       end
     end
   end
 end
 ```
 
-在序列化时调用 `.format` 方法生成用户友好的字符串表示。
+#### 2.3.3 API 序列化格式
+
+在 Jbuilder 模板中调用 `.format` 方法生成格式化字符串：
+
+```ruby
+# app/views/api/v1/transactions/_transaction.json.jbuilder:5
+json.amount transaction.entry.amount_money.format
+```
+
+**格式化示例**：
+| 数据库存储（整数分） | classification | API 返回字符串 | 含义 |
+|---------------------|----------------|--------------|------|
+| -1000 | `"income"` | `"-$10.00"` | $10.00 收入 |
+| 1000 | `"expense"` | `"$10.00"` | $10.00 支出 |
+| -2550 | `"income"` | `"-$25.50"` | $25.50 收入 |
+| 2550 | `"expense"` | `"$25.50"` | $25.50 支出 |
+
+#### 2.3.4 classification 判断逻辑
+
+`classification` 字段完全由数据库存储的金额正负决定：
+
+```ruby
+# app/models/entry.rb:37-39
+def classification
+  amount.negative? ? "income" : "expense"
+end
+```
+
+> **转账特殊说明**：转账交易包含两条记录，流入方（to_account）金额为负（income），流出方（from_account）金额为正（expense）。`transfer.amount` 字段返回的是绝对值（无符号）。
 
 ## 3. 字段口径与界面所见数据的差异
 
