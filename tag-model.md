@@ -177,8 +177,81 @@ end
 
 ### 4.2 颜色在视图中的渲染
 
-**标签徽章** (`app/views/tags/_badge.html.erb:1`)：
+#### 4.2.1 颜色头像 Partial
+
+**位置**：`app/views/shared/_color_avatar.html.erb`
+
 ```erb
+<%# locals: (name: nil, color: "#000") %>
+<% letter = name&.first || "?" %>
+<% background_color = "color-mix(in srgb, #{color} 5%, white)" %>
+<% border_color = "color-mix(in srgb, #{color} 10%, white)" %>
+<span data-color-avatar-target="avatar"
+      class="w-8 h-8 flex items-center justify-center rounded-full"
+      style="background-color: <%= background_color %>; border-color: <%= border_color %>; color: <%= color %>">
+  <%= letter.upcase %>
+</span>
+```
+
+**使用场景**：
+1. **标签列表项** (`app/views/tags/_tag.html.erb:5`) - 在标签管理页面展示每个标签的颜色头像
+2. **标签编辑表单** (`app/views/tags/_form.html.erb:5`) - 新建/编辑标签时的颜色预览
+
+**技术要点**：
+- 展示标签名称首字母的圆形头像
+- 使用 CSS `color-mix()` 函数实现颜色透明化
+- 背景色：颜色 + 5% 透明度混合白色
+- 边框色：颜色 + 10% 透明度混合白色
+- 文字色：直接使用标签颜色
+- 作为 Stimulus `color-avatar` 控制器的目标元素
+
+#### 4.2.2 DS::FilledIcon 组件
+
+**位置**：`app/components/DS/filled_icon.rb`
+
+这是一个通用的设计系统组件，用于在标签筛选器等场景展示带颜色的图标/文字：
+
+```ruby
+def container_styles
+  <<~STYLE.strip
+    background-color: #{transparent_bg_color};
+    border-color: #{transparent_border_color};
+    color: #{custom_fg_color};
+  STYLE
+end
+
+def transparent_bg_color
+  "color-mix(in oklab, #{custom_fg_color} 10%, transparent)"
+end
+
+def transparent_border_color
+  "color-mix(in oklab, #{custom_fg_color} 10%, transparent)"
+end
+```
+
+**使用场景**：标签筛选器 (`app/views/transactions/searches/filters/_tag_filter.html.erb:19-25`)
+
+```erb
+<%= render DS::FilledIcon.new(
+  variant: :text,
+  hex_color: tag.color || Tag::UNCATEGORIZED_COLOR,
+  text: tag.name,
+  size: "sm",
+  rounded: true
+) %>
+```
+
+**技术要点**：
+- 使用 `oklab` 色彩空间进行颜色混合（而非 `srgb`）
+- 背景透明度为 10%
+- 支持多种尺寸变体（sm/md/lg）
+
+#### 4.2.3 标签徽章 Partial
+
+**位置**：`app/views/tags/_badge.html.erb`
+
+```erb
+<%# locals: (tag:) %>
 <span class="border text-sm font-medium px-2.5 py-1 rounded-full content-center"
       style="
         background-color: color-mix(in srgb, <%= tag.color %> 5%, white);
@@ -187,15 +260,6 @@ end
   <%= tag.name %>
 </span>
 ```
-
-**技术要点**：
-- 使用 CSS `color-mix()` 函数实现颜色透明化
-- 背景色：颜色 + 5% 透明度混合白色
-- 边框色：颜色 + 10% 透明度混合白色
-- 文字色：直接使用标签颜色
-
-**颜色头像** (`app/views/shared/color_avatar.html.erb`)：
-在标签列表和筛选器中使用，展示颜色预览。
 
 ---
 
@@ -234,11 +298,18 @@ end
 **标签编辑表单** (`app/views/tags/_form.html.erb:1`)：
 ```erb
 <div data-controller="color-avatar">
-  <% Tag::COLORS.each do |color| %>
-    <label class="relative">
-      <%= f.radio_button :color, color, class: "sr-only peer", data: { action: "change->color-avatar#handleColorChange" } %>
-      <div class="w-6 h-6 rounded-full cursor-pointer peer-checked:ring-2 peer-checked:ring-offset-2 peer-checked:ring-blue-500" style="background-color: <%= color %>"></div>
-    </label>
+  <%= styled_form_with model: tag, class: "space-y-4", data: { turbo_frame: :_top } do |f| %>
+    <div class="w-fit m-auto">
+      <%= render partial: "shared/color_avatar", locals: { name: tag.name, color: tag.color } %>
+    </div>
+    <div class="flex gap-2 items-center justify-center">
+      <% Tag::COLORS.each do |color| %>
+        <label class="relative">
+          <%= f.radio_button :color, color, class: "sr-only peer", data: { action: "change->color-avatar#handleColorChange" } %>
+          <div class="w-6 h-6 rounded-full cursor-pointer peer-checked:ring-2 peer-checked:ring-offset-2 peer-checked:ring-blue-500" style="background-color: <%= color %>"></div>
+        </label>
+      <% end %>
+    </div>
   <% end %>
 </div>
 ```
@@ -270,21 +341,36 @@ end
 **标签筛选组件** (`app/views/transactions/searches/filters/_tag_filter.html.erb:1`)：
 ```erb
 <div data-controller="list-filter">
-  <input type="search" placeholder="Filter tags"
-         data-list-filter-target="input"
-         data-action="input->list-filter#filter">
-
+  <div class="relative">
+    <input type="search" placeholder="Filter tags"
+           data-list-filter-target="input"
+           data-action="input->list-filter#filter">
+    <%= icon("search") %>
+  </div>
   <div data-list-filter-target="list">
     <% Current.family.tags.alphabetically.each do |tag| %>
       <div class="filterable-item" data-filter-name="<%= tag.name %>">
         <%= form.check_box :tags, { multiple: true, checked: @q[:tags]&.include?(tag.name) }, tag.name, nil %>
-        <%= render DS::FilledIcon.new(hex_color: tag.color, text: tag.name, size: "sm", rounded: true) %>
-        <%= tag.name %>
+        <%= form.label :tags, value: tag.name do %>
+          <%= render DS::FilledIcon.new(
+            variant: :text,
+            hex_color: tag.color || Tag::UNCATEGORIZED_COLOR,
+            text: tag.name,
+            size: "sm",
+            rounded: true
+          ) %>
+          <%= tag.name %>
+        <% end %>
       </div>
     <% end %>
   </div>
 </div>
 ```
+
+**关键点**：
+- 筛选器中使用的是 `DS::FilledIcon` 组件，不是颜色头像 partial
+- `DS::FilledIcon` 是设计系统通用组件，使用 `oklab` 色彩空间混合
+- 颜色头像 partial 仅用于标签管理页面和标签编辑表单
 
 **筛选徽章展示**：选中的标签以徽章形式显示在搜索结果顶部：
 ```erb
@@ -298,76 +384,101 @@ end
 
 ## 七、Hotwire 与 Stimulus 控件消费方式
 
-### 7.1 Hotwire Turbo 框架
+### 7.1 路径一：标签创建
 
-**模态框编辑**：标签新建/编辑通过 Turbo Frame 模态框加载：
-```erb
-# app/views/tags/index.html.erb:15-21
-<%= render DS::Link.new(
-  text: t(".new"),
-  variant: "primary",
-  href: new_tag_path,
-  icon: "plus",
-  frame: :modal
-) %>
+**完整链路**：
+```
+用户点击"新建标签"按钮 (tags/index.html.erb:15-21)
+  ↓
+Turbo Frame 加载模态框 (data: { turbo_frame: "modal" })
+  ↓
+渲染 tags/new.html.erb → 嵌套 _form.html.erb
+  ↓
+color-avatar Stimulus 控制器激活 (data-controller="color-avatar")
+  ↓
+用户选择颜色 → handleColorChange() 实时更新头像预览
+  ↓
+用户输入名称 → 绑定到 color-avatar 控制器的 name target
+  ↓
+提交表单 (data: { turbo_frame: :_top })
+  ↓
+TagsController#create → 保存到数据库
+  ↓
+整页重定向到标签列表 (redirect_to tags_path)
 ```
 
-**实时更新**：交易详情抽屉使用 Turbo 框架，标签修改后自动刷新：
-```erb
-# app/views/transactions/show.html.erb:1
-<%= render DS::Dialog.new(variant: "drawer") do |dialog| %>
+**Hotwire 角色**：
+- `turbo_frame: "modal"`：通过 Turbo Frame 加载模态框内容，无需整页刷新
+- `turbo_frame: :_top`：表单提交后整页导航，确保页面状态同步
+
+**Stimulus 角色**：
+- `color-avatar` 控制器：提供颜色和名称的实时预览，无需服务器往返
+
+### 7.2 路径二：交易打标
+
+**完整链路**：
+```
+用户点击交易条目 (transactions/_transaction.html.erb:49-57)
+  ↓
+Turbo Frame 抽屉加载 (data: { turbo_frame: "drawer" })
+  ↓
+渲染 transactions/show.html.erb 抽屉界面
+  ↓
+auto-submit-form Stimulus 控制器激活 (data: { controller: "auto-submit-form" })
+  ↓
+标签多选器绑定 (data-auto-submit-form-target="auto")
+  ↓
+用户选择标签 → 控制器自动触发表单提交
+  ↓
+TransactionsController#update → 更新 tag_ids 关联
+  ↓
+Turbo Stream 响应 (app/controllers/transactions_controller.rb:94-104)
+  ↓
+局部替换：交易头部 + 交易条目 + Flash 通知
 ```
 
-### 7.2 Stimulus 控制器
+**Hotwire 角色**：
+- `turbo_frame: "drawer"`：通过 Turbo Frame 加载抽屉详情页
+- `turbo_stream.replace`：更新后局部替换 DOM，无需整页刷新
+- `turbo_stream.replace(@entry)`：替换交易列表中的对应条目
 
-#### 7.2.1 列表筛选控制器 (`app/javascript/controllers/list_filter_controller.js`)
+**Stimulus 角色**：
+- `auto-submit-form` 控制器：监听表单字段变化，自动提交保存，实现无感体验
 
-```javascript
-export default class extends Controller {
-  static targets = ["input", "list", "emptyMessage"];
+### 7.3 路径三：列表筛选
 
-  filter() {
-    const filterValue = this.inputTarget.value.toLowerCase();
-    const items = this.listTarget.querySelectorAll(".filterable-item");
-
-    items.forEach((item) => {
-      const text = item.getAttribute("data-filter-name").toLowerCase();
-      const shouldDisplay = text.includes(filterValue);
-      item.style.display = shouldDisplay ? "" : "none";
-    });
-  }
-}
+**完整链路**：
+```
+打开交易列表页面 (transactions/index.html.erb:53)
+  ↓
+渲染搜索表单 (transactions/searches/_form.html.erb:1)
+  ↓
+auto-submit-form 控制器激活 (data: { controller: "auto-submit-form" })
+  ↓
+点击筛选按钮 → 弹出筛选菜单
+  ↓
+选择标签筛选 → 渲染 _tag_filter.html.erb
+  ↓
+list-filter 控制器激活 (data-controller="list-filter")
+  ↓
+用户搜索标签 → filter() 方法前端实时过滤
+  ↓
+用户勾选标签 → auto-submit-form 自动提交表单 (GET 请求)
+  ↓
+TransactionsController#index → Transaction::Search 应用筛选
+  ↓
+整页刷新，展示筛选结果
+  ↓
+顶部显示已选标签徽章 (_search.html.erb:19-21)
 ```
 
-**消费方式**：
-- 在标签筛选器中，通过 `data-controller="list-filter"` 绑定
-- 输入框通过 `data-list-filter-target="input"` 注册
-- 列表项通过 `data-list-filter-target="list"` 和 `data-filter-name` 注册
-- 实时过滤无需服务器请求
+**Hotwire 角色**：
+- 常规 GET 请求刷新页面（不是 Turbo Stream）
+- 筛选表单使用 `method: :get`，通过 URL 参数传递筛选条件
 
-#### 7.2.2 颜色头像控制器 (`app/javascript/controllers/color_avatar_controller.js`)
-
-```javascript
-export default class extends Controller {
-  static targets = ["name", "avatar", "selection"];
-
-  handleColorChange(e) {
-    const color = e.currentTarget.value;
-    this.avatarTarget.style.backgroundColor = `color-mix(in srgb, ${color} 10%, transparent)`;
-    this.avatarTarget.style.borderColor = `color-mix(in srgb, ${color} 10%, transparent)`;
-    this.avatarTarget.style.color = color;
-  }
-}
-```
-
-**消费方式**：
-- 标签新建/编辑表单中，通过 `data-controller="color-avatar"` 绑定
-- 颜色单选按钮通过 `data-action="change->color-avatar#handleColorChange"` 触发
-- 实时预览头像颜色变化
-
-#### 7.2.3 自动提交表单控制器 (`app/javascript/controllers/auto_submit_form_controller.js`)
-
-在交易详情中修改标签后自动提交保存，无需手动点击保存按钮。
+**Stimulus 角色**：
+- `list-filter` 控制器：在标签筛选列表中提供实时搜索过滤，纯前端操作
+- `auto-submit-form` 控制器：筛选条件变化时自动提交搜索表单
 
 ---
 
@@ -378,24 +489,25 @@ export default class extends Controller {
 ```
 用户点击"新建标签" → Turbo Frame 加载模态框 → 表单展示 (color-avatar 控制器)
     → 选择颜色 (Stimulus 实时预览) → 输入名称 → 提交表单
-    → TagsController#create → 保存到数据库 → 重定向到标签列表
+    → TagsController#create → 保存到数据库 → 整页重定向到标签列表
 ```
 
 ### 8.2 交易打标签流程
 
 ```
-打开交易详情 → 标签多选器展示家庭所有标签 → 用户选择标签
-    → auto-submit-form 控制器自动提交 → TransactionsController#update
-    → 更新 tag_ids 关联 → 自动保存
+打开交易详情 → Turbo Frame 抽屉加载 → 标签多选器展示家庭所有标签
+    → 用户选择标签 → auto-submit-form 控制器自动提交
+    → TransactionsController#update → 更新 tag_ids 关联
+    → Turbo Stream 局部替换 → 交易列表实时更新
 ```
 
 ### 8.3 标签筛选交易流程
 
 ```
 打开交易搜索页面 → 展开标签筛选器 → list-filter 控制器实时过滤标签列表
-    → 用户勾选标签 → 提交搜索表单 → Transaction::Search 应用标签筛选
-    → joins(:tags).where(tags: { name: tags }) → 返回筛选结果
-    → 顶部显示已选标签徽章
+    → 用户勾选标签 → auto-submit-form 自动提交 GET 请求
+    → Transaction::Search 应用标签筛选 (joins(:tags).where)
+    → 整页刷新 → 顶部显示已选标签徽章
 ```
 
 ---
@@ -406,6 +518,8 @@ export default class extends Controller {
 |--------|------|
 | **家庭级归属** | 标签是家庭共享资源，而非用户私有 |
 | **多态关联** | 通过 `taggings` 中间表支持未来扩展到其他模型 |
-| **颜色内嵌** | 颜色直接存储在标签表，渲染时通过 CSS `color-mix()` 动态计算 |
+| **颜色双轨渲染** | 颜色头像 partial 使用 `srgb`，DS::FilledIcon 使用 `oklab` |
+| **颜色承载** | 颜色直接存储在标签表，渲染时通过 CSS `color-mix()` 动态计算 |
 | **实时交互** | Stimulus 控制器实现前端实时过滤和预览，无需服务器往返 |
+| **渐进式增强** | 标签创建用整页刷新，交易打标用 Turbo Stream 局部更新，筛选用 GET 刷新 |
 | **自动保存** | 配合 `auto-submit-form` 实现无感保存体验 |
