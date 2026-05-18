@@ -158,7 +158,78 @@ connect() {
 
 状态完全由服务端渲染的 HTML 标记决定，控制器仅在浏览器端"激活"这些状态。
 
-### 3.3 状态变更示例：Tabs 切换
+### 3.3 深入案例：Dialog ESC 关闭的完整链路
+
+DS::Dialog 的 ESC 键关闭功能展示了**多控制器协作**模式，涉及三个层级的代码配合：
+
+**第一步：Ruby 组件注入双控制器和配置** (`app/components/DS/dialog.rb:98-110`)
+```ruby
+def merged_opts
+  data[:controller] = [ "DS--dialog", "hotkey", data[:controller] ].compact.join(" ")
+  data[:DS__dialog_auto_open_value] = auto_open
+  data[:DS__dialog_reload_on_close_value] = reload_on_close
+  data[:action] = [ "mousedown->DS--dialog#clickOutside", data[:action] ].compact.join(" ")
+  data[:hotkey] = "esc:DS--dialog#close"  # 声明快捷键映射
+end
+```
+
+生成的 HTML 标记：
+```html
+<dialog data-controller="DS--dialog hotkey"
+        data-hotkey="esc:DS--dialog#close"
+        data-action="mousedown->DS--dialog#clickOutside">
+  ...
+</dialog>
+```
+
+**第二步：Hotkey 控制器安装监听** (`app/javascript/controllers/hotkey_controller.js:1-12`)
+```javascript
+import { install, uninstall } from "@github/hotkey";
+
+export default class extends Controller {
+  connect() {
+    install(this.element);  // 解析 data-hotkey 属性，安装键盘事件监听
+  }
+
+  disconnect() {
+    uninstall(this.element);
+  }
+}
+```
+
+`@github/hotkey` 库会：
+1. 读取 `data-hotkey="esc:DS--dialog#close"` 属性
+2. 解析出快捷键 `esc` 和目标动作 `DS--dialog#close`
+3. 在 `document` 上安装 `keydown` 事件监听器
+4. 当用户按下 ESC 键时，触发 Stimulus action 调用
+
+**第三步：触发 Dialog 控制器的 close 方法**
+```javascript
+// app/components/DS/dialog_controller.js:26-32
+close() {
+  this.element.close();  // 调用原生 <dialog> API 关闭
+  if (this.reloadOnCloseValue) {
+    Turbo.visit(window.location.href);
+  }
+}
+```
+
+**完整链路图：**
+```
+用户按下 ESC 键
+      ↓
+@github/hotkey 库捕获 keydown 事件
+      ↓
+匹配 data-hotkey="esc:DS--dialog#close"
+      ↓
+触发 Stimulus action: DS--dialog#close
+      ↓
+DialogController.close() 执行
+      ↓
+this.element.close() 关闭对话框
+```
+
+### 3.4 状态变更示例：Tabs 切换
 
 `DS::Tabs` 展示了完整的状态流转：
 
