@@ -64,7 +64,39 @@ EmailConfirmationMailer.with(user: self).confirmation_email.deliver_later
 | 布局 | `views/layouts/mailer.html.erb` | 邮件通用布局框架 |
 | 发件人配置 | `application_mailer.rb:2` | 统一发件人名称和地址 |
 
-### 2.7 链接验证与防御机制
+### 2.7 Self-Hosted 模式下的特殊分支
+
+在 `initiate_email_change` 方法（`user.rb:44-58`）中存在一个关键的条件分支：
+
+```ruby
+def initiate_email_change(new_email)
+  return false if new_email == email
+  return false if new_email == unconfirmed_email
+
+  if Rails.application.config.app_mode.self_hosted? && !Setting.require_email_confirmation
+    update(email: new_email)  # 直接更新，跳过确认流程
+  else
+    if update(unconfirmed_email: new_email)
+      EmailConfirmationMailer.with(user: self).confirmation_email.deliver_later
+      true
+    else
+      false
+    end
+  end
+end
+```
+
+**触发条件（同时满足）：**
+1. `app_mode.self_hosted?` → 由环境变量 `SELF_HOSTED=true` 或 `SELF_HOSTING_ENABLED=true` 决定（`application.rb:30`）
+2. `!Setting.require_email_confirmation` → 自托管管理员在设置页关闭了邮箱确认要求
+
+**为何不发确认邮件：**
+- **设计意图**：自托管场景下，管理员可能完全控制服务器，不需要邮箱验证作为额外的安全层
+- **简化流程**：跳过邮件确认可以减少对 SMTP 服务的依赖，适合内网或离线部署
+- **风险权衡**：自托管用户通常只有少数几个账号，且管理员对所有账号有完全控制权，邮箱确认的安全收益较低
+- **控制器联动**：`users_controller.rb:10-13` 也有对应分支，返回不同的成功提示
+
+### 2.8 链接验证与防御机制
 
 验证逻辑在 `email_confirmations_controller.rb:5-17`：
 
