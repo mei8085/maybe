@@ -336,6 +336,35 @@ class Transaction::Search
 end
 ```
 
+#### 6.1.1 查询层匹配语义
+
+**核心逻辑**：`joins(:tags).where(tags: { name: tags })`
+
+**SQL 语义解析**：
+```sql
+SELECT transactions.*
+FROM transactions
+INNER JOIN taggings ON taggings.taggable_id = transactions.id 
+                   AND taggings.taggable_type = 'Transaction'
+INNER JOIN tags ON tags.id = taggings.tag_id
+WHERE tags.name IN ('标签A', '标签B', ...)
+```
+
+**匹配规则**：
+- 使用 `INNER JOIN`（通过 `joins` 方法）而非 `LEFT JOIN`
+- **多标签命中方式**：`OR` 语义（只要命中任意一个选中的标签即可）
+- **结果影响**：
+  - 无标签的交易**不会**出现在结果中（因为 INNER JOIN 排除了无匹配的行）
+  - 如果一个交易同时有多个选中的标签，会出现**重复行**（需要后续去重）
+  - 没有处理重复问题，依赖上层查询或分页逻辑隐式去重
+
+**与其他筛选器的对比**：
+| 筛选器 | JOIN 类型 | 特殊处理 |
+|--------|----------|----------|
+| 标签筛选 | `INNER JOIN` (`joins`) | 无标签交易被排除 |
+| 分类筛选 | `LEFT JOIN` (`left_joins`) | 特别处理 "Uncategorized" 情况 |
+| 商家筛选 | `INNER JOIN` (`joins`) | 无商家交易被排除 |
+
 ### 6.2 筛选器 UI
 
 **标签筛选组件** (`app/views/transactions/searches/filters/_tag_filter.html.erb:1`)：
