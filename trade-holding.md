@@ -369,19 +369,31 @@ end
 
 **文件位置**: `app/models/holding/portfolio_cache.rb`
 
-**价格优先级**:
+**价格优先级**（priority 数字越小，优先级越高，`min_by` 取最小值）:
 ```
-1. DB 价格（从提供商同步）→ 优先级 1
-2. 交易价格 → 优先级 2
-3. 持仓价格 → 优先级 3
+1. DB 价格（从提供商同步）→ priority: 1（最高）
+2. 交易价格 → priority: 2
+3. 持仓价格 → priority: 3（最低）
 ```
 
 ```ruby
 def get_price(security_id, date, source: nil)
-  # 按优先级选择价格，最低优先级的价格优先使用
+  # min_by(&:priority) 取 priority 最小的，即优先级最高的价格
   price = security[:prices].select { |p| p.price.date == date }.min_by(&:priority)&.price
   # 自动转换为账户货币
 end
+```
+
+**价格源加载逻辑**：
+```ruby
+# DB 价格（最高优先级）
+db_prices = security.prices.where(...).map { PriceWithPriority.new(priority: 1, source: "db") }
+
+# 交易价格（中等优先级）
+trade_prices = trades.map { PriceWithPriority.new(priority: 2, source: "trade") }
+
+# 持仓价格（最低优先级，仅反向计算时使用）
+holding_prices = holdings.map { PriceWithPriority.new(priority: 3, source: "holding") }
 ```
 
 ### 4.5 缺口填充 (`Gapfillable`)
