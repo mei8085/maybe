@@ -253,10 +253,20 @@ def broadcast
     account.family.broadcast_sync_complete  # 级联触发家庭级广播
   end
 
-  # 4. 刷新当前资产详情页（发送到 account 频道）
+  # 🔴 4. 刷新资产详情页（发送到 account 频道）
+  # 使用 Turbo 8 Page Refresh 机制，客户端自动 morph 更新页面
   account.broadcast_refresh
 end
 ```
+
+**⚠️ 重要修正**：`account.broadcast_refresh` 是 Turbo Rails 8+ 内置方法，来自 `Turbo::Broadcastable` 模块（自动包含在所有 ActiveRecord 模型中）。它的实现是：
+```ruby
+def broadcast_refresh
+  broadcast_refresh_to self  # 向 account 频道发送 refresh 动作
+end
+```
+
+这不是调用 `UI::AccountPage#broadcast_refresh!`，而是发送一个 Turbo Page Refresh 事件，客户端使用 morphing 技术智能更新页面。
 
 ### 6.4 家庭级广播 (`app/models/family/sync_complete_event.rb`)
 
@@ -286,10 +296,16 @@ end
 
 **组件**：`UI::AccountPage` (`app/components/UI/account_page.rb`)
 
-**实时刷新机制**：
-- 订阅 `account` 频道（独立于家庭频道）
-- `account.broadcast_refresh` 触发 `UI::AccountPage#broadcast_refresh!`
-- 整个页面在 `turbo_frame_tag id="#account_123_container"` 内，可被整体替换
+**实时刷新机制（修正后）**：
+- 页面订阅 `account` 频道（独立于家庭频道）
+- `account.broadcast_refresh` 发送 Turbo Page Refresh 事件到 `account` 频道
+- 客户端收到后，使用 **morphing 技术**智能更新页面（保留滚动位置、表单状态等）
+- 这不是替换特定 turbo_frame，而是整页差异更新
+
+**`UI::AccountPage#broadcast_refresh!` 方法说明**：
+- 这是一个自定义方法，但**在同步流程中没有被调用**
+- 它会替换整个 `#account_123_container` turbo_frame
+- 可能用于其他场景（如手动触发刷新）
 
 **展示的数据来源**：
 - 账户余额：`account.balance`（从 `accounts` 表读取，已在同步时更新）
@@ -373,11 +389,11 @@ end
    │   └─ [Family::SyncCompleteEvent#broadcast]
    │       ├─ 广播替换 <div id="net-worth-chart">（到 family 频道）
    │       └─ 广播替换 <div id="balance-sheet">（到 family 频道）
-   └─ 调用 account.broadcast_refresh
-       └─ 广播替换整个账户页面（到 account 频道）
+   └─ 🔴 调用 account.broadcast_refresh（Turbo 8 内置方法）
+       └─ 发送 Page Refresh 事件（到 account 频道）
              ↓
 [前端 Turbo 自动处理]
-   ├─ 资产详情页：接收 account 频道消息 → 局部替换页面
+   ├─ 资产详情页：接收 account 频道 refresh 事件 → morph 整页更新
    └─ 所有打开的页面：接收 family 频道消息 → 局部替换净资产图和资产总览
 ```
 
@@ -391,15 +407,27 @@ end
     - 刷新资产详情页（仅订阅该账户频道的页面）
     - 更新资产列表中的账户行（所有页面）
     - 更新侧边栏分组（所有页面）
+    - 使用 **Turbo Page Refresh**（morphing）更新资产详情页
 
 2.  **家庭级广播**（`Family::SyncCompleteEvent`）：
     - 刷新净资产图表（所有页面）
     - 刷新资产总览表（所有页面）
     - 手动账户会从账户级广播级联触发家庭级广播
+    - 使用 **broadcast_replace** 替换特定 DOM 元素
 
 3.  **Plaid 链接账户**：
     - 由 `PlaidItem::SyncCompleteEvent` 触发家庭级广播
     - 不需要在账户级广播中重复触发
+
+### Turbo 8 Page Refresh vs broadcast_replace
+
+| 特性 | `broadcast_refresh` | `broadcast_replace` |
+|------|---------------------|---------------------|
+| 触发方式 | `account.broadcast_refresh` | `family.broadcast_replace(target: ...)` |
+| 更新范围 | 整页 morphing 差异更新 | 替换指定 target DOM 元素 |
+| 状态保留 | 保留滚动位置、表单状态 | 仅替换目标元素内容 |
+| 适用场景 | 复杂页面（如资产详情页） | 特定组件（如净资产图） |
+| 实现复杂度 | 低（自动处理） | 高（需指定 target 和 partial） |
 
 ### 核心技术设计
 
@@ -410,3 +438,4 @@ end
 5.  **余额物化**：每日余额预计算，避免页面加载时的昂贵计算
 6.  **多态设计**：Valuation 通过 Entry 包装，与 Transaction、Trade 共享同一入口
 7.  **频道分层**：家庭频道 + 账户频道的双层订阅，精确控制更新范围
+8.  **Turbo 8 Page Refresh**：使用 morphing 技术实现智能页面更新，保留用户状态
