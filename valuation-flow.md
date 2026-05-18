@@ -3,7 +3,7 @@
 ## 概览
 
 用户手工填入资产估值后，系统经历以下完整链路：
-**用户提交估值 → 创建 Valuation 记录 → 触发后台同步 → 余额物化计算 → 更新账户余额 → 缓存失效 → 页面自动刷新展示**
+**用户提交估值 → 创建 Valuation 记录 → 触发后台同步 → 余额物化计算 → 更新账户余额 → Turbo Streams 广播 → 所有页面实时局部刷新**
 
 ---
 
@@ -97,7 +97,7 @@ def perform(sync)
 end
 ```
 
-### 3. Sync 模型 (`app/models/sync.rb`)
+### 3.3 Sync 模型 (`app/models/sync.rb`)
 
 **状态机** (第 27-52 行)：
 - `pending` → `syncing` → `completed` / `failed`
@@ -107,6 +107,14 @@ end
 ```ruby
 def handle_completion_transition
   family.touch(:latest_sync_completed_at)  # 触发缓存失效
+end
+```
+
+**Post-Sync 钩子** (第 142-149 行)：
+```ruby
+def perform_post_sync
+  syncable.perform_post_sync
+  syncable.broadcast_sync_complete  # 🔴 关键：触发 Turbo Streams 广播
 end
 ```
 
@@ -198,26 +206,97 @@ end
 
 ---
 
-## 6. 视图展示层
+## 6. Turbo Streams 广播层
 
-### 6.1 资产详情页 (Account Page)
+### 6.1 频道订阅机制
+
+**全局订阅** (`app/views/layouts/shared/_htmldoc.html.erb` 第 29-31 行)：
+```erb
+<% if Current.family %>
+  <%= turbo_stream_from Current.family %>  # 🔴 所有页面订阅家庭级频道
+<% end %>
+```
+
+**账户级订阅** (`app/components/UI/account_page.html.erb` 第 1 行)：
+```erb
+<%= turbo_stream_from account %>  # 资产详情页额外订阅账户级频道
+```
+
+### 6.2 SyncCompleteEvent 广播器
+
+Syncable 模块通过 `sync_broadcaster` 方法获取对应的广播器：
+```ruby
+def sync_broadcaster
+  self.class::SyncCompleteEvent.new(self)
+end
+```
+
+### 6.3 账户级广播 (`app/models/account/sync_complete_event.rb`)
+
+```ruby
+def broadcast
+  # 1. 更新账户列表中的账户行（发送到 family 频道）
+  account.broadcast_replace_to(
+    account.family,
+    target: "account_#{account.id}",
+    partial: "accounts/account",
+    locals: { account: account }
+  )
+
+  # 2. 更新侧边栏分组（发送到 family 频道）
+  sidebar_targets.each do |(tab, mobile_flag)|
+    account.broadcast_replace_to(...)
+  end
+
+  # 🔴 3. 手动账户触发家庭级广播（因为没有 Plaid 同步）
+  unless account.linked?
+    account.family.broadcast_sync_complete  # 级联触发家庭级广播
+  end
+
+  # 4. 刷新当前资产详情页（发送到 account 频道）
+  account.broadcast_refresh
+end
+```
+
+### 6.4 家庭级广播 (`app/models/family/sync_complete_event.rb`)
+
+```ruby
+def broadcast
+  # 🔴 直接替换净资产图表（所有打开的页面都会收到）
+  family.broadcast_replace(
+    target: "net-worth-chart",
+    partial: "pages/dashboard/net_worth_chart",
+    locals: { balance_sheet: family.balance_sheet, period: Period.last_30_days }
+  )
+
+  # 🔴 直接替换资产总览表（所有打开的页面都会收到）
+  family.broadcast_replace(
+    target: "balance-sheet",
+    partial: "pages/dashboard/balance_sheet",
+    locals: { balance_sheet: family.balance_sheet }
+  )
+end
+```
+
+---
+
+## 7. 视图展示层
+
+### 7.1 资产详情页 (Account Page)
 
 **组件**：`UI::AccountPage` (`app/components/UI/account_page.rb`)
 
-**Turbo Streams 实时更新**：
-- 视图订阅账户的 Turbo Stream 频道 (`account_page.html.erb` 第 1 行)：
-  ```erb
-  <%= turbo_stream_from account %>
-  ```
-- 同步完成后通过 `broadcast_sync_complete` 推送更新
-- 整个页面在 `turbo_frame_tag` 内，可被局部替换
+**实时刷新机制**：
+- 订阅 `account` 频道（独立于家庭频道）
+- `account.broadcast_refresh` 触发 `UI::AccountPage#broadcast_refresh!`
+- 整个页面在 `turbo_frame_tag id="#account_123_container"` 内，可被整体替换
 
 **展示的数据来源**：
 - 账户余额：`account.balance`（从 `accounts` 表读取，已在同步时更新）
 - 历史图表：`account.sparkline_series`（基于 `balances` 表计算）
 - 估值记录：`account.entries.valuations`（从 `entries` + `valuations` 表读取）
 
-### 6.2 净资产页 (Dashboard / Balance Sheet)
+### 7.2 净资产页 (Dashboard / Balance Sheet)
 
 **BalanceSheet 聚合** (`app/models/balance_sheet.rb`)：
 ```ruby
@@ -225,7 +304,7 @@ def assets
   @assets ||= ClassificationGroup.new(
     classification: "asset",
     currency: family.currency,
-    accounts: account_totals.asset_accounts  # 缓存的账户汇总数据
+    accounts: account_totals.asset_accounts
   )
 end
 
@@ -234,9 +313,16 @@ def net_worth
 end
 
 def net_worth_series(period: Period.last_30_days)
-  net_worth_series_builder.net_worth_series(period: period)  # 缓存的净资产系列
+  net_worth_series_builder.net_worth_series(period: period)
 end
 ```
+
+**实时刷新机制**：
+- 所有页面订阅 `Current.family` 频道
+- `Family::SyncCompleteEvent` 直接广播替换两个 DOM 元素：
+  - `<div id="net-worth-chart">`：净资产趋势图
+  - `<div id="balance-sheet">`：资产/负债总览表
+- **无需刷新页面**，Turbo 自动处理局部替换
 
 **视图**：
 - `_net_worth_chart.html.erb`：展示净资产趋势图
@@ -247,18 +333,18 @@ end
 ## 完整数据流时序图
 
 ```
-用户操作
+用户操作（输入估值）
    ↓
 [ValuationsController]
    ↓ create_reconciliation / update_reconciliation
 [Account::Reconcileable]
    ↓
 [Account::ReconciliationManager]
-   ├─ 创建/更新 Valuation 记录
+   ├─ 创建/更新 Valuation 记录（entries + valuations 表）
    └─ 调用 sync_later
          ↓
 [Syncable.sync_later]
-   ├─ 创建 Sync 记录
+   ├─ 创建 Sync 记录（syncs 表）
    └─ 入队 SyncJob
          ↓
 [后台 Worker]
@@ -274,25 +360,53 @@ end
    │       │   └─ 更新 account.balance / cash_balance
    │       └─ 账户余额更新 → account.updated_at 变化
    ├─ 状态变为 completed
-   └─ handle_completion_transition
-       └─ family.touch(:latest_sync_completed_at)
+   ├─ handle_completion_transition
+   │   └─ family.touch(:latest_sync_completed_at)  # 缓存失效
+   └─ perform_post_sync
+       ├─ syncable.perform_post_sync
+       └─ syncable.broadcast_sync_complete  # 🔴 触发广播
              ↓
-[缓存失效]
-   ├─ AccountTotals 缓存键变化 → 重新计算
-   └─ NetWorthSeriesBuilder 缓存键变化 → 重新计算
-         ↓
-[页面展示]
-   ├─ 资产详情页：Turbo Stream 推送更新
-   └─ 净资产页：下次刷新时读取新缓存
+[Account::SyncCompleteEvent#broadcast]
+   ├─ 广播替换账户行（到 family 频道）
+   ├─ 广播替换侧边栏分组（到 family 频道）
+   ├─ 🔴 手动账户额外触发：account.family.broadcast_sync_complete
+   │   └─ [Family::SyncCompleteEvent#broadcast]
+   │       ├─ 广播替换 <div id="net-worth-chart">（到 family 频道）
+   │       └─ 广播替换 <div id="balance-sheet">（到 family 频道）
+   └─ 调用 account.broadcast_refresh
+       └─ 广播替换整个账户页面（到 account 频道）
+             ↓
+[前端 Turbo 自动处理]
+   ├─ 资产详情页：接收 account 频道消息 → 局部替换页面
+   └─ 所有打开的页面：接收 family 频道消息 → 局部替换净资产图和资产总览
 ```
 
 ---
 
 ## 关键设计要点
 
+### 广播链路分层设计
+
+1.  **账户级广播**（`Account::SyncCompleteEvent`）：
+    - 刷新资产详情页（仅订阅该账户频道的页面）
+    - 更新资产列表中的账户行（所有页面）
+    - 更新侧边栏分组（所有页面）
+
+2.  **家庭级广播**（`Family::SyncCompleteEvent`）：
+    - 刷新净资产图表（所有页面）
+    - 刷新资产总览表（所有页面）
+    - 手动账户会从账户级广播级联触发家庭级广播
+
+3.  **Plaid 链接账户**：
+    - 由 `PlaidItem::SyncCompleteEvent` 触发家庭级广播
+    - 不需要在账户级广播中重复触发
+
+### 核心技术设计
+
 1.  **异步解耦**：用户提交后立即返回，余额计算在后台异步执行
 2.  **幂等设计**：重复的 sync 会被合并（扩展窗口），避免重复计算
 3.  **缓存失效**：通过 `latest_sync_completed_at` 时间戳实现优雅的缓存失效
-4.  **实时推送**：Turbo Streams 实现资产详情页的实时更新
+4.  **实时推送**：Turbo Streams 实现全站无刷新更新
 5.  **余额物化**：每日余额预计算，避免页面加载时的昂贵计算
 6.  **多态设计**：Valuation 通过 Entry 包装，与 Transaction、Trade 共享同一入口
+7.  **频道分层**：家庭频道 + 账户频道的双层订阅，精确控制更新范围
