@@ -42,11 +42,98 @@ Stimulus 会自动扫描 DOM，当发现带有 `data-controller="DS--dialog"` �
 | `app/components/DS/tabs_controller.js` | `DS--tabs` | `data-controller="DS--tabs"` |
 | `app/components/DS/menu_controller.js` | `DS--menu` | `data-controller="DS--menu"` |
 
+### 2.4 完整链路：从 Ruby 符号到 HTML 属性
+
+#### DS__ 命名转换机制
+
+Rails 的 `tag` 辅助方法和 `data:` 选项会自动处理命名转换。核心转换规则：
+
+1. **双下划线 `__` → 双连字符 `--`**：用于标识命名空间
+2. **单下划线 `_` → 单连字符 `-`**：用于分隔单词
+3. **自动添加 `data-` 前缀**：所有 `data:` 哈希中的键都会加上 `data-` 前缀
+
+**转换示例：**
+
+| Ruby 符号 | 生成的 HTML 属性 |
+|----------|-----------------|
+| `controller: "DS--tabs"` | `data-controller="DS--tabs"` |
+| `DS__tabs_target: "navBtn"` | `data-DS--tabs-target="navBtn"` |
+| `DS__tabs_session_key_value: "accounts_tab"` | `data-DS--tabs-session-key-value="accounts_tab"` |
+| `DS__tabs_nav_btn_active_class: "bg-white..."` | `data-DS--tabs-nav-btn-active-class="bg-white..."` |
+
+**代码示例（Tabs 组件）：**
+
+```ruby
+# app/components/DS/tabs.html.erb:1-8
+<%= tag.div data: {
+  controller: "DS--tabs",
+  DS__tabs_session_key_value: session_key,
+  DS__tabs_url_param_key_value: url_param_key,
+  DS__tabs_nav_btn_active_class: active_btn_classes,
+  DS__tabs_nav_btn_inactive_class: inactive_btn_classes
+} do %>
+```
+
+生成的 HTML：
+```html
+<div data-controller="DS--tabs"
+     data-DS--tabs-session-key-value="accounts_tab"
+     data-DS--tabs-url-param-key-value="tab"
+     data-DS--tabs-nav-btn-active-class="bg-white text-primary shadow-sm"
+     data-DS--tabs-nav-btn-inactive-class="text-secondary hover:bg-surface-inset-hover">
+  ...
+</div>
+```
+
+#### 三层注入机制详解
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  第一层：data-controller - 控制器识别                     │
+├─────────────────────────────────────────────────────────┤
+│  Ruby:  data: { controller: "DS--tabs" }                │
+│  HTML:  data-controller="DS--tabs"                       │
+│  作用：  Stimulus 扫描到此属性时实例化 TabsController     │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  第二层：data-target - 元素标记                           │
+├─────────────────────────────────────────────────────────┤
+│  Ruby:  data: { DS__tabs_target: "navBtn" }             │
+│  HTML:  data-DS--tabs-target="navBtn"                    │
+│  作用：  控制器通过 this.navBtnTargets 访问这些元素       │
+└─────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  第三层：data-value / data-class - 配置传递               │
+├─────────────────────────────────────────────────────────┤
+│  Ruby:  data: { DS__tabs_auto_open_value: true }        │
+│  HTML:  data-DS--tabs-auto-open-value="true"             │
+│  作用：  控制器通过 this.autoOpenValue 读取配置值         │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### Stimulus 侧的属性读取
+
+控制器通过静态声明告诉 Stimulus 要读取哪些属性：
+
+```javascript
+// app/components/DS/tabs_controller.js:5-7
+static classes = ["navBtnActive", "navBtnInactive"];  // 读取 data-DS--tabs-nav-btn-active-class
+static targets = ["panel", "navBtn"];                   // 读取 data-DS--tabs-target="panel"
+static values = { sessionKey: String, urlParamKey: String };  // 读取 data-DS--tabs-session-key-value
+```
+
+Stimulus 自动完成：
+- `navBtnActive` → 查找 `data-DS--tabs-nav-btn-active-class`
+- `sessionKeyValue` → 查找 `data-DS--tabs-session-key-value`
+- `navBtnTargets` → 收集所有 `data-DS--tabs-target="navBtn"` 的元素
+
 ## 3. 控制器接管局部交互状态
 
 ### 3.1 Stimulus 核心概念映射
 
-Stimulus 通过三个核心概念实现状态管理：
+Stimulus 通过四个核心概念实现状态管理：
 
 | 概念 | 声明方式 | 用途 | 示例 |
 |-----|---------|------|------|
@@ -119,31 +206,60 @@ show(e) {
 }
 ```
 
-## 4. 视觉变体到行为的映射
+## 4. 无 JavaScript 时的组件行为核对
 
-### 4.1 变体定义模式
+### 4.1 渐进增强策略验证
+
+| 组件 | 无 JS 时的表现 | 依赖 JS 的功能 | 结论 |
+|-----|---------------|---------------|------|
+| **DS::Disclosure** | 使用原生 `<details>` 元素，`open` 属性控制初始状态。点击 summary 可展开/折叠，完全正常工作。 | 无 | ✅ 完全可用 |
+| **DS::Toggle** | 使用原生 `<input type="checkbox">` + CSS `peer-checked` 选择器实现开关效果。点击 label 可切换状态，表单提交时值正确。 | 无 | ✅ 完全可用 |
+| **DS::Alert** | 纯展示组件，消息和图标正常渲染。 | 无 | ✅ 完全可用 |
+| **DS::Button** | 原生 `<button>` 或 `<a>` 元素，点击可提交表单或跳转。 | `confirm` 选项依赖 Turbo JS 实现确认对话框。 | ⚠️ 基础功能可用，增强功能失效 |
+| **DS::Link** | 原生 `<a>` 元素，点击可跳转。 | `turbo_frame` 等增强功能失效。 | ⚠️ 基础功能可用，增强功能失效 |
+| **DS::Dialog** | `<dialog>` 元素。如果渲染时带有 `open` 属性，则显示；否则隐藏。**无法打开**（需要 `showModal()`）。关闭按钮的 `data-action` 失效。 | 打开/关闭动画、点击外部关闭、ESC 键关闭。 | ❌ 不可用（除非初始打开） |
+| **DS::Menu** | 按钮可见，但内容区域有 `hidden` 类，**无法打开**。 | 打开/关闭、浮动定位、点击外部关闭、ESC 键关闭。 | ❌ 不可用 |
+| **DS::Tabs** | 初始激活的 tab 内容可见，其他 tab 面板有 `hidden` 类。按钮可见但点击无反应，**无法切换**。 | Tab 切换、URL 参数同步、Session 同步。 | ❌ 不可用（只能看初始 tab） |
+| **DS::Tooltip** | 图标可见，但提示内容有 `hidden` 类，**悬停不显示**。 | 悬停显示、浮动定位。 | ❌ 不可用 |
+
+### 4.2 修正后的渐进增强结论
+
+> **原结论修正**：并非所有组件在无 JavaScript 时都能正常工作。
+>
+> 实际情况分为三类：
+> 1. **完全可用**：Disclosure、Toggle、Alert - 依赖原生 HTML/CSS
+> 2. **基础可用**：Button、Link - 原生功能可用，JS 增强功能失效
+> 3. **不可用**：Dialog、Menu、Tabs、Tooltip - 核心交互依赖 JS
+
+这种设计是合理的权衡：
+- 简单组件优先使用原生 HTML 语义
+- 复杂交互组件接受 JS 依赖，因为它们的交互模式（如浮动定位、模态框）无法用纯 HTML/CSS 优雅实现
+
+## 5. 视觉变体到行为的映射
+
+### 5.1 变体定义模式
 
 设计系统组件通过 `VARIANTS` 常量定义视觉变体，这是一个标准模式。以 `DS::Buttonish` 为例 (`app/components/DS/buttonish.rb:2-35`):
 
 ```ruby
 VARIANTS = {
   primary: {
-    container_classes: "text-inverse bg-inverse hover:bg-inverse-hover ...",
+    container_classes: "text-inverse bg-inverse hover:bg-inverse-hover disabled:bg-gray-500 theme-dark:disabled:bg-gray-400",
     icon_classes: "fg-inverse"
   },
   destructive: {
-    container_classes: "text-inverse bg-red-500 hover:bg-red-600 ...",
+    container_classes: "text-inverse bg-red-500 theme-dark:bg-red-400 hover:bg-red-600 theme-dark:hover:bg-red-500 disabled:bg-red-200 theme-dark:disabled:bg-red-600",
     icon_classes: "fg-white"
   },
   ghost: {
-    container_classes: "text-primary bg-transparent hover:bg-gray-100 ...",
+    container_classes: "text-primary bg-transparent hover:bg-gray-100 theme-dark:hover:bg-gray-700",
     icon_classes: "fg-gray"
   },
   # ... 更多变体
 }.freeze
 ```
 
-### 4.2 变体参数传递链
+### 5.2 变体参数传递链
 
 ```
 调用方传入 variant 参数
@@ -157,7 +273,7 @@ Ruby 组件 initialize 接收并存储
 控制器使用这些类名进行状态切换
 ```
 
-### 4.3 变体影响行为的两种方式
+### 5.3 变体影响行为的三种方式
 
 #### 方式一：纯视觉变体（CSS 驱动）
 
@@ -208,7 +324,7 @@ def dialog_outer_classes
 end
 ```
 
-### 4.4 类名传递给控制器：Tabs 案例
+### 5.4 类名传递给控制器：Tabs 案例
 
 当控制器需要根据状态切换视觉效果时，Ruby 组件将变体对应的类名通过 `data-*` 属性传递：
 
@@ -235,7 +351,222 @@ navBtn.classList.add(...this.navBtnActiveClasses);
 
 这种设计使控制器完全不依赖具体的类名字符串，所有视觉决策都在 Ruby 组件层完成。
 
-## 5. 组件协作流程图
+## 6. 端到端变体映射案例
+
+### 6.1 案例一：DS::Menu 变体到行为的完整链路
+
+**调用方代码：**
+```erb
+<%# 变体 1: 图标菜单 %>
+<%= render DS::Menu.new(variant: "icon", placement: "bottom-end") do |menu| %>
+  <% menu.with_item(text: "Edit", href: edit_path) %>
+<% end %>
+
+<%# 变体 2: 头像菜单 %>
+<%= render DS::Menu.new(variant: "avatar", avatar_url: user.avatar_url, placement: "right-start") do |menu| %>
+  <% menu.with_item(text: "Settings", href: settings_path) %>
+<% end %>
+```
+
+**Ruby 侧处理：**
+```ruby
+# app/components/DS/menu.rb:26-37
+def initialize(variant: "icon", placement: "bottom-end", offset: 12, ...)
+  @variant = variant.to_sym
+  @placement = placement
+  @offset = offset
+end
+```
+
+**模板渲染（变体差异）：**
+```erb
+<!-- app/components/DS/menu.html.erb:1-12 -->
+<%= tag.div data: { 
+  controller: "DS--menu", 
+  DS__menu_placement_value: placement, 
+  DS__menu_offset_value: offset 
+} do %>
+  <% if variant == :icon %>
+    <%= render DS::Button.new(variant: "icon", icon: "more-horizontal", 
+          data: { DS__menu_target: "button" }) %>
+  <% elsif variant == :avatar %>
+    <button data-DS--menu-target="button">
+      <img src="<%= avatar_url %>" class="w-9 h-9 rounded-full">
+    </button>
+  <% end %>
+  ...
+<% end %>
+```
+
+**生成的 HTML（变体 1: icon）：**
+```html
+<div data-controller="DS--menu" 
+     data-DS--menu-placement-value="bottom-end"
+     data-DS--menu-offset-value="12">
+  <button data-DS--menu-target="button" class="hover:bg-gray-100 ...">
+    <svg data-icon="more-horizontal">...</svg>
+  </button>
+  <div data-DS--menu-target="content" class="hidden">...</div>
+</div>
+```
+
+**生成的 HTML（变体 2: avatar）：**
+```html
+<div data-controller="DS--menu" 
+     data-DS--menu-placement-value="right-start"
+     data-DS--menu-offset-value="12">
+  <button data-DS--menu-target="button">
+    <img src="/avatars/123.jpg" class="w-9 h-9 rounded-full">
+  </button>
+  <div data-DS--menu-target="content" class="hidden">...</div>
+</div>
+```
+
+**控制器侧行为（统一逻辑）：**
+```javascript
+// app/components/DS/menu_controller.js:14-20
+static targets = ["button", "content"];
+static values = {
+  show: Boolean,
+  placement: { type: String, default: "bottom-end" },
+  offset: { type: Number, default: 6 },
+};
+
+// 打开菜单时使用变体参数
+update() {
+  computePosition(this.buttonTarget, this.contentTarget, {
+    placement: this.placementValue,  // "bottom-end" 或 "right-start"
+    middleware: [offset(this.offsetValue), flip(), shift({ padding: 5 })],
+  }).then(({ x, y }) => {
+    Object.assign(this.contentTarget.style, {
+      position: "fixed",
+      left: `${x}px`,
+      top: `${y}px`,
+    });
+  });
+}
+```
+
+**映射总结：**
+
+| 变体 | 触发按钮外观 | placement 值 | 菜单弹出位置 | 控制器逻辑 |
+|-----|-------------|-------------|-------------|-----------|
+| `icon` | ⋯ 图标按钮 | `bottom-end` | 按钮下方右对齐 | 完全相同 |
+| `avatar` | 用户头像 | `right-start` | 头像右侧上对齐 | 完全相同 |
+| `button` | 自定义按钮 | 可配置 | 可配置 | 完全相同 |
+
+### 6.2 案例二：DS::Dialog 变体到行为的完整链路
+
+**调用方代码：**
+```erb
+<%# 变体 1: Modal 模态框 %>
+<%= render DS::Dialog.new(variant: "modal", width: "md") do |dialog| %>
+  <% dialog.with_header(title: "确认删除") %>
+  <% dialog.with_body do %>确定要删除这条记录吗？<% end %>
+<% end %>
+
+<%# 变体 2: Drawer 抽屉 %>
+<%= render DS::Dialog.new(variant: "drawer", reload_on_close: true) do |dialog| %>
+  <% dialog.with_header(title: "编辑设置") %>
+  <% dialog.with_body do %><%= render "form" %><% end %>
+<% end %>
+```
+
+**Ruby 侧处理：**
+```ruby
+# app/components/DS/dialog.rb:38-54
+VARIANTS = %w[modal drawer].freeze
+WIDTHS = { sm: "lg:max-w-[300px]", md: "lg:max-w-[550px]", ... }.freeze
+
+def initialize(variant: "modal", auto_open: true, reload_on_close: false, width: "md", ...)
+  @variant = variant.to_sym
+  @auto_open = auto_open
+  @reload_on_close = reload_on_close
+  @width = width.to_sym
+end
+
+# 变体决定布局类
+def dialog_outer_classes
+  variant_classes = if drawer?
+    "items-end justify-end"  # 底部对齐
+  else
+    "items-center justify-center"  # 居中
+  end
+end
+
+# 变体决定尺寸类
+def dialog_inner_classes
+  variant_classes = if drawer?
+    "lg:w-[550px] h-full"  # 全高，固定宽度
+  else
+    class_names("max-h-full", WIDTHS[width])  # 最大高度，可变宽度
+  end
+end
+
+# 所有变体共享的 data 属性注入
+def merged_opts
+  data[:controller] = "DS--dialog"
+  data[:DS__dialog_auto_open_value] = auto_open
+  data[:DS__dialog_reload_on_close_value] = reload_on_close
+end
+```
+
+**生成的 HTML（变体 1: modal）：**
+```html
+<dialog data-controller="DS--dialog"
+        data-DS--dialog-auto-open-value="true"
+        data-DS--dialog-reload-on-close-value="false"
+        class="w-full h-full bg-transparent ...">
+  <div class="flex h-full w-full items-center justify-center">
+    <div class="flex flex-col bg-container rounded-xl max-h-full lg:max-w-[550px] ..."
+         data-DS--dialog-target="content">
+      ...
+    </div>
+  </div>
+</dialog>
+```
+
+**生成的 HTML（变体 2: drawer）：**
+```html
+<dialog data-controller="DS--dialog"
+        data-DS--dialog-auto-open-value="true"
+        data-DS--dialog-reload-on-close-value="true"
+        class="w-full h-full bg-transparent ...">
+  <div class="flex h-full w-full items-end justify-end">
+    <div class="flex flex-col bg-container rounded-xl lg:w-[550px] h-full ..."
+         data-DS--dialog-target="content">
+      ...
+    </div>
+  </div>
+</dialog>
+```
+
+**控制器侧行为：**
+```javascript
+// app/components/DS/dialog_controller.js:5-10
+static targets = ["content"]
+static values = {
+  autoOpen: { type: Boolean, default: false },
+  reloadOnClose: { type: Boolean, default: false },
+};
+
+// 关闭时根据变体参数决定是否刷新
+close() {
+  this.element.close();
+  if (this.reloadOnCloseValue) {  // modal 为 false，drawer 为 true
+    Turbo.visit(window.location.href);
+  }
+}
+```
+
+**映射总结：**
+
+| 变体 | 布局类 | 尺寸类 | 视觉效果 | reload_on_close | 关闭后行为 |
+|-----|--------|--------|---------|----------------|-----------|
+| `modal` | `items-center justify-center` | `max-h-full lg:max-w-[550px]` | 屏幕中央的模态框 | `false` | 直接关闭 |
+| `drawer` | `items-end justify-end` | `lg:w-[550px] h-full` | 右侧滑入的抽屉 | `true` | 关闭后刷新页面 |
+
+## 7. 组件协作流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -277,20 +608,23 @@ navBtn.classList.add(...this.navBtnActiveClasses);
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## 6. 关键设计原则
+## 8. 关键设计原则
 
-### 6.1 渐进增强（Progressive Enhancement）
+### 8.1 渐进增强（Progressive Enhancement）
 
-所有组件在无 JavaScript 的情况下仍能正常工作（基础内容可见），Stimulus 仅增强交互体验。例如 `DS::Disclosure` 使用原生 `<details>` 元素，无需 JavaScript 即可展开/折叠。
+组件按优先级采用不同策略：
+- **优先原生**：Disclosure、Toggle 使用原生 HTML 元素
+- **基础可用**：Button、Link 保证核心功能，JS 仅提供增强
+- **接受依赖**：Dialog、Menu、Tabs、Tooltip 等复杂组件依赖 JS
 
-### 6.2 标记即契约（Markup as Contract）
+### 8.2 标记即契约（Markup as Contract）
 
 Ruby 组件与 Stimulus 控制器之间通过 `data-*` 属性建立明确的契约，而非通过 JavaScript 配置对象。这种方式使：
 - 服务端可以完全控制组件的初始状态
 - 模板变更不会意外破坏 JavaScript 逻辑
 - 控制器可独立测试（只需提供符合契约的 HTML 片段）
 
-### 6.3 关注点分离
+### 8.3 关注点分离
 
 | 层级 | 职责 |
 |-----|------|
@@ -298,13 +632,20 @@ Ruby 组件与 Stimulus 控制器之间通过 `data-*` 属性建立明确的契�
 | ERB 模板 | 生成语义化 HTML、声明 data-* 契约 |
 | Stimulus 控制器 | 事件绑定、状态流转、DOM 操作 |
 
-### 6.4 可组合性
+### 8.4 可组合性
 
 组件可以嵌套使用，例如 `DS::Dialog` 内部使用 `DS::Button` 和 `DS::Disclosure`，每个子组件独立管理自己的 Stimulus 控制器。
 
-## 7. 典型组件深度解析
+### 8.5 视觉决策在上层
 
-### 7.1 DS::Menu - 浮动定位组件
+所有 CSS 类名决策都在 Ruby 组件层完成，控制器仅接收类名并在适当的时候应用。这意味着：
+- 设计师可以修改 Ruby 组件中的 `VARIANTS` 配置来调整样式
+- 无需修改 JavaScript 代码
+- 保持了单源真值（Single Source of Truth）
+
+## 9. 典型组件深度解析
+
+### 9.1 DS::Menu - 浮动定位组件
 
 **协作要点：**
 - Ruby 侧传递 `placement` 和 `offset` 参数
@@ -322,14 +663,14 @@ Floating UI: computePosition(button, content, { placement, offset })
 DOM: style.left = `${x}px`, style.top = `${y}px`
 ```
 
-### 7.2 DS::Tooltip - 悬停提示
+### 9.2 DS::Tooltip - 悬停提示
 
 **协作要点：**
 - 采用与 Menu 相同的 Floating UI 定位方案
 - 事件绑定在 `connect()` 中建立，`disconnect()` 中清理
 - 使用 `mouseenter`/`mouseleave` 触发显示/隐藏
 
-### 7.3 DS::Button - 纯视觉组件
+### 9.3 DS::Button - 纯视觉组件
 
 **协作要点：**
 - 无对应的 Stimulus 控制器
@@ -337,9 +678,16 @@ DOM: style.left = `${x}px`, style.top = `${y}px`
 - 可作为子组件被其他组件（如 Dialog、Menu）使用
 - 支持 `confirm` 选项，通过 `turbo-confirm` 与 Rails UJS 集成
 
-## 8. 开发指南
+### 9.4 DS::Disclosure - 原生 HTML 优先
 
-### 8.1 新增交互组件的步骤
+**协作要点：**
+- 无控制器，完全使用原生 `<details>` 元素
+- 使用 CSS `group-open:` 变体实现箭头旋转动画
+- `open` 参数控制初始状态
+
+## 10. 开发指南
+
+### 10.1 新增交互组件的步骤
 
 1. **创建 Ruby 组件类** (`app/components/DS/widget.rb`)
    - 继承 `DesignSystemComponent`
@@ -348,9 +696,9 @@ DOM: style.left = `${x}px`, style.top = `${y}px`
 
 2. **创建模板** (`app/components/DS/widget.html.erb`)
    - 根元素添加 `data-controller="DS--widget"`
-   - 使用 `data-DS--widget-target="name"` 标记关键元素
-   - 使用 `data-DS--widget-*-value` 传递配置
-   - 使用 `data-action="DS--widget#method"` 绑定事件
+   - 使用 `data-DS__widget_target: "name"` 标记关键元素（注意双下划线）
+   - 使用 `data-DS__widget_*_value: value` 传递配置
+   - 使用 `data: { action: "DS--widget#method" }` 绑定事件
 
 3. **创建 Stimulus 控制器** (`app/components/DS/widget_controller.js`)
    - 声明 `static targets`、`static values`、`static classes`
@@ -359,25 +707,39 @@ DOM: style.left = `${x}px`, style.top = `${y}px`
 
 4. **无需额外配置** - Importmap 和 Stimulus 自动加载会处理剩下的事情
 
-### 8.2 新增视觉变体的步骤
+### 10.2 新增视觉变体的步骤
 
 1. 在组件的 `VARIANTS` 哈希中添加新条目
 2. 定义对应的 CSS 类名
 3. 在 `initialize` 中验证参数
 4. 模板自动使用新变体，控制器逻辑无需修改
 
-## 9. 代码索引
+### 10.3 data 属性命名速查表
 
-| 组件 | Ruby 类 | 模板 | 控制器 |
-|-----|---------|------|--------|
-| Tabs | `app/components/DS/tabs.rb` | `tabs.html.erb` | `tabs_controller.js` |
-| Dialog | `app/components/DS/dialog.rb` | `dialog.html.erb` | `dialog_controller.js` |
-| Menu | `app/components/DS/menu.rb` | `menu.html.erb` | `menu_controller.js` |
-| Tooltip | `app/components/DS/tooltip.rb` | `tooltip.html.erb` | `tooltip_controller.js` |
-| Button | `app/components/DS/button.rb` | `button.html.erb` | 无 |
-| Disclosure | `app/components/DS/disclosure.rb` | `disclosure.html.erb` | 无 |
+| 用途 | Ruby 写法 | HTML 结果 | JS 访问方式 |
+|-----|----------|----------|------------|
+| 控制器 | `controller: "DS--widget"` | `data-controller="DS--widget"` | 自动实例化 |
+| Target | `DS__widget_target: "name"` | `data-DS--widget-target="name"` | `this.nameTarget` / `this.nameTargets` |
+| Value | `DS__widget_count_value: 5` | `data-DS--widget-count-value="5"` | `this.countValue` |
+| Class | `DS__widget_active_class: "bg-red"` | `data-DS--widget-active-class="bg-red"` | `this.activeClass` / `this.activeClasses` |
+| Action | `action: "click->DS--widget#toggle"` | `data-action="click->DS--widget#toggle"` | 方法 `toggle()` 被调用 |
+
+## 11. 代码索引
+
+| 组件 | Ruby 类 | 模板 | 控制器 | 无 JS 可用性 |
+|-----|---------|------|--------|-------------|
+| Tabs | `app/components/DS/tabs.rb` | `tabs.html.erb` | `tabs_controller.js` | ❌ |
+| Dialog | `app/components/DS/dialog.rb` | `dialog.html.erb` | `dialog_controller.js` | ❌ |
+| Menu | `app/components/DS/menu.rb` | `menu.html.erb` | `menu_controller.js` | ❌ |
+| Tooltip | `app/components/DS/tooltip.rb` | `tooltip.html.erb` | `tooltip_controller.js` | ❌ |
+| Button | `app/components/DS/button.rb` | `button.html.erb` | 无 | ⚠️ |
+| Link | `app/components/DS/link.rb` | `link.html.erb` | 无 | ⚠️ |
+| Disclosure | `app/components/DS/disclosure.rb` | `disclosure.html.erb` | 无 | ✅ |
+| Toggle | `app/components/DS/toggle.rb` | `toggle.html.erb` | 无 | ✅ |
+| Alert | `app/components/DS/alert.rb` | `alert.html.erb` | 无 | ✅ |
 
 **核心配置：**
 - Importmap: `config/importmap.rb:8`
 - Stimulus 入口: `app/javascript/controllers/index.js`
+- Stimulus 应用: `app/javascript/controllers/application.js`
 - 基类: `app/components/design_system_component.rb`
