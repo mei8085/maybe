@@ -413,16 +413,29 @@ end
 
 ## 五、非买卖交易接入链路详解
 
-### 5.1 交易类型与 Entry 类型映射
+### 5.1 两个独立的交易录入入口
 
-| 表单类型 | Entry 类型 | 影响现金 | 影响持仓 |
-|---------|-----------|---------|---------|
+项目中有两个独立的交易录入表单，分别处理不同类型的交易：
+
+| 表单 | 路由 | 控制器 | 用途 |
+|------|------|--------|------|
+| Trades 表单 | `/trades/new` | `TradesController` | 证券买卖、利息、存款取款 |
+| Transactions 表单 | `/transactions/new` | `TransactionsController` | 通用收入/支出，包括分红 |
+
+### 5.2 Trades 表单支持的类型
+
+**Trades 表单实际支持 5 种类型**（来自 `app/views/trades/_form.html.erb`）：
+
+| 表单类型 | 创建的 Entry 类型 | 影响现金 | 影响持仓 |
+|---------|------------------|---------|---------|
 | buy/sell | Trade | ✅ | ✅ |
 | interest | Transaction | ✅ | ❌ |
-| deposit/withdrawal (无对方账户) | Transaction | ✅ | ❌ |
-| deposit/withdrawal (有对方账户) | Transfer (两个 Transaction) | ✅ (双方) | ❌ |
+| deposit/withdrawal（无对方账户） | Transaction | ✅ | ❌ |
+| deposit/withdrawal（有对方账户） | Transfer（两个 Transaction） | ✅（双方） | ❌ |
 
-### 5.2 余额计算中的现金流分类
+> **关键事实**：Trades 表单 **没有 dividend（分红）类型**。分红不通过此表单录入。
+
+### 5.3 余额计算中的现金流分类
 
 **文件位置**: `app/models/balance/base_calculator.rb`
 
@@ -451,42 +464,135 @@ end
 ```
 
 **关键逻辑**:
-- `Transaction` 类型只影响现金流
+- `Transaction` 类型只影响现金流（`txn_inflow_sum` / `txn_outflow_sum`）
 - `Trade` 类型同时影响现金流和非现金流（持仓），且方向相反
-- 利息、分红等非买卖交易作为 `Transaction` 处理，只影响现金
+- **判断标准是 entryable_type，不是业务类型**
+- 因此：利息、分红、费用等，只要是 `Transaction` 类型，现金流计算方式完全相同
 
-### 5.3 利息/分红接入路径
+### 5.4 利息（Interest）接入路径
 
-```
-用户选择 "interest" 类型
-    ↓
-Trade::CreateForm#create_interest_income
-    ↓
-创建 Entry (entryable: Transaction.new)
-    ↓
-entry.save → account.sync_later
-    ↓
-Balance::ForwardCalculator#calculate
-    ↓
-flows_for_date(date) 识别为 transaction?
-    ↓
-计入 cash_inflows / cash_outflows
-    ↓
-derive_cash_balance 更新现金余额
-    ↓
-（不影响持仓，non_cash 无变化）
-```
-
-### 5.4 转账接入路径（关联账户）
+**入口**：Trades 表单 → 选择 "Interest" 类型
 
 ```
-用户选择 "deposit"/"withdrawal" 并指定对方账户
+用户在 /trades/new 选择 "Interest" 类型
+    ↓
+TradesController#create
+    ↓
+Trade::CreateForm#create (type: "interest")
+    ↓
+create_interest_income
+    ├─ name: "Interest payment"（固定名称）
+    ├─ amount: 取负（表示流入）
+    └─ entryable: Transaction.new（无 category）
+    ↓
+entry.save → entry.sync_account_later
+    ↓
+Balance 计算
+    └─ flows_for_date 识别为 transaction?
+        └─ 计入 txn_inflow_sum（现金流入）
+```
+
+**代码实现**（`app/models/trade/create_form.rb:56-73`）：
+```ruby
+def create_interest_income
+  signed_amount = amount.to_d * -1  # 负金额表示收入
+  entry = account.entries.build(
+    name: "Interest payment",       # 固定名称
+    date: date,
+    amount: signed_amount,
+    currency: currency,
+    entryable: Transaction.new      # 无分类
+  )
+  # ...
+end
+```
+
+### 5.5 分红（Dividend）接入路径
+
+**入口**：不通过 Trades 表单，有两种录入方式
+
+#### 方式 1：Plaid 同步（自动识别）
+```
+Plaid 拉取银行交易数据
+    ↓
+PlaidEntry::Processor 处理
+    ↓
+根据交易描述识别 category 为 income_dividends
+    ↓
+创建 Entry (entryable: Transaction.new, category: income_dividends)
+    ↓
+entry.save → entry.sync_account_later
+    ↓
+（后续现金流计算同所有 Transaction 类型）
+```
+
+**分类识别**（`app/models/plaid_account/transactions/category_taxonomy.rb`）：
+```ruby
+income_dividends: {
+  classification: :income,
+  aliases: [ "dividend", "stock income", "dividend income", "dividend earnings" ]
+}
+```
+
+#### 方式 2：手动录入（Transactions 表单）
+```
+用户在 /transactions/new 创建交易
+    ↓
+选择 "Income"（收入）类型
+    ↓
+填写名称（如 "Investment Dividends"）
+    ↓
+选择分类（如 "Investment Income"）
+    ↓
+TransactionsController#create
+    ↓
+创建 Entry (entryable: Transaction.new, category_id: xxx)
+    ↓
+entry.save → entry.sync_account_later
+    ↓
+（后续现金流计算同所有 Transaction 类型）
+```
+
+**代码实现**（`app/models/demo/generator.rb:856-866`）：
+```ruby
+def create_transaction!(account, amount, name, category, date)
+  account.entries.create!(
+    entryable: Transaction.new(category: category),
+    amount: amount,        # 负金额表示收入
+    name: name,            # "Investment Dividends"
+    currency: account.currency,
+    date: date
+  )
+end
+```
+
+### 5.6 利息与分红的关系对比
+
+| 维度 | 利息（Interest） | 分红（Dividend） |
+|------|----------------|----------------|
+| 录入入口 | Trades 表单（`/trades/new`） | Transactions 表单（`/transactions/new`）或 Plaid 同步 |
+| 表单类型选择 | type: "interest" | nature: "inflow" + category 选择 |
+| Entry 名称 | 固定为 "Interest payment" | 用户自定义（如 "Investment Dividends"） |
+| Entry 类型 | Transaction | Transaction |
+| 是否有 category | ❌ 无 | ✅ 有（如 Investment Income） |
+| 现金流计算 | 计入 txn_inflow_sum | 计入 txn_inflow_sum（与利息完全相同） |
+| 是否影响持仓 | ❌ 不影响 | ❌ 不影响 |
+
+**核心结论**：
+- **入口不同**：利息走 Trades 表单的 interest 快捷入口，分红走通用 Transactions 表单
+- **终点相同**：两者最终都创建 `Transaction` 类型的 Entry，在后续余额计算中处理方式完全一致
+- **区别仅在元数据**：利息有固定名称、无分类；分红有自定义名称、有分类
+
+### 5.7 转账接入路径（关联账户）
+
+```
+用户在 Trades 表单选择 "deposit"/"withdrawal" 并指定对方账户
     ↓
 Trade::CreateForm#create_transfer
     ↓
 Transfer::Creator#create
-    ├─ 创建 Transaction (源账户，流出，正金额)
-    ├─ 创建 Transaction (目标账户，流入，负金额)
+    ├─ 创建 Transaction（源账户，流出，正金额）
+    ├─ 创建 Transaction（目标账户，流入，负金额）
     └─ 创建 Transfer 关联两个 Transaction
     ↓
 source_account.sync_later
@@ -495,14 +601,14 @@ destination_account.sync_later
 两个账户各自独立计算余额
 ```
 
-### 5.5 存款/取款接入路径（无关联账户）
+### 5.8 存款/取款接入路径（无关联账户）
 
 ```
-用户选择 "deposit"/"withdrawal" 不指定对方账户
+用户在 Trades 表单选择 "deposit"/"withdrawal" 不指定对方账户
     ↓
 Trade::CreateForm#create_unlinked_transfer
     ↓
-创建 Entry (entryable: Transaction.new)
+创建 Entry（entryable: Transaction.new）
     ↓
 entry.save → account.sync_later
     ↓
@@ -510,6 +616,17 @@ Balance 计算时识别为 transaction?
     ↓
 计入 cash_inflows / cash_outflows
 ```
+
+### 5.9 非买卖交易类型全景
+
+| 业务类型 | 录入入口 | Entry 类型 | 现金流归类 |
+|---------|---------|-----------|-----------|
+| 利息 | Trades 表单 → interest | Transaction | txn_inflow |
+| 分红 | Plaid 同步 或 Transactions 表单 | Transaction | txn_inflow |
+| 存款/取款（关联账户） | Trades 表单 → deposit/withdrawal | Transfer（2x Transaction） | 双方各计 cash 流 |
+| 存款/取款（无关联账户） | Trades 表单 → deposit/withdrawal | Transaction | txn_inflow / txn_outflow |
+| 其他收入 | Transactions 表单 → inflow | Transaction | txn_inflow |
+| 费用支出 | Transactions 表单 → outflow | Transaction | txn_outflow |
 
 ---
 
@@ -699,12 +816,14 @@ end
 
 | 模块 | 文件位置 |
 |------|----------|
-| 交易表单 | `app/models/trade/create_form.rb` |
+| 交易表单逻辑 | `app/models/trade/create_form.rb` |
+| 交易表单视图 | `app/views/trades/_form.html.erb` |
 | 交易模型 | `app/models/trade.rb` |
-| 普通交易 | `app/models/transaction.rb` |
+| 普通交易模型 | `app/models/transaction.rb` |
 | 转账创建器 | `app/models/transfer/creator.rb` |
 | 转账模型 | `app/models/transfer.rb` |
 | 账务条目 | `app/models/entry.rb` |
+| Entry 类型定义 | `app/models/entryable.rb` |
 | 持仓模型 | `app/models/holding.rb` |
 | 正向计算（持仓） | `app/models/holding/forward_calculator.rb` |
 | 反向计算（持仓） | `app/models/holding/reverse_calculator.rb` |
@@ -719,3 +838,6 @@ end
 | 账户同步器 | `app/models/account/syncer.rb` |
 | 同步机制 | `app/models/concerns/syncable.rb` |
 | 交易控制器 | `app/controllers/trades_controller.rb` |
+| Plaid 交易分类 | `app/models/plaid_account/transactions/category_taxonomy.rb` |
+| Plaid 交易处理器 | `app/models/plaid_entry/processor.rb` |
+| Demo 数据生成器 | `app/models/demo/generator.rb` |
