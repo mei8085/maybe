@@ -131,7 +131,50 @@ end
 
 用户在 "忘记密码" 页面提交邮箱地址（`password_resets_controller.rb:11-19`）
 
-### 3.2 链路完整流程
+### 3.2 邮箱查询与归一化的行为边界
+
+**关键代码**（`password_resets_controller.rb:12`）：
+```ruby
+if (user = User.find_by(email: params[:email]))
+```
+
+⚠️ **重要边界：控制器直接使用原始邮箱查询，不经过模型归一化！**
+
+#### 3.2.1 模型层的邮箱归一化
+
+模型定义了自动归一化规则（`user.rb:18-19`）：
+```ruby
+normalizes :email, with: ->(email) { email.strip.downcase }
+normalizes :unconfirmed_email, with: ->(email) { email&.strip&.downcase }
+```
+
+**归一化触发时机**：
+- ✅ 模型 `save` / `update` 时自动调用
+- ✅ 创建用户时
+- ✅ 修改邮箱时
+- ❌ **`find_by` 查询时不会自动应用**
+
+#### 3.2.2 行为边界分析
+
+| 操作 | 邮箱值 | 数据库存储 | 查询结果 |
+|------|--------|-----------|---------|
+| 注册 "User@Example.com" | 原始输入 | `user@example.com`（归一化后） | N/A |
+| 重置密码输入 "User@Example.com" | `"User@Example.com"` | `user@example.com` | ✅ 匹配（PostgreSQL 字符串比较不区分大小写） |
+| 重置密码输入 " user@example.com "（带空格） | `" user@example.com "` | `user@example.com` | ❌ **不匹配**（空格导致精确比较失败） |
+| 重置密码输入 "USER@EXAMPLE.COM"（全大写） | `"USER@EXAMPLE.COM"` | `user@example.com` | ✅ 匹配（PostgreSQL CI 特性） |
+
+**边界风险**：
+用户注册时邮箱前后的空格会被自动去除，但重置密码时输入带空格的邮箱会查询不到用户，且由于统一响应设计，用户得不到任何提示。
+
+**设计权衡**：
+- 优点：控制器逻辑简单，不需要复制归一化逻辑
+- 缺点：存在边缘 case 导致真实用户收不到重置邮件
+- 建议优化：在控制器查询前手动应用归一化：
+  ```ruby
+  if (user = User.find_by(email: params[:email].to_s.strip.downcase))
+  ```
+
+### 3.3 链路完整流程
 
 ```
 用户提交邮箱 → 查找用户 → 生成签名token → 投递邮件队列 → 异步发送邮件 →
@@ -320,6 +363,10 @@ Rails 生成的 token 结构：
 | 失效原因 | `unconfirmed_email` 变为 `nil` | `password_salt` 重新生成 |
 | 操作幂等性 | ✅ 多次点击不产生副作用 | ⚠️ edit 幂等，update 非幂等 |
 | GET 请求是否修改状态 | ✅ 是（确认邮箱） | ❌ 否（仅展示表单） |
+| Self-hosted 跳过分支 | ✅ 支持（关闭确认时直接更新） | ❌ 无特殊分支 |
+| 对不存在账号的处理 | N/A | 静默忽略，统一重定向到 pending 页 |
+| 防账号枚举 | N/A | ✅ 邮箱存在与否响应完全相同 |
+| 专属限流规则 | N/A | ❌ 未配置（仅通用 API 限流） |
 
 ---
 
