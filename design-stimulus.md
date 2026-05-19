@@ -388,7 +388,7 @@ end
 ```ruby
 def dialog_outer_classes
   variant_classes = if drawer?
-    "items-end justify-end"  # drawer 从底部滑入
+    "items-end justify-end"  # drawer 右下角对齐
   else
     "items-center justify-center"  # modal 居中显示
   end
@@ -635,7 +635,15 @@ close() {
 | 变体 | 布局类 | 尺寸类 | 视觉效果 | reload_on_close | 关闭后行为 |
 |-----|--------|--------|---------|----------------|-----------|
 | `modal` | `items-center justify-center` | `max-h-full lg:max-w-[550px]` | 屏幕中央的模态框 | `false` | 直接关闭 |
-| `drawer` | `items-end justify-end` | `lg:w-[550px] h-full` | 右侧滑入的抽屉 | `true` | 关闭后刷新页面 |
+| `drawer` | `items-end justify-end` | `lg:w-[550px] h-full` | 右下角对齐的全高面板 | `true` | 关闭后刷新页面 |
+
+**Drawer 行为边界说明：**
+
+源码中 `drawer` 变体**不包含任何过渡动画或滑入效果**。其行为边界：
+- **仅通过 CSS 类控制静态布局**：`items-end justify-end` 使内容靠右下角对齐，`h-full` 使其占满整个视口高度
+- **无 transition/transform 动画类**：查看 dialog 相关的所有 CSS 类，未发现 `transition`、`translate`、`duration` 等动画属性
+- **打开/关闭行为与 Modal 完全相同**：都通过原生 `<dialog>` 的 `showModal()` / `close()` API 实现，无额外的 JS 动画逻辑
+- **实际视觉效果**：大屏下是一个右侧固定宽度（550px）的全高面板，小屏下是全屏对话框，打开时直接显示，无滑入动画
 
 ## 7. 组件协作流程图
 
