@@ -755,7 +755,33 @@ DOM: style.left = `${x}px`, style.top = `${y}px`
 - 无对应的 Stimulus 控制器
 - 变体系统仅影响 CSS 类
 - 可作为子组件被其他组件（如 Dialog、Menu）使用
-- 支持 `confirm` 选项，通过 `turbo-confirm` 与 Rails UJS 集成
+- 支持 `confirm` 选项，通过 `turbo-confirm` 与 Turbo 表单确认机制集成
+
+**turbo-confirm 完整证据链：**
+
+1. **Ruby 侧注入 data 属性** (`app/components/DS/button.rb:28-30`)：
+   ```ruby
+   if confirm.present?
+     data = data.merge(turbo_confirm: confirm.to_data_attribute)
+   end
+   ```
+   生成的 HTML：`<button data-turbo-confirm="Are you sure?">...</button>`
+
+2. **Turbo 框架消费**：Turbo 内置的表单处理逻辑会检测 `data-turbo-confirm` 属性，拦截表单提交或链接点击。
+
+3. **自定义确认对话框** (`app/javascript/controllers/application.js:9-17`)：
+   ```javascript
+   Turbo.config.forms.confirm = (data) => {
+     const confirmDialogController = application.getControllerForElementAndIdentifier(
+       document.getElementById("confirm-dialog"),
+       "confirm-dialog",
+     );
+     return confirmDialogController.handleConfirm(data);
+   };
+   ```
+   项目将 Turbo 默认的浏览器 `confirm()` 替换为自定义的 `confirm-dialog` 控制器实现。
+
+4. **对话框控制器处理** (`confirm_dialog_controller.js:8-25`)：`handleConfirm()` 方法返回 Promise，用户确认后 resolve 为 `true`，取消则为 `false`，Turbo 根据结果决定是否继续提交。
 
 ### 9.4 DS::Disclosure - 原生 HTML 优先
 
