@@ -485,7 +485,7 @@ create_interest_income
     ├─ amount: 取负（表示流入）
     └─ entryable: Transaction.new（无 category）
     ↓
-entry.save → entry.sync_account_later
+entry.save → account.sync_later
     ↓
 Balance 计算
     └─ flows_for_date 识别为 transaction?
@@ -521,7 +521,7 @@ PlaidEntry::Processor 处理
     ↓
 创建 Entry (entryable: Transaction.new, category: income_dividends)
     ↓
-entry.save → entry.sync_account_later
+entry.save → account.sync_later
     ↓
 （后续现金流计算同所有 Transaction 类型）
 ```
@@ -548,7 +548,7 @@ TransactionsController#create
     ↓
 创建 Entry (entryable: Transaction.new, category_id: xxx)
     ↓
-entry.save → entry.sync_account_later
+entry.save → account.sync_later
     ↓
 （后续现金流计算同所有 Transaction 类型）
 ```
