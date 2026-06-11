@@ -226,7 +226,7 @@ account.broadcast_refresh
 ```
 [app/models/account/sync_complete_event.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/models/account/sync_complete_event.rb#L36)
 
-详见第六章"morph 刷新"。
+详见第七章"morph 刷新"。
 
 ### 4.7 自定义动作 `redirect` - 页面跳转
 
@@ -358,6 +358,45 @@ after_update_commit -> { broadcast_update_to chat }, if: :broadcast?
 
 `broadcast_update_to chat` 省略了 `target` 参数。turbo-rails 的默认行为是：**以模型的 `dom_id` 作为 target**。
 
+**`dom_id` 生成规则**：
+- 对于 `Message` 模型的 id=123 的记录，`dom_id(message)` 生成 `"message_123"`
+- 对于 `AssistantMessage` 模型的 id=42 的记录，`dom_id(assistant_message)` 生成 `"assistant_message_42"`
+- 命名规则：`模型名复数形式_id`，全部小写，下划线分隔
+
+**消息 partial 的最外层 div 有对应的 id 属性**，例如：
+```erb
+<div id="<%= dom_id message %>">
+  <!-- 消息内容 -->
+</div>
+```
+
+**完整定位链路图**：
+
+```
+after_update_commit 触发
+        │
+        ▼
+broadcast_update_to chat（无显式 target）
+        │
+        ├─ turbo-rails 自动计算 target = dom_id(self)
+        │  （如 AssistantMessage id=42 → "assistant_message_42"）
+        │
+        ├─ turbo-rails 自动渲染内容 = to_partial_path 对应的 partial
+        │  （如 "assistant_messages/assistant_message"）
+        │
+        ▼
+Turbo Stream 消息发送到客户端
+        │
+        ▼
+客户端通过 document.getElementById("assistant_message_42") 查找
+        │
+        ▼
+找到 <div id="assistant_message_42">（与 partial 外层 id 匹配）
+        │
+        ▼
+执行 update 动作（替换 innerHTML）
+```
+
 具体流程：
 
 1. `AssistantMessage#append_text!(text)` 调用 `save!` 触发 `after_update_commit`
@@ -377,7 +416,7 @@ after_update_commit -> { broadcast_update_to chat }, if: :broadcast?
 
 1. 用户在聊天表单提交 → `ChatsController#update` 或 `MessagesController#create`
 2. 创建 `UserMessage` 记录，触发 `after_create_commit`
-3. `broadcast_append_to chat, target: "messages"` 发送 append 动作
+3. `broadcast_append_to chat, target: "messages"` 发送 append 动作（**显式指定 target 为 `"messages"`**）
 4. 客户端在 `<div id="messages">` 末尾追加 `user_messages/_user_message.html.erb` 渲染的 DOM 节点
 5. DOM 落点：`<div id="user_message_1">` （由 [dom_id(user_message)](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/user_messages/_user_message.html.erb#L3) 生成）
 
@@ -433,7 +472,7 @@ turbo-rails 对 `broadcast_update_to` / `broadcast_replace_to` 省略 `target` �
 
 ## 七、Morph 刷新机制
 
-### 6.1 配置
+### 7.1 配置
 
 ```erb
 <%= turbo_refreshes_with method: :morph, scroll: :preserve %>
@@ -444,7 +483,7 @@ turbo-rails 对 `broadcast_update_to` / `broadcast_replace_to` 省略 `target` �
 - `<meta name="turbo-refresh-method" content="morph">` — 使用 idiomorph 算法做增量 DOM diff
 - `<meta name="turbo-refresh-scroll" content="preserve">` — 刷新时保持滚动位置
 
-### 6.2 Morph 刷新的触发方式
+### 7.2 Morph 刷新的触发方式
 
 #### 触发方式一：`broadcast_refresh`（WebSocket 推送）
 
@@ -483,7 +522,7 @@ ActivityDate 和 ActivityFeed 组件同理：
 - DOM 节点最大程度复用
 - 滚动位置保持
 
-### 6.3 Morph 与 replace/update 的本质区别
+### 7.3 Morph 与 replace/update 的本质区别
 
 | 维度 | replace / update | morph refresh |
 |------|------------------|---------------|
@@ -496,11 +535,11 @@ ActivityDate 和 ActivityFeed 组件同理：
 
 ---
 
-## 七、自定义 Turbo.visit 的触发条件
+## 八、自定义 Turbo.visit 的触发条件
 
 项目中共有 4 处 `Turbo.visit()` 调用，各有不同的触发条件：
 
-### 7.1 Turbo Stream redirect 动作
+### 8.1 Turbo Stream redirect 动作
 
 ```javascript
 Turbo.StreamActions.redirect = function () {
@@ -515,7 +554,7 @@ Turbo.StreamActions.redirect = function () {
 
 **使用场景**: 创建/更新资源后需要跳转到新页面时，如 [stream_extensions.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/concerns/stream_extensions.rb#L18)、[categories_controller.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/categories_controller.rb#L28)、[holdings_controller.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/holdings_controller.rb#L21)
 
-### 7.2 SelectableLink Controller —— URL 参数变更导航
+### 8.2 SelectableLink Controller —— URL 参数变更导航
 
 ```javascript
 handleChange(event) {
@@ -533,7 +572,7 @@ handleChange(event) {
 
 **使用场景**: 下拉选择器切换筛选条件（如账户类型、时间范围等）
 
-### 7.3 TradeForm Controller —— Frame 内局部导航
+### 8.3 TradeForm Controller —— Frame 内局部导航
 
 ```javascript
 async changeType(event) {
@@ -550,7 +589,7 @@ async changeType(event) {
 
 **使用场景**: 在模态框中切换交易类型时，重新加载对应类型的表单
 
-### 7.4 Dialog Controller —— 关闭后刷新
+### 8.4 Dialog Controller —— 关闭后刷新
 
 ```javascript
 close() {
@@ -568,7 +607,7 @@ close() {
 
 **使用场景**: 模态框关闭后需要刷新底层页面数据时（如编辑后）
 
-### 7.5 Turbo.visit 各调用方式对比
+### 8.5 Turbo.visit 各调用方式对比
 
 | 调用方式 | `frame` 参数 | 导航范围 | URL 变更 |
 |----------|-------------|----------|----------|
@@ -578,9 +617,9 @@ close() {
 
 ---
 
-## 八、强制 Reload 机制
+## 九、强制 Reload 机制
 
-### 8.1 `data-turbo-track="reload"`
+### 9.1 `data-turbo-track="reload"`
 
 ```erb
 <%= stylesheet_link_tag "tailwind", "data-turbo-track": "reload" %>
@@ -591,7 +630,7 @@ close() {
 
 本项目将 Tailwind CSS 样式表标记为 `track: reload`，确保部署新版本后用户能获取到更新后的样式。
 
-### 8.2 `window.location.reload()`
+### 9.2 `window.location.reload()`
 
 ```erb
 onclick: "window.location.reload()"
@@ -600,7 +639,7 @@ onclick: "window.location.reload()"
 
 这是唯一的 `location.reload()` 调用，出现在 Redis 配置错误页面，不属于核心业务流程。
 
-### 8.3 Dialog 关闭后刷新
+### 9.3 Dialog 关闭后刷新
 
 ```javascript
 if (this.reloadOnCloseValue) {
@@ -616,15 +655,159 @@ if (this.reloadOnCloseValue) {
 
 ---
 
-## 九、降级到整页跳转的触发场景（完整版）
+## 十、移动端授权页强制刷新
 
-### 9.1 JS 环境不可用
+### 10.1 概述
+
+在 Doorkeeper OAuth 授权流程中，移动端 WebView 场景下存在三重强制刷新/绕过 Turbo 的机制：
+1. 页面级：`turbo-visit-control="reload"` meta 标签
+2. 表单级：`data-turbo="false"` 禁用 Turbo 表单提交
+3. JS 级：`window.location.href = url` 直接浏览器跳转
+
+这三层机制共同确保移动端 OAuth 流程的可靠性，避免 Turbo 导航干扰授权回调的 URL Scheme 跳转。
+
+### 10.2 `turbo-visit-control="reload"` 的触发条件
+
+**代码位置**：[app/views/doorkeeper/authorizations/new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/new.html.erb#L1-L7)
+
+```erb
+<% if params[:redirect_uri]&.start_with?('maybeapp://') || params[:display] == 'mobile' %>
+  <meta name="turbo-visit-control" content="reload">
+<% end %>
+```
+
+**触发条件（满足任一即生效）**：
+
+1. **`redirect_uri` 以 `maybeapp://` 开头**
+   - 表示第三方 App 使用自定义 URL Scheme 作为回调地址
+   - Turbo 的 fetch/XHR 无法处理自定义协议的跳转，必须走完整浏览器导航
+
+2. **`display == 'mobile'`**
+   - 表示移动端展示模式
+   - 移动端 WebView 环境下 Turbo 行为可能不稳定，强制使用传统页面加载
+
+**生效时机**：
+- 当 Turbo 导航到包含此 meta 标签的页面时，检测到 `turbo-visit-control="reload"`
+- Turbo 会放弃 morph/替换渲染，转而执行完整的 `location.reload()` 级别页面加载
+- 本质：从 Turbo 导航降级为完整浏览器页面加载
+
+**作用范围**：页面级，影响整个页面的导航进入方式
+
+### 10.3 `data-turbo="false"` 表单禁用 Turbo 的时机
+
+**代码位置**：[app/views/doorkeeper/authorizations/new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/new.html.erb)
+
+触发条件与 `turbo-visit-control` 完全相同：
+```erb
+<% turbo = !(params[:redirect_uri]&.start_with?('maybeapp://') || params[:display] == 'mobile') %>
+<%= form_for @authorization, url: authorization_path, method: :post, data: { turbo: turbo } do |f| %>
+```
+
+**具体生效时机**：
+
+1. **表单提交时**：如果 `data-turbo="false"`，Turbo 不拦截表单提交
+2. **浏览器原生提交**：表单以传统 `application/x-www-form-urlencoded` 方式提交
+3. **服务端处理**：控制器正常处理 POST 请求
+4. **重定向响应**：服务端返回 302 重定向到 `redirect_uri`
+5. **浏览器跟随重定向**：浏览器原生处理重定向，遇到 `maybeapp://` 协议时触发 App 唤起
+
+**为什么需要关闭 Turbo 表单提交**：
+- Turbo 表单提交使用 fetch API，响应通过 JavaScript 处理
+- fetch 无法触发自定义 URL Scheme（`maybeapp://`）的 App 唤起
+- 必须走浏览器原生的表单提交 → 302 重定向 → URL Scheme 唤起链路
+
+### 10.4 `form_post` 模式的特殊处理
+
+**代码位置**：[app/views/doorkeeper/authorizations/form_post.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/form_post.html.erb)
+
+`form_post` 是 OAuth 2.0 的一种响应模式，授权码通过自动提交的表单 POST 到回调地址。
+
+```erb
+<%= form_tag @redirect_uri, method: :post, data: { turbo: false } do %>
+  <% @form_post_params.each do |key, value| %>
+    <%= hidden_field_tag key, value %>
+  <% end %>
+<% end %>
+```
+
+**`data-turbo="false"` 的必要性**：
+- 页面加载后立即自动提交表单（JS 触发）
+- 如果 Turbo 拦截，会以 fetch 方式提交，跨域时可能被 CORS 阻止
+- 禁用 Turbo 确保表单使用浏览器原生提交，保证回调地址能正确接收授权码
+
+### 10.5 完整流程时序图（移动端授权）
+
+```
+用户点击授权
+     │
+     ▼
+Turbo 导航到 /oauth/authorize
+     │
+     ├─ 检测到 turbo-visit-control="reload"
+     │  └─ 降级为完整页面加载（reload）
+     │
+     ▼
+页面完全加载（无 Turbo 上下文遗留）
+     │
+     ▼
+用户点击"授权"按钮
+     │
+     ├─ 表单 data-turbo="false"
+     │  └─ 浏览器原生提交，非 fetch
+     │
+     ▼
+服务端验证授权，返回 302 重定向到 maybeapp://...
+     │
+     ▼
+浏览器原生处理重定向
+     │
+     ├─ 检测到 maybeapp:// 协议
+     │  └─ 唤起移动 App
+     │
+     ▼
+App 接收授权码，完成 OAuth 流程
+```
+
+### 10.6 四种整页跳转方式的界限对比
+
+| 方式 | 触发层面 | 触发方式 | Turbo 参与度 | 渲染方式 | 白屏闪烁 | Stimulus 状态 | 典型使用场景 |
+|------|---------|---------|------------|---------|---------|--------------|-------------|
+| **`data-turbo-frame="_top"`** | 链接/表单属性 | `data: { turbo_frame: :_top }` | 参与（morph 渲染） | 整页 morph diff | 无 | 尽量保留 | 模态框/抽屉关闭后跳转到整页 |
+| **`action(:redirect)`** | Turbo Stream 动作 | `turbo_stream.action(:redirect, url)` | 参与（`Turbo.visit`） | 整页 morph diff | 无 | 尽量保留 | 创建/更新资源后跳转 |
+| **`turbo-visit-control="reload"`** | 页面级 meta 标签 | `<meta name="turbo-visit-control" content="reload">` | 部分参与（检测后降级） | 完整页面 reload | 有 | 全部重建 | 移动端授权页、需完全重置状态的页面 |
+| **`window.location.href` / `data-turbo="false"`** | JS 级/表单级 | `window.location.href = url` 或 `data-turbo="false"` | 不参与（完全绕过） | 完整页面加载 | 有 | 全部重建 | 自定义 URL Scheme 跳转、Plaid 回调、跨域 |
+
+### 10.7 `data-turbo="false"` 与其他方式的本质区别
+
+**`data-turbo="false"`（表单禁用 Turbo）**：
+- 作用时机：**表单提交时**
+- 行为：Turbo 完全不拦截，浏览器原生提交表单
+- 后续：服务端 302 重定向由浏览器原生处理，可触发 URL Scheme
+- 场景：OAuth 授权表单、需原生跳转的表单
+
+**`turbo-visit-control="reload"`（页面级 reload）**：
+- 作用时机：**Turbo 导航进入页面时**
+- 行为：Turbo 检测到 meta 标签后，主动降级为完整 reload
+- 后续：页面完全重新加载，所有 JS 状态重置
+- 场景：移动端授权页（确保无 Turbo 上下文干扰后续表单提交）
+
+**`window.location.href`（JS 直接跳转）**：
+- 作用时机：**JavaScript 运行时**
+- 行为：直接操作浏览器地址栏，完全绕过 Turbo
+- 后续：浏览器原生导航，可触发 URL Scheme
+- 场景：Plaid Link 回调、自定义协议跳转
+
+---
+
+## 十一、降级到整页跳转的触发场景（完整版）
+
+### 11.1 JS 环境不可用
 
 **触发条件**: 浏览器禁用 JavaScript、Turbo 库加载失败、旧版浏览器
 
 **降级行为**: 所有请求走传统 HTTP，服务器返回完整 HTML，浏览器整页刷新
 
-### 9.2 `turbo_frame: "_top"` 显式顶层导航
+### 11.2 `turbo_frame: "_top"` 显式顶层导航
 
 **触发条件**: 链接或表单声明 `data-turbo-frame="_top"`
 
@@ -632,7 +815,7 @@ if (this.reloadOnCloseValue) {
 
 **项目中共 33 处使用**
 
-### 9.3 Turbo Stream `action(:redirect)` 自定义重定向
+### 11.3 Turbo Stream `action(:redirect)` 自定义重定向
 
 **触发条件**: 服务端返回 `turbo_stream.action(:redirect, url)`
 
@@ -640,25 +823,25 @@ if (this.reloadOnCloseValue) {
 
 **使用场景**: 资源创建/更新后需跳转（[stream_extensions.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/concerns/stream_extensions.rb)、[categories_controller.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/categories_controller.rb#L28)、[family_merchants_controller.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/family_merchants_controller.rb#L22)、[holdings_controller.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/holdings_controller.rb#L21)）
 
-### 9.4 Turbo Frame 响应不匹配
+### 11.4 Turbo Frame 响应不匹配
 
 **触发条件**: 请求由 `<turbo-frame>` 发起，响应中无匹配 id 的 `<turbo-frame>`
 
 **降级行为**: 自动升级为整页导航
 
-### 9.5 表单验证失败（422 Unprocessable Entity）
+### 11.5 表单验证失败（422 Unprocessable Entity）
 
 **触发条件**: 控制器返回 `status: :unprocessable_entity`
 
 **降级行为**: Turbo 将响应内容渲染到当前页面（替换 `<body>` 或 Frame 内容），**不执行跳转**
 
-### 9.6 非 Turbo 格式的请求/响应
+### 11.6 非 Turbo 格式的请求/响应
 
 **触发条件**: 直接访问 URL、页面刷新（F5）、无 Turbo 请求头
 
 **降级行为**: 传统整页加载
 
-### 9.7 特殊状态码
+### 11.7 特殊状态码
 
 | 状态码 | 行为 |
 |--------|------|
@@ -666,29 +849,53 @@ if (this.reloadOnCloseValue) {
 | **401 Unauthorized** | 触发登录页整页跳转 |
 | **404 / 500** | 整页错误页面 |
 
-### 9.8 `data-turbo-track="reload"` 触发强制 reload
+### 11.8 `data-turbo-track="reload"` 触发强制 reload
 
 **触发条件**: Turbo 导航时检测到标记元素的 `href`/`src` 发生变化
 
 **降级行为**: 从 morph 渲染降级为完整页面 reload（`location.reload()`）
 
-### 9.9 Turbo Stream 目标元素不存在
+### 11.9 Turbo Stream 目标元素不存在
 
 **触发条件**: 推送消息的 `target` 在当前页面不存在
 
 **降级行为**: **静默忽略**，不触发整页跳转，但局部刷新失效
 
-### 9.10 跨域请求
+### 11.10 跨域请求
 
 **触发条件**: 导航到不同域名
 
 **降级行为**: 浏览器传统导航
 
+### 11.11 `turbo-visit-control="reload"` 页面级强制 reload
+
+**触发条件**: 页面包含 `<meta name="turbo-visit-control" content="reload">`
+
+**降级行为**: Turbo 检测到后主动执行完整页面 reload，从 morph 渲染降级为完整浏览器加载
+
+**使用场景**: 移动端 OAuth 授权页（[new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/new.html.erb)）
+
+### 11.12 `data-turbo="false"` 表单级禁用 Turbo
+
+**触发条件**: 表单设置 `data-turbo="false"`
+
+**降级行为**: Turbo 不拦截表单提交，走浏览器原生表单提交 → 302 重定向链路
+
+**使用场景**: OAuth 授权表单、form_post 模式（[new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/new.html.erb)、[form_post.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/form_post.html.erb)）
+
+### 11.13 `window.location.href` JS 级直接跳转
+
+**触发条件**: JavaScript 直接设置 `window.location.href` 或调用 `location.reload()`
+
+**降级行为**: 完全绕过 Turbo，浏览器原生导航
+
+**使用场景**: Plaid Link 回调（[plaid_controller.js](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/javascript/controllers/plaid_controller.js)）、Redis 配置错误页
+
 ---
 
-## 十、典型流程分析
+## 十二、典型流程分析
 
-### 10.1 成功的局部刷新流程（交易更新）
+### 12.1 成功的局部刷新流程（交易更新）
 
 1. 用户在 drawer 中编辑交易信息，提交表单
 2. Turbo 拦截表单提交，AJAX 发送请求（`Accept: text/vnd.turbo-stream.html`）
@@ -705,7 +912,7 @@ if (this.reloadOnCloseValue) {
    - 通过 `id="entry_123"` 找到 `<turbo-frame>` → 整体替换
    - 向 `id="notification-tray"` 追加通知
 
-### 10.2 Morph 刷新流程（账户同步完成）
+### 12.2 Morph 刷新流程（账户同步完成）
 
 1. 后台同步完成后调用 `account.broadcast_sync_complete`
 2. `Account::SyncCompleteEvent#broadcast` 执行：
@@ -714,7 +921,7 @@ if (this.reloadOnCloseValue) {
 3. 客户端收到 `<turbo-stream action="refresh">` → `Turbo.session.refresh()`
 4. 客户端 fetch 当前页面完整 HTML → idiomorph diff → 增量更新 DOM → 保持滚动位置
 
-### 10.3 Frame 内导航流程（模态框切换交易类型）
+### 12.3 Frame 内导航流程（模态框切换交易类型）
 
 1. 用户在 modal 中选择交易类型（触发 `change` 事件）
 2. `trade_form_controller.js` 调用 `Turbo.visit(url, { frame: "modal" })`
@@ -722,7 +929,7 @@ if (this.reloadOnCloseValue) {
 4. 服务端返回包含 `<turbo-frame id="modal">` 的 HTML
 5. 仅 modal frame 内容被替换，页面其余部分不变
 
-### 10.4 顶层导航流程（转账表单提交）
+### 12.4 顶层导航流程（转账表单提交）
 
 1. 用户在 drawer 中提交转账表单（`data-turbo-frame="_top"`）
 2. Turbo 对整页发起导航请求
@@ -731,9 +938,9 @@ if (this.reloadOnCloseValue) {
 
 ---
 
-## 十一、总结
+## 十三、总结
 
-### 11.1 四种刷新/导航模式对比
+### 13.1 四种刷新/导航模式对比
 
 | 模式 | 触发方式 | 作用范围 | 服务端渲染量 | Stimulus 影响 |
 |------|---------|----------|-------------|--------------|
@@ -742,7 +949,7 @@ if (this.reloadOnCloseValue) {
 | **Frame 导航** | `turbo_frame: "modal"/"drawer"` | 单个 frame | 中（frame 区域） | frame 内 controller 重连 |
 | **整页跳转** | `_top` / `action(:redirect)` / 不匹配 | 整页 | 大（整页 HTML） | 全部重建（morph 时尽量保留） |
 
-### 11.2 降级场景分类
+### 13.2 降级场景分类
 
 | 类别 | 触发场景 | 降级行为 |
 |------|----------|----------|
@@ -756,10 +963,13 @@ if (this.reloadOnCloseValue) {
 | **错误状态码** | 401/404/500 | 整页错误页面 |
 | **目标不存在** | Turbo Stream target 未找到 | 静默忽略 |
 | **跨域请求** | 不同域名 | 浏览器传统导航 |
+| **页面级强制 reload** | `turbo-visit-control="reload"` | 完整页面 reload |
+| **表单级禁用 Turbo** | `data-turbo="false"` | 浏览器原生表单提交 |
+| **JS 级直接跳转** | `window.location.href` | 完全绕过 Turbo |
 
 ---
 
-## 十二、核心代码索引
+## 十四、核心代码索引
 
 | 模块 | 文件路径 |
 |------|----------|
@@ -789,3 +999,17 @@ if (this.reloadOnCloseValue) {
 | 聊天 Helper（chat_frame） | [chats_helper.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/helpers/chats_helper.rb) |
 | Syncable concern | [syncable.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/models/concerns/syncable.rb) |
 | 交易控制器 | [transactions_controller.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/transactions_controller.rb) |
+| Assistant 核心逻辑 | [assistant.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/models/assistant.rb) |
+| AI 响应流式处理 | [responder.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/models/assistant/responder.rb) |
+| AssistantMessage partial | [_assistant_message.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/assistant_messages/_assistant_message.html.erb) |
+| UserMessage partial | [_user_message.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/user_messages/_user_message.html.erb) |
+| 思考指示器 partial | [_thinking_indicator.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/chats/_thinking_indicator.html.erb) |
+| 聊天错误提示 partial | [_error.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/chats/_error.html.erb) |
+| Plaid 银行连接 Controller | [plaid_controller.js](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/javascript/controllers/plaid_controller.js) |
+| Plaid Items 控制器 | [plaid_items_controller.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/controllers/plaid_items_controller.rb) |
+| Doorkeeper 授权页（移动端） | [authorizations/new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/new.html.erb) |
+| Doorkeeper form_post 模板 | [authorizations/form_post.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/doorkeeper/authorizations/form_post.html.erb) |
+| Doorkeeper 布局 | [layouts/doorkeeper/application.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/layouts/doorkeeper/application.html.erb) |
+| Doorkeeper 配置 | [config/initializers/doorkeeper.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/config/initializers/doorkeeper.rb) |
+| 移动设备模型 | [mobile_device.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/models/mobile_device.rb) |
+| Onboarding Controller | [onboarding_controller.js](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/javascript/controllers/onboarding_controller.js) |
