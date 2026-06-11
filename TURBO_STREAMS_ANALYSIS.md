@@ -336,7 +336,102 @@ Frame 骨架定义在布局文件：
 
 ---
 
-## 六、Morph 刷新机制
+## 六、聊天消息实时更新链路
+
+### 6.1 消息模型的两种广播回调
+
+[message.rb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/models/message.rb#L13-L14) 定义了两个核心广播回调：
+
+```ruby
+after_create_commit -> { broadcast_append_to chat, target: "messages" }, if: :broadcast?
+after_update_commit -> { broadcast_update_to chat }, if: :broadcast?
+```
+
+两者的关键区别：
+
+| 回调 | 动作 | 显式 target | 语义 |
+|------|------|------------|------|
+| `after_create_commit` | `append` | `"messages"` | 在消息列表末尾追加新消息节点 |
+| `after_update_commit` | `update` | **无** | 更新已存在的消息节点内容 |
+
+### 6.2 `broadcast_update_to chat` 无显式 target 时的定位机制
+
+`broadcast_update_to chat` 省略了 `target` 参数。turbo-rails 的默认行为是：**以模型的 `dom_id` 作为 target**。
+
+具体流程：
+
+1. `AssistantMessage#append_text!(text)` 调用 `save!` 触发 `after_update_commit`
+2. turbo-rails 执行 `broadcast_update_to chat`，由于无显式 target，自动使用 `dom_id(self)` 即 `"assistant_message_42"` 作为 target
+3. 同时，turbo-rails 自动渲染该模型的 partial（`assistant_messages/assistant_message`）作为更新内容
+4. 客户端收到 Turbo Stream 消息：
+   ```xml
+   <turbo-stream action="update" target="assistant_message_42">
+     <template>... 重新渲染的 partial 内容 ...</template>
+   </turbo-stream>
+   ```
+5. 客户端通过 `document.getElementById("assistant_message_42")` 定位 DOM 节点，执行 `update`（替换 innerHTML）
+
+### 6.3 消息从创建到 DOM 落地的完整链路
+
+#### 阶段一：用户发送消息
+
+1. 用户在聊天表单提交 → `ChatsController#update` 或 `MessagesController#create`
+2. 创建 `UserMessage` 记录，触发 `after_create_commit`
+3. `broadcast_append_to chat, target: "messages"` 发送 append 动作
+4. 客户端在 `<div id="messages">` 末尾追加 `user_messages/_user_message.html.erb` 渲染的 DOM 节点
+5. DOM 落点：`<div id="user_message_1">` （由 [dom_id(user_message)](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/user_messages/_user_message.html.erb#L3) 生成）
+
+#### 阶段二：AI 开始思考
+
+1. `UserMessage#request_response_later` 调度 `AssistantResponseJob`
+2. `Assistant#respond_to` 开始执行，调用 `update_thinking("Thinking...")`
+3. `chat.broadcast_update target: "thinking-indicator"` 发送 update 动作
+4. 客户端更新 `<div id="thinking-indicator">` 的内容
+5. [thinking_indicator.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/chats/_thinking_indicator.html.erb#L3) 渲染思考提示
+
+#### 阶段三：AI 流式响应（逐 token 追加）
+
+1. LLM 流式回调触发 `assistant_message.append_text!(text)`
+2. 每次 `save!` 触发 `after_update_commit`
+3. `broadcast_update_to chat` 发送 update 动作，target 自动为 `"assistant_message_42"`
+4. 客户端更新 `<div id="assistant_message_42">` 的 innerHTML
+5. [assistant_message.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/assistant_messages/_assistant_message.html.erb#L3) 重新渲染，包含累积的全部文本
+
+**关键细节**：首次 token 到达时，先执行 `stop_thinking`（`broadcast_remove target: "thinking-indicator"` 移除思考指示器），然后创建 `AssistantMessage` 记录。
+
+#### 阶段四：响应完成或出错
+
+- **成功**：`chat.update_latest_response!(response_id)` 更新最新响应 ID
+- **失败**：`chat.add_error(e)` 追加错误提示（`broadcast_append target: "messages"`），用户可点击 Retry
+
+### 6.4 消息 DOM ID 映射表
+
+| 模型类 | dom_id 示例 | 视图 Partial | DOM 元素 |
+|--------|------------|-------------|----------|
+| `UserMessage` | `"user_message_1"` | [user_messages/_user_message.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/user_messages/_user_message.html.erb#L3) | `<div id="user_message_1">` |
+| `AssistantMessage` | `"assistant_message_42"` | [assistant_messages/_assistant_message.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/assistant_messages/_assistant_message.html.erb#L3) | `<div id="assistant_message_42">` |
+| 思考指示器 | `"thinking-indicator"` | [chats/_thinking_indicator.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/chats/_thinking_indicator.html.erb#L3) | `<div id="thinking-indicator">` |
+| 错误提示 | `"chat-error"` | [chats/_error.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/6-maybe/app/views/chats/_error.html.erb#L3) | `<div id="chat-error">` |
+
+### 6.5 无显式 target 的通用规则
+
+turbo-rails 对 `broadcast_update_to` / `broadcast_replace_to` 省略 `target` 时的默认行为：
+
+```
+默认 target = dom_id(模型实例)
+默认内容   = 渲染模型的 to_partial_path 对应的 partial
+```
+
+这意味着：
+- `broadcast_update_to chat` 等价于 `broadcast_update_to chat, target: dom_id(self), partial: to_partial_path`
+- 对于 `AssistantMessage` 实例：target 为 `"assistant_message_42"`，partial 为 `"assistant_messages/assistant_message"`
+- 对于 `UserMessage` 实例：target 为 `"user_message_1"`，partial 为 `"user_messages/user_message"`
+
+这要求视图 partial 的**最外层元素必须设置与 `dom_id` 一致的 `id` 属性**，否则客户端无法定位目标节点。项目中两个消息 partial 均满足此要求。
+
+---
+
+## 七、Morph 刷新机制
 
 ### 6.1 配置
 
