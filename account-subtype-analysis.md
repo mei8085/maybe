@@ -476,3 +476,327 @@ Plaid loan subtype 有 6 个值，但 Loan::SUBTYPES 只定义了 4 个 key：
    - 入口过滤、Liabilities Processor 选择、balance_type 计算是**分支判断**
 
 5. **Plaid 映射存在 3 个漏洞**：`business` / `home_equity` / `line_of_credit` 三个 loan subtype 在映射后不在 Loan::SUBTYPES 内，也不触发任何 Liability Processor，展示标签会退化到通用的 display_name。
+
+---
+
+## 八、补充：Property 控制器与 AccountableResource 的关联与分歧
+
+### 8.1 关联：Property 仍然 include 了 AccountableResource
+
+前文说 Property "不使用 AccountableResource"是不准确的。实际代码（[properties_controller.rb#L2](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/controllers/properties_controller.rb#L2-L2)）：
+
+```ruby
+class PropertiesController < ApplicationController
+  include AccountableResource, StreamExtensions
+```
+
+Property **确实 include 了 AccountableResource**，因此它继承了该 concern 提供的全部基础设施：
+
+| 继承自 AccountableResource 的内容 | Property 是否使用 |
+|------|:---:|
+| `before_action :set_account, only: [:show, :edit, :update]` | ✅ `edit` 由 concern 的空方法体渲染，`update` 被 Property 重写 |
+| `before_action :set_link_options, only: :new` | ✅ 但 Property 的 `new` 没有渲染 method_selector，所以 `@show_us_link` / `@show_eu_link` 虽被设置但从未在视图中使用 |
+| `accountable_type` 方法（`controller_name.classify.constantize` → `Property`） | ✅ 隐式使用 |
+| `set_account` 方法 | ✅ 被 `before_action` 调用 |
+| `Periodable` concern | ✅ 被引入 |
+
+### 8.2 分歧：Property 覆写了 4 个 concern 方法
+
+Property 对 AccountableResource 的覆写是**选择性替换**，不是完全脱离：
+
+| 方法 | concern 原始行为 | Property 覆写行为 | 分歧原因 |
+|------|----------------|-----------------|---------|
+| `new` | `build(currency: family.currency, accountable: accountable_type.new)` | `build(accountable: Property.new)` — **没有设 currency** | 向导 Step 1 不需要 currency/balance 字段，留到 Step 2 处理 |
+| `create` | `create_and_sync(account_params)` → `lock_saved_attributes!` → `redirect_to @account` | `create!(property_params.merge(currency: ..., balance: 0, status: "draft"))` → `redirect_to balances_property_path` | 向导需要分步：Step 1 只创建 draft，Step 2 设 balance，Step 3 设 address，最终才 activate |
+| `update` | 通用：处理 balance 更新 + 属性更新 + `lock_saved_attributes!` | Property 专用：更新 property_params 后根据 `active?` 判断重定向到 edit 还是 balances | 编辑已激活的 Property 与未完成的 Property 走不同路径 |
+| `account_params` | `permit(:name, :balance, :subtype, :currency, :accountable_type, :return_to, accountable_attributes: [...])` | 替换为 `property_params`：`permit(:name, :subtype, :accountable_type, accountable_attributes: [...])` — **没有 :balance, :currency, :return_to** | Step 1 表单不提交 balance/currency，这些在 Step 2 单独处理 |
+
+此外 Property 还新增了 concern 中没有的 4 个 action 和对应的 `before_action`：
+- `balances` / `update_balances`：Step 2（balance 输入）
+- `address` / `update_address`：Step 3（地址输入 + 激活）
+- `before_action :set_property`：替代 `set_account`（额外设 `@property`），但只用于 Step 2/3/4
+
+### 8.3 分歧的本质：draft → active 的生命周期差异
+
+标准 AccountableResource 的 `create` 流程是**原子操作**：
+
+```
+用户填写 name + balance + (subtype)
+  → create_and_sync（含 OpeningBalanceManager）
+    → lock_saved_attributes!
+      → redirect_to @account  （账户直接进入 active 状态）
+```
+
+Property 的流程是**多步事务**，状态沿 `draft → active` 渐进：
+
+```
+Step 1: name + subtype + year_built + area
+  → create!（status: "draft", balance: 0）
+    → redirect_to balances_property_path
+
+Step 2: balance
+  → update_balances（set_current_balance）
+    → redirect_to address_property_path
+
+Step 3: address
+  → update_address（property.update + activate!）
+    → redirect_to account_path(@account)  （此时才 active）
+```
+
+这导致 Property 不能使用 `create_and_sync`（会立即触发 sync 和 opening balance），也不能使用 concern 的 `account_params`（Step 1 不应接受 balance）。但 `edit` action 和 `set_account` 等"只读"基础设施仍直接复用 concern 的实现。
+
+### 8.4 Property 没有进入 method_selector
+
+Property 的 `new` action 没有 `step: "method_select"` 的分支判断——它的 [new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/views/properties/new.html.erb) 直接渲染表单，标题是 "Enter property manually"。也就是说，Property 类型**没有 Plaid 连接选项**，用户只能手动录入。这一点与 Depository/Investment/CreditCard/Loan 的入口行为不同（后四者先展示 method_selector，提供"手动录入"和"Plaid 连接"两种选择）。
+
+---
+
+## 九、补充：method_select 入口对可见选项的影响
+
+### 9.1 完整的用户入口流程
+
+用户创建新账户时，实际经历了**三层选择**：
+
+```
+Layer 1: 选择 classification（asset / liability）
+  → /accounts/new?classification=asset
+
+Layer 2: 选择 accountable_type（Depository / Investment / ...）
+  → 点击某个类型 → /depositories/new?step=method_select
+
+Layer 3: 选择创建方式（手动 / Plaid US / Plaid EU）
+  → 手动 → /depositories/new（表单）
+  → Plaid → /plaid_items/new?accountable_type=Depository
+```
+
+### 9.2 Layer 1：classification 过滤
+
+[accounts/new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/views/accounts/new.html.erb) 中，`params[:classification]` 控制哪些类型可见：
+
+| classification 值 | 可见的 Accountable 类型 |
+|---|---|
+| 未传参（默认） | 全部 9 个类型 |
+| `"asset"` | CreditCard, Loan, OtherLiability |
+| `"liability"` | Depository, Investment, Crypto, Property, Vehicle, OtherAsset |
+
+### 9.3 Layer 2：点击类型 → method_selector
+
+[_account_type.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/views/accounts/_account_type.html.erb) 中，点击某个类型后跳转的 URL 为：
+
+```erb
+<%= link_to new_polymorphic_path(accountable, step: "method_select", return_to: params[:return_to]) %>
+```
+
+即所有类型的默认入口都带 `step=method_select`。但各类型的 `new.html.erb` 对此参数的处理**分为两类**：
+
+#### 类型 A：有 method_select 步骤（4 个类型）
+
+Depository、Investment、CreditCard、Loan 的 `new.html.erb` 均有如下分支：
+
+```erb
+<% if params[:step] == "method_select" %>
+  <%= render "accounts/new/method_selector", ... %>
+<% else %>
+  <%= render DS::Dialog.new do |dialog| %>
+    <% dialog.with_body do %>
+      <%= render "xxx/form", ... %>
+    <% end %>
+  <% end %>
+<% end %>
+```
+
+#### 类型 B：没有 method_select 步骤（5 个类型）
+
+Property、Vehicle、Crypto、OtherAsset、OtherLiability 的 `new.html.erb` 直接渲染表单，**忽略 `step` 参数**：
+
+```erb
+<%= render DS::Dialog.new do |dialog| %>
+  <% dialog.with_body do %>
+    <%= render "xxx/form", ... %>
+  <% end %>
+<% end %>
+```
+
+尽管 URL 中也带了 `step=method_select`，但这些类型的 view 不检查该参数，直接进入表单。
+
+### 9.4 method_selector 的可见选项
+
+[accounts/new/_method_selector.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/views/accounts/new/_method_selector.html.erb) 提供三个入口：
+
+| 入口 | 链接目标 | 可见条件 |
+|------|---------|---------|
+| 手动录入 | `new_xxx_path(return_to: ...)` （同类型，无 step 参数） | **始终可见** |
+| Plaid US 连接 | `new_plaid_item_path(region: "us", accountable_type: ...)` | `@show_us_link == true`（取决于家庭是否配置了 Plaid US） |
+| Plaid EU 连接 | `new_plaid_item_path(region: "eu", accountable_type: ...)` | `@show_eu_link == true`（取决于家庭是否配置了 Plaid EU + 家庭是否为 EU 区域） |
+
+`@show_us_link` 和 `@show_eu_link` 由 [accountable_resource.rb#L68-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/controllers/concerns/accountable_resource.rb#L68-L71) 的 `set_link_options` before_action 设置：
+
+```ruby
+def set_link_options
+  @show_us_link = Current.family.can_connect_plaid_us?
+  @show_eu_link = Current.family.can_connect_plaid_eu?
+end
+```
+
+### 9.5 accountable_type 对 Plaid Link Token 的影响
+
+用户选择 Plaid 连接后，`accountable_type` 参数传入 [plaid_items_controller.rb#L11](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/controllers/plaid_items_controller.rb#L11-L11)：
+
+```ruby
+accountable_type: params[:accountable_type] || "Depository"
+```
+
+这个参数最终影响 Plaid Link Token 的产品配置（[plaid.rb#L182-L198](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/models/provider/plaid.rb#L182-L198)）：
+
+```ruby
+def get_primary_product(accountable_type)
+  return "transactions" if eu?
+
+  case accountable_type
+  when "Investment"
+    "investments"
+  when "CreditCard", "Loan"
+    "liabilities"
+  else
+    "transactions"
+  end
+end
+
+def get_additional_consented_products(accountable_type)
+  return [] if eu?
+
+  MAYBE_SUPPORTED_PLAID_PRODUCTS - [ get_primary_product(accountable_type) ]
+end
+```
+
+**这意味着 `accountable_type` 决定了 Plaid 在建立连接时请求哪个核心产品**：
+
+| 用户选择的类型 | Plaid 主产品（US） | Plaid 额外同意产品（US） |
+|---|---|---|
+| Depository / Crypto / Property / Vehicle / OtherAsset / OtherLiability | `"transactions"` | `["investments", "liabilities"]` |
+| Investment | `"investments"` | `["transactions", "liabilities"]` |
+| CreditCard / Loan | `"liabilities"` | `["transactions", "investments"]` |
+
+**EU 区域特殊处理**：EU 模式下只请求 `"transactions"` 产品，不请求额外同意产品。这是 Plaid EU API 的限制。
+
+### 9.6 method_select 与 subtype 的关系
+
+method_select 这一步**不涉及 subtype**。用户在 Layer 2 选择的是 `accountable_type`（如 "Depository"），不是 subtype（如 "checking"）。subtype 要等到 Layer 3 选择"手动录入"后，在具体类型的表单中才会出现。
+
+但 `accountable_type` 通过上述 Plaid 产品选择机制，**间接决定了 Plaid 是否会拉取 liabilities 数据**，而 liabilities 数据的可用性又取决于账户的 `plaid_subtype`。这个因果链在第十章完整串联。
+
+---
+
+## 十、补充：Plaid 路径中 subtype 的两层作用串联
+
+Plaid 导入路径中，subtype 实际上参与了**两个不同层次的决策**，前文将它们混在了一起，此处重新拆解并串联。
+
+### 10.1 第一层：subtype 决定是否拉取 liabilities 数据
+
+在 [accounts_snapshot.rb#L93-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/models/plaid_item/accounts_snapshot.rb#L93-L98) 中，`can_fetch_liabilities?` 方法**使用 Plaid 返回的账户原始 subtype** 来决定是否调用 Liabilities API：
+
+```ruby
+def can_fetch_liabilities?
+  plaid_item.supports_product?("liabilities") &&
+  accounts.any? do |a|
+    a.type == "credit" && a.subtype == "credit card" ||
+    a.type == "loan" && (a.subtype == "mortgage" || a.subtype == "student")
+  end
+end
+```
+
+这里有两个前置条件：
+
+**前置条件 A**：`plaid_item.supports_product?("liabilities")`
+
+这个方法（[plaid_item.rb#L96-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/models/plaid_item.rb#L96-L98)）检查 Plaid Item 是否支持 liabilities 产品：
+
+```ruby
+def supports_product?(product)
+  supported_products.include?(product)
+end
+
+def supported_products
+  available_products + billed_products
+end
+```
+
+`available_products` 和 `billed_products` 是 Plaid 在 Link Token 创建后返回的。**它们是否包含 "liabilities" 取决于**：
+
+- US 区域：Link Token 创建时 `products` 或 `additional_consented_products` 包含了 `"liabilities"`（即用户在 method_select 中选择了 CreditCard 或 Loan 类型，或者选择了其他类型但 Plaid 额外同意了 liabilities）
+- EU 区域：永远不包含 `"liabilities"`（EU 模式只请求 `"transactions"`）
+
+**前置条件 B**：该 Plaid Item 下的账户中至少有一个的 `[type, subtype]` 组合属于以下之一：
+
+| Plaid type | Plaid subtype | 含义 |
+|---|---|---|
+| `"credit"` | `"credit card"` | 信用卡 |
+| `"loan"` | `"mortgage"` | 房贷 |
+| `"loan"` | `"student"` | 学生贷款 |
+
+**注意**：`"loan"` + `"auto"` / `"business"` / `"home equity"` / `"line of credit"` **不满足**前置条件 B，即使 Plaid Item 支持 liabilities 产品，也不会调用 Liabilities API。
+
+**第一层决策的完整因果链**：
+
+```
+用户在 method_select 选择了 CreditCard 或 Loan 类型
+  → Link Token 的 primary_product = "liabilities"（US 区域）
+    → Plaid 建立 Item 后，liabilities 出现在 available/billed_products 中
+      → supports_product?("liabilities") = true
+
+Plaid 返回的账户列表中，某些账户的 [type, subtype] 为
+  ["credit", "credit card"] 或 ["loan", "mortgage"] 或 ["loan", "student"]
+  → can_fetch_liabilities? = true
+    → 调用 Plaid Liabilities API 拉取数据
+      → 数据存储到 plaid_account.raw_liabilities_payload
+```
+
+如果用户选择了 Depository 类型，但 Plaid 额外同意了 liabilities 产品，且该 Item 下恰好也有 loan 类账户，liabilities 数据**也会被拉取**——因为 `can_fetch_liabilities?` 检查的是 Plaid 返回的所有账户，不仅限于用户选择的 accountable_type 对应的账户。
+
+### 10.2 第二层：subtype 决定如何分发 liabilities 数据
+
+当 liabilities 数据成功拉取后，[processor.rb#L77-L88](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/models/plaid_account/processor.rb#L77-L88) 的 `process_liabilities` 对**每个 PlaidAccount** 单独执行分发：
+
+```ruby
+def process_liabilities
+  case [ plaid_account.plaid_type, plaid_account.plaid_subtype ]
+  when [ "credit", "credit card" ]
+    PlaidAccount::Liabilities::CreditProcessor.new(plaid_account).process
+  when [ "loan", "mortgage" ]
+    PlaidAccount::Liabilities::MortgageProcessor.new(plaid_account).process
+  when [ "loan", "student" ]
+    PlaidAccount::Liabilities::StudentLoanProcessor.new(plaid_account).process
+  end
+end
+```
+
+第二层的分发逻辑使用 `plaid_account.plaid_subtype`（Plaid 原始值），不使用映射后的 `account.subtype`。分发结果：
+
+| [plaid_type, plaid_subtype] | Processor | 写入目标 | 写入的字段 |
+|---|---|---|---|
+| `["credit", "credit card"]` | CreditProcessor | `account.credit_card` | `minimum_payment`, `apr` |
+| `["loan", "mortgage"]` | MortgageProcessor | `account.loan` | `rate_type`, `interest_rate` |
+| `["loan", "student"]` | StudentLoanProcessor | `account.loan` | `rate_type="fixed"`, `interest_rate`, `initial_balance`, `term_months` |
+| 其他所有组合 | *(nil，无 Processor)* | — | — |
+
+### 10.3 两层作用的关键差异
+
+| 维度 | 第一层（数据拉取） | 第二层（数据分发） |
+|------|---|---|
+| **决策对象** | 整个 PlaidItem（item 级别） | 单个 PlaidAccount（account 级别） |
+| **判断的 subtype 来源** | Plaid API 返回的 `account.type` + `account.subtype`（AccountsSnapshot 中遍历所有账户） | 数据库中 `plaid_account.plaid_type` + `plaid_account.plaid_subtype`（已存储的快照） |
+| **判断时机** | 数据获取阶段（AccountsSnapshot 构建时） | 数据处理阶段（Processor 执行时） |
+| **影响** | 是否调用 `LiabilitiesGet` API（昂贵的外部调用） | 是否将拉取到的 liabilities 数据写入 CreditCard/Loan 专属字段 |
+| **auto loan 的命运** | 不满足条件 B → 不会触发 Liabilities API 调用 | 即使被调用也不会匹配任何 Processor |
+
+### 10.4 两层之间的串联
+
+第一层和第二层的**解耦**导致一个重要结果：如果某个 Plaid Item 下同时有 credit card 和 auto loan 账户：
+
+1. 第一层：`can_fetch_liabilities?` 扫描全部账户，发现存在 `["credit", "credit card"]` → 返回 true → 调用 Liabilities API → **拉取所有 liabilities 数据**（包括 credit、mortgage、student 三类）
+2. 数据存储到每个 `plaid_account.raw_liabilities_payload`
+3. 第二层：对 credit card 账户执行 CreditProcessor → 写入 credit_card 字段；对 auto loan 账户 → case 不匹配 → **不写入 loan 字段**，即使 `raw_liabilities_payload` 中可能存在 auto loan 的数据（Plaid Liabilities API 实际不返回 auto loan 的结构化数据）
+
+这意味着：**auto loan 在第一层就被排除在 liabilities 数据拉取之外**（`can_fetch_liabilities?` 不认为它需要 liabilities），**在第二层也被排除在 processor 分发之外**（case 不匹配）。两层决策对 auto loan 的态度一致——忽略它。
+
+但如果将来 Plaid Liabilities API 增加了 auto loan 数据支持，需要同时修改两处：`can_fetch_liabilities?` 的账户过滤条件 + `process_liabilities` 的 case 分支。目前的解耦设计使得这两处修改容易遗漏其中一处。
