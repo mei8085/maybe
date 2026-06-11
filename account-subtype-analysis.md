@@ -547,7 +547,7 @@ Step 3: address
 
 ### 8.4 Property 没有进入 method_selector
 
-Property 的 `new` action 没有 `step: "method_select"` 的分支判断——它的 [new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/views/properties/new.html.erb) 直接渲染表单，标题是 "Enter property manually"。也就是说，Property 类型**没有 Plaid 连接选项**，用户只能手动录入。这一点与 Depository/Investment/CreditCard/Loan 的入口行为不同（后四者先展示 method_selector，提供"手动录入"和"Plaid 连接"两种选择）。
+Property 的 `new` action 没有 `step: "method_select"` 的分支判断——它的 [new.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/5-maybe/app/views/properties/new.html.erb) 直接渲染表单，标题是 "Enter property manually"。也就是说，Property 类型**没有 Plaid 连接选项**，用户只能手动录入。这一点与 Depository/Investment/Crypto/CreditCard/Loan 的入口行为不同（后五者先展示 method_selector，提供"手动录入"和"Plaid 连接"两种选择）。
 
 ---
 
@@ -576,8 +576,8 @@ Layer 3: 选择创建方式（手动 / Plaid US / Plaid EU）
 | classification 值 | 可见的 Accountable 类型 |
 |---|---|
 | 未传参（默认） | 全部 9 个类型 |
-| `"asset"` | CreditCard, Loan, OtherLiability |
-| `"liability"` | Depository, Investment, Crypto, Property, Vehicle, OtherAsset |
+| `"asset"` | Depository, Investment, Crypto, Property, Vehicle, OtherAsset |
+| `"liability"` | CreditCard, Loan, OtherLiability |
 
 ### 9.3 Layer 2：点击类型 → method_selector
 
@@ -589,9 +589,9 @@ Layer 3: 选择创建方式（手动 / Plaid US / Plaid EU）
 
 即所有类型的默认入口都带 `step=method_select`。但各类型的 `new.html.erb` 对此参数的处理**分为两类**：
 
-#### 类型 A：有 method_select 步骤（4 个类型）
+#### 类型 A：有 method_select 步骤（5 个类型）
 
-Depository、Investment、CreditCard、Loan 的 `new.html.erb` 均有如下分支：
+Depository、Investment、CreditCard、Loan、**Crypto** 的 `new.html.erb` 均有如下分支：
 
 ```erb
 <% if params[:step] == "method_select" %>
@@ -605,9 +605,11 @@ Depository、Investment、CreditCard、Loan 的 `new.html.erb` 均有如下分�
 <% end %>
 ```
 
-#### 类型 B：没有 method_select 步骤（5 个类型）
+这 5 个类型在 method_selector 中都提供"手动录入"和"Plaid 连接"两种选项（前提是家庭配置了对应区域的 Plaid）。
 
-Property、Vehicle、Crypto、OtherAsset、OtherLiability 的 `new.html.erb` 直接渲染表单，**忽略 `step` 参数**：
+#### 类型 B：没有 method_select 步骤（4 个类型）
+
+Property、Vehicle、OtherAsset、OtherLiability 的 `new.html.erb` 直接渲染表单，**忽略 `step` 参数**：
 
 ```erb
 <%= render DS::Dialog.new do |dialog| %>
@@ -617,7 +619,7 @@ Property、Vehicle、Crypto、OtherAsset、OtherLiability 的 `new.html.erb` 直
 <% end %>
 ```
 
-尽管 URL 中也带了 `step=method_select`，但这些类型的 view 不检查该参数，直接进入表单。
+尽管 `_account_type.html.erb` 跳转到这些类型时 URL 中也带了 `step=method_select`，但这些类型的 view 不检查该参数，直接进入表单。这 4 个类型**只能手动创建，不能通过 Plaid 连接创建**——这也解释了为什么它们不需要 method_selector。
 
 ### 9.4 method_selector 的可见选项
 
