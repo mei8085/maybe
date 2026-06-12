@@ -4,7 +4,7 @@
 > 1. 子分类对 color / lucide_icon 的处理边界（**只继承颜色不继承图标**）
 > 2. 各场景下「复用通用分类徽章 _badge」与「独立渲染」的呈现分工
 > 3. 虚拟分类的设计作用
-> 4. **修訂**：子分类表单里仅颜色区被隐藏，图标区可见且可修改（v2 修正）
+> 4. 子分类编辑时的表单可见性边界：颜色区隐藏（`selection` target `display:none`），图标区始终可见可改；提交后颜色被 `before_save` 回调强制覆盖为父色，图标正常保存用户选择
 > 所有行号均基于源码当前版本。
 
 ---
@@ -87,7 +87,7 @@
 | `handleIconChange`（第 107 行） | 图标单选 | 克隆 SVG → 插入头像预览区 |
 | `handleIconColorChange`（第 92 行） | 图标单选 | 记录 `selectedIcon` → 清除其他图标高亮 → 为选中图标着色 |
 | `autoAdjust`（第 147 行） | 点击 auto-adjust | 循环减暗 RGB 值直到对比度 ≥ 4.5 |
-| `handleParentChange`（第 153 行） | 父分类变更 | 子分类时隐藏颜色/图标选择区 |
+| `handleParentChange`（第 153 行） | 父分类变更 | 子分类时隐藏颜色选择区（仅 `selection` target），图标区不受影响 |
 
 **对比度校验**：自定义颜色时，控制器计算前景色与 10% 透明背景的 WCAG 对比度。若 < 4.5，通过 `setCustomValidity` 阻止表单提交，并显示 "Poor contrast" 提示。
 
@@ -318,19 +318,61 @@ end
 
 [schema.rb 第 162-172 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/db/schema.rb#L162-L172) 中 `color` 和 `lucide_icon` 都是独立列，有各自的默认值（`#6172F3` / `shapes`），没有任何外键或关联声明暗示图标需要从父分类取值。
 
-### 5.3 表单层配合
+### 5.3 表单层：精确可见性边界
 
-[_form.html.erb 第 15 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_form.html.erb#L15)：
+**子分类时，只有颜色区被隐藏，图标区仍然可见且可交互。**
 
-```erb
-<div data-category-target="selection" style="<%= "display:none;" if @category.subcategory? %>">
+#### 5.3.1 DOM 结构分析
+
+[_form.html.erb 第 14-56 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_form.html.erb#L14-L56) 中，弹出面板（popup）内包含两个同级 div：
+
+```
+popup (第 14 行)
+  ├─ selection div (第 15 行)  ← 子分类时 display:none
+  │    ├─ pickerSection
+  │    ├─ h4 "Color"
+  │    ├─ colorsSection（预设色圆点）
+  │    └─ paletteSection（自定义调色板 + color text_field）
+  │
+  └─ 图标区 div (第 43 行)  ← 始终可见，不在 selection 内！
+       ├─ h4 "Icon"
+       └─ 图标网格（lucide_icon radio 按钮）
 ```
 
-该 `div` 包裹了**颜色选择区 + 图标选择区**两个区域。当编辑子分类时，颜色和图标选择区整体被 `display:none` 隐藏。
+只有 `selection` div 有 `style="<%= "display:none;" if @category.subcategory? %>"`。图标区 div 在 `selection` 之外，**不受子分类条件影响**。
 
-但从实际持久化行为看，这个"一起隐藏"是 UI 层面的简化：保存时颜色会被父分类覆盖（无论表单提交什么），而图标由于没有对应的继承回调，如果前端被绕过并直接提交了不同的 `lucide_icon`，数据库中会保留子分类自己的图标值。不过在正常 UI 路径下，子分类提交的 `lucide_icon` 就是它已有的值（因为图标选择区被隐藏，用户无法修改）。
+#### 5.3.2 服务端渲染行为
 
-`handleParentChange` 方法（[category_controller.js 第 153-158 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/javascript/controllers/category_controller.js#L153-L158)）在用户为分类选择父级时，动态隐藏颜色+图标选择区。
+当 `@category.subcategory?` 为 true 时（编辑已有子分类）：
+- 第 15 行的 `selection` div 直接带 `style="display:none;"` 输出到 HTML → 颜色区初始隐藏
+- 第 43-55 行的图标区 div 没有任何 display 条件 → 图标区初始可见
+
+#### 5.3.3 客户端 JS 行为
+
+`handleParentChange` 方法（[category_controller.js 第 153-158 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/javascript/controllers/category_controller.js#L153-L158)）：
+
+```js
+handleParentChange(e) {
+  const parent = e.currentTarget.value;
+  const display =
+    typeof parent === "string" && parent !== "" ? "none" : "flex";
+  this.selectionTarget.style.display = display;
+}
+```
+
+只操作 `this.selectionTarget`（即颜色区 div），**不操作图标区**。当用户在父分类下拉框中选择了一个父分类时，颜色区被隐藏，图标区保持不变。
+
+#### 5.3.4 提交后的生效结果
+
+| 字段 | UI 是否可改 | 表单是否提交 | 保存后最终值 | 原因 |
+|---|---|---|---|---|
+| `color` | ❌ 不可见 | ✅ 仍提交（隐藏域 + 单选按钮在 DOM 中） | 父分类的 color | `before_save :inherit_color_from_parent` 覆盖 |
+| `lucide_icon` | ✅ 可见可改 | ✅ 提交 | 用户选择的图标 | 没有继承回调，直接保存 |
+
+**具体解释**：
+
+- **color**：虽然颜色区被 `display:none` 隐藏，但所有 `f.radio_button :color` 和 `f.text_field :color` 仍然在 DOM 中，表单提交时仍然会带 color 参数。不过由于 Model 层 `inherit_color_from_parent` 回调的存在，**无论提交什么颜色值，最终都会被父分类颜色覆盖**。
+- **lucide_icon**：图标区完全可见，用户可以点击任意图标单选按钮，选择的值会正常提交并持久化。子分类可以拥有与父分类完全不同的图标。
 
 ### 5.4 视图层的呈现表现
 
@@ -416,7 +458,7 @@ end
 │            ├→ 自定义色: Pickr → colorInput.value                      │
 │            ├→ 图标: Category.icon_codes → radio :lucide_icon          │
 │            ├→ 对比度校验 (WCAG ≥ 4.5)                                 │
-│            └→ 子分类: 颜色+图标选择区整体 display:none                 │
+│            └→ 子分类: 仅颜色区 display:none, 图标区仍可见可改         │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │ form submit (color + lucide_icon)
                              ▼
@@ -491,7 +533,7 @@ end
 
 1. **颜色透明度公式统一**：徽章和表单头像使用 `color-mix(in oklab, <color> 10%, transparent)` 生成浅色背景；预算甜甜圈中心使用 `hex_with_alpha(<color>, 0.05)`（5% 透明）。二者透明度不同，对应胶囊标签 vs 甜甜圈中心圆的视觉密度需求。公式分别实现在 [_badge.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_badge.html.erb#L7-L9)、[_color_avatar.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_color_avatar.html.erb#L6) 和 [application_helper.rb 第 31-34 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/application_helper.rb#L31-L34)。
 
-2. **子分类边界（颜色继承 / 图标独立）**：`before_save :inherit_color_from_parent` 只覆盖 `self.color = parent.color`，对 `lucide_icon` 不做处理。表单层将颜色和图标选择区一起隐藏是 UI 简化，但真正的语义边界在 Model 层。这使得父子分类在颜色上形成视觉分组，同时子分类可通过独立图标进行语义区分。
+2. **子分类边界（颜色继承 / 图标独立）**：`before_save :inherit_color_from_parent` 只覆盖 `self.color = parent.color`，对 `lucide_icon` 不做处理。表单层仅隐藏颜色选择区（`selection` target div），**图标选择区始终可见可改**。这使得父子分类在颜色上形成视觉分组，同时子分类可通过独立图标进行语义区分。
 
 3. **_badge.html.erb 复用 vs 独立渲染的分工**：当场景需要"胶囊形标签 + 同时展示图标和名称"时走 badge；当场景涉及数据可视化（进度条、甜甜圈、色条）、特殊布局（圆形图标嵌入 donut）、或只需要 color 不需要 icon 时走独立渲染。预算模块是独立渲染的主要聚集区，预算视图有 6 处独立渲染，全部不走 badge。
 
