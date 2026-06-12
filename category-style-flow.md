@@ -1,6 +1,10 @@
 # Category Icon & Color — 数据流代码理解记录
 
-> 本文档追踪 `Category` 模型的 `color` 与 `lucide_icon` 两个字段，从编辑表单、持久化到列表展示的完整链路，并补充子分类颜色继承与虚拟分类的设计作用。所有行号均基于源码当前版本。
+> 本文档追踪 `Category` 模型的 `color` 与 `lucide_icon` 两个字段，从编辑表单、持久化到列表展示的完整链路，并重点厘清：
+> 1. 子分类对 color / lucide_icon 的处理边界（只继承颜色不继承图标）
+> 2. 各场景下「复用通用分类徽章 _badge」与「独立渲染」的呈现分工
+> 3. 虚拟分类的设计作用
+> 所有行号均基于源码当前版本。
 
 ---
 
@@ -111,30 +115,17 @@ def inherit_color_from_parent
 end
 ```
 
-子分类的 `color` 会被父分类颜色强制覆盖，无论表单提交了什么值。（详见第 5 节）
+注意回调**只覆盖 `color`，不动 `lucide_icon`**。详见第 5 节。
 
 ---
 
-## 4 列表展示层
+## 4 列表展示层：复用通用徽章 vs 独立渲染
 
-### 4.1 分类设置列表（主路径）
+整个系统中，color + lucide_icon 的呈现分为两大路径：**复用 `_badge.html.erb`** 或 **各视图独立渲染**。
 
-```
-index.html.erb
-  └→ _category_list_group.html.erb
-       └→ _category.html.erb
-            └→ _badge.html.erb
-```
+### 4.1 通用分类徽章 `_badge.html.erb`
 
-**[index.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/index.html.erb#L1-L57)** 加载 `@categories = Current.family.categories.alphabetically`，按 Income/Expense 分组渲染。
-
-**[_category_list_group.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_category_list_group.html.erb#L1-L25)** 使用 `Category::Group.for(categories)` 将扁平列表转为树结构（父 + 子），逐一渲染每个 category。
-
-**[_category.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_category.html.erb#L1-L25)** 是列表行组件：
-- 子分类前显示一个带分类颜色的 `corner-down-right` 缩进图标
-- 渲染 `_badge` partial
-
-**[_badge.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_badge.html.erb#L1-L15)** 是**核心视觉组件**，在多个场景被复用：
+[_badge.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_badge.html.erb#L1-L15) 是**通用徽章组件**，提供一套固定的胶囊形视觉：
 
 ```erb
 <span style="
@@ -154,46 +145,121 @@ index.html.erb
 - **文字 & 图标色**：`<color>` —— 100% 分类色
 - **图标**：若 `lucide_icon` 存在，渲染 Lucide SVG，颜色设为 `current`（继承父元素 `color`）
 
-### 4.2 交易列表中的分类展示
+### 4.2 复用 `_badge` 的场景
 
+以下场景**直接调用 `render "categories/badge"`**，所有视觉参数由 badge 内部统一决定：
+
+| 场景 | 视图文件 | 行号 | 说明 |
+|---|---|---|---|
+| 分类设置列表行 | [_category.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_category.html.erb#L11) | 11 | 列表每行的分类标识 |
+| 交易分类菜单按钮 | [_menu.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_menu.html.erb#L5) | 5 | 交易行上作为下拉菜单触发按钮 |
+| 交易 Transfer/Payment 徽章 | [_transaction_category.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/transactions/_transaction_category.html.erb#L7) | 7 | 不可分类的转账/还款用虚拟分类渲染 |
+| 交易分类下拉行 | [_row.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/category/dropdowns/_row.html.erb#L24) | 24 | 分类下拉选择器每行 |
+| 交易搜索筛选器 | [_category_filter.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/transactions/searches/filters/_category_filter.html.erb#L19) | 19 | 高级搜索中可勾选的分类标签 |
+| 证券交易行 | [_trade.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/trades/_trade.html.erb#L33) | 33 | 交易记录中的分类徽章 |
+
+**复用 badge 的共同特征**：
+- 需要同时展示 `color`（背景/边框/文字）和 `lucide_icon`（图标）以及分类名称
+- 作为紧凑的标签/徽章出现，不需要额外的数据可视化元素
+- 允许传入虚拟分类（Category 实例但不落库），同样能正确渲染
+
+### 4.3 独立渲染的场景
+
+以下场景**不调用 `_badge`**，而是在各自模板中直接读取 `category.color` / `category.lucide_icon`，配合各自的图表或布局需求做独立呈现。
+
+#### 4.3.1 预算分类列表行：圆形图标 + 数据
+
+[_budget_category.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budget_categories/_budget_category.html.erb#L1-L54)：
+
+```erb
+<div class="w-8 h-8 ... rounded-full flex justify-center items-center"
+     style="color: <%= budget_category.category.color %>">
+  <% if budget_category.category.lucide_icon %>
+    <%= icon(budget_category.category.lucide_icon, color: "current") %>
+  <% else %>
+    <%= render DS::FilledIcon.new(variant: :text, hex_color: budget_category.category.color, ...) %>
+  <% end %>
+</div>
 ```
-transactions/_transaction.html.erb
-  └→ transactions/_transaction_category.html.erb
-       ├→ categories/_menu.html.erb → categories/_badge.html.erb
-       └→ categories/_badge.html.erb（Transfer/Payment 虚拟分类）
+
+独立原因：需要将图标放在 32px 圆形背景内（而非胶囊形 badge），并在图标旁展示剩余预算金额、实际支出等预算专属数据。图标降级为 DS::FilledIcon（首字母填充图标）。
+
+#### 4.3.2 预算分类甜甜圈中心图标
+
+[_budget_category_donut.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budget_categories/_budget_category_donut.html.erb#L1-L24)：
+
+```erb
+<div style="background-color: <%= hex_with_alpha(budget_category.category.color, 0.05) %>">
+  <% if budget_category.category.lucide_icon %>
+    <span style="color: <%= budget_category.category.color %>">
+      <%= icon(budget_category.category.lucide_icon, size: "sm", color: "current") %>
+    </span>
+  <% else %>
+    <span class="text-sm uppercase" style="color: <%= budget_category.category.color %>">
+      <%= budget_category.category.name.first.upcase %>
+    </span>
+  <% end %>
+</div>
 ```
 
-[_transaction.html.erb 第 92-94 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/transactions/_transaction.html.erb#L92-L94) 在交易行中渲染分类列。
+独立原因：图标需要嵌入甜甜圈图（donut-chart）的中心圆内，背景使用 `hex_with_alpha(..., 0.05)`（5% 透明）而非 badge 的 `color-mix 10%`，图标缺失时降级为大写首字母而非隐藏。
 
-[_transaction_category.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/transactions/_transaction_category.html.erb#L1-L9) 判断：
-- 若交易可分类 → 渲染分类菜单（badge 作为菜单按钮）
-- 否则用 [CategoriesHelper](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb#L1-L25) 创建的虚拟分类渲染 badge
+> `hex_with_alpha` 定义在 [application_helper.rb 第 31-34 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/application_helper.rb#L31-L34)，将 0-1 的 alpha 转为 8 位 HEX。
 
-### 4.3 分类下拉选择器
+#### 4.3.3 预算分类表单：色条 + 名称
 
-```
-Category::DropdownsController#show
-  └→ category/dropdowns/show.html.erb
-       └→ category/dropdowns/_row.html.erb
-            └→ categories/_badge.html.erb
+[_budget_category_form.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budget_categories/_budget_category_form.html.erb#L1-L31) 与 [_uncategorized_budget_category_form.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budget_categories/_uncategorized_budget_category_form.html.erb#L1-L21)：
+
+```erb
+<div class="w-1 h-3 rounded-xl mt-1" style="background-color: <%= budget_category.category.color %>"></div>
+<p><%= budget_category.category.name %></p>
 ```
 
-[DropdownsController](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/controllers/category/dropdowns_controller.rb#L1-L22) 加载分类列表，将已选中分类排到首位。
+独立原因：这里只需要 1×3 px 的细竖色条作为颜色标识（类似书签条），图标完全省略，右侧展示"中位数月支出"和金额输入框，与 badge 的胶囊形标签语义完全不同。
 
-[_row.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/category/dropdowns/_row.html.erb#L1-L31) 中每行渲染 `_badge`，点击后通过 [TransactionCategoriesController](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/controllers/transaction_categories_controller.rb#L1-L52) 更新交易的分类关联。
+#### 4.3.4 实际支出摘要：进度条 + 图例色点
 
-### 4.4 预算视图
+[_actuals_summary.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budgets/_actuals_summary.html.erb#L1-L57)：
 
-在预算相关视图中，`category.color` 被广泛用于：
+```erb
+<!-- 分段进度条 -->
+<div style="background-color: <%= category_total.category.color %>; width: <%= category_total.weight %>"></div>
+<!-- 图例色点 -->
+<div class="w-2.5 h-2.5 rounded-full shrink-0" style="background-color: <%= category_total.category.color %>"></div>
+```
 
-- [_budget_donut.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budgets/_budget_donut.html.erb#L41)：圆环图色条
-- [_actuals_summary.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budgets/_actuals_summary.html.erb#L15)：进度条 & 图例色点
-- [_budget_category.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budget_categories/_budget_category.html.erb#L11-L17)：圆形图标 + 渐变进度环
-- [_budget_category_donut.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budget_categories/_budget_category_donut.html.erb#L12-L18)：甜甜圈中心图标 + 首字母备选
+独立原因：`color` 用于绘制堆叠进度条（按 weight 分配宽度）和 10px 圆形图例色点。这里是数据可视化，完全不需要 `lucide_icon` 和分类名的胶囊呈现。
 
-### 4.5 API 输出
+#### 4.3.5 预算总览甜甜圈：颜色映射
 
-[_transaction.json.jbuilder](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/api/v1/transactions/_transaction.json.jbuilder#L19-L29) 将 `color` 和 `lucide_icon`（重命名为 `icon`）暴露给 API 消费者：
+[_budget_donut.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budgets/_budget_donut.html.erb#L37-L59)：
+
+```erb
+<div class="w-1 h-3 rounded-xl" style="background-color: <%= bc.category.color %>"></div>
+<p class="text-sm text-secondary"><%= bc.category.name %></p>
+```
+
+独立原因：隐藏的 DOM 节点（由 donut-chart Stimulus controller 在 hover 时切换显示），用 1×3 px 色条 + 文字展示当前 hover 的分类详情。
+
+此外，[budget_category.rb 第 78-93 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/budget_category.rb#L78-L93) 的 `to_donut_segments_json` 方法直接把 `category.color` 序列化进 JSON，由 donut-chart JS controller 用 CSS 变量绘制 SVG 扇形。
+
+#### 4.3.6 分类设置列表行的子分类缩进图标
+
+[_category.html.erb 第 5-9 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_category.html.erb#L5-L9)：
+
+```erb
+<% if category.subcategory? %>
+  <span style="color: <%= category.color %>">
+    <%= icon "corner-down-right", size: "sm", color: "current" %>
+  </span>
+<% end %>
+```
+
+独立原因：这是一个布局辅助图标，视觉上用 `category.color` 给 `corner-down-right` 箭头着色，用于提示"此分类是子分类"。它**不使用 category 自身的 `lucide_icon`**，而是使用固定图标。
+
+#### 4.3.7 API 输出
+
+[_transaction.json.jbuilder](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/api/v1/transactions/_transaction.json.jbuilder#L19-L29)：
 
 ```ruby
 json.category do
@@ -202,11 +268,31 @@ json.category do
 end
 ```
 
+独立原因：这是数据序列化而非视图渲染，`lucide_icon` 被重命名为 `icon`，交由前端消费者自行决定如何呈现。
+
+### 4.4 分工总结表
+
+| 场景 | 是否复用 `_badge` | 读取 color | 读取 lucide_icon | 原因 |
+|---|---|---|---|---|
+| 分类设置列表 | ✅ 是 | badge 内部 | badge 内部 | 标准胶囊标签 |
+| 交易菜单按钮 | ✅ 是 | badge 内部 | badge 内部 | 标准胶囊标签 |
+| 交易下拉行 | ✅ 是 | badge 内部 | badge 内部 | 标准胶囊标签 |
+| 交易搜索筛选器 | ✅ 是 | badge 内部 | badge 内部 | 标准胶囊标签 |
+| Transfer/Payment 虚拟分类 | ✅ 是 | badge 内部 | badge 内部 | 共享徽章 + 虚拟 Category 实例 |
+| 证券交易行 | ✅ 是 | badge 内部 | badge 内部 | 标准胶囊标签 |
+| 预算分类行（_budget_category） | ❌ 否 | 直接 | 直接 | 需要圆形图标 + 金额数据，非胶囊 |
+| 预算甜甜圈中心 | ❌ 否 | `hex_with_alpha(..., 0.05)` | 直接 | 嵌入 donut 中心，降级为大写首字母 |
+| 预算分类表单 | ❌ 否 | 直接 | ❌ 不读 | 只需 1px 色条标识 |
+| 实际支出进度条 | ❌ 否 | 直接 | ❌ 不读 | 数据可视化，只需要颜色 |
+| 预算总览甜甜圈 | ❌ 否 | 直接 | ❌ 不读 | donut 扇形 + hover 色条 |
+| 子分类缩进图标 | ❌ 否 | 直接 | ❌ 用固定 `corner-down-right` | 布局辅助，不需要 category 自身图标 |
+| API JSON | ❌ 否 | 直接序列化 | 重命名为 `icon` 序列化 | 数据交付，不做渲染 |
+
 ---
 
-## 5 子分类颜色继承机制
+## 5 子分类处理边界：颜色继承，图标独立
 
-### 5.1 回调实现
+### 5.1 回调实现的精确边界
 
 [category.rb 第 17 行 & 第 92-96 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/category.rb#L92-L96)：
 
@@ -216,13 +302,22 @@ before_save :inherit_color_from_parent
 def inherit_color_from_parent
   if subcategory?
     self.color = parent.color
+    # 注意：这里没有 self.lucide_icon = parent.lucide_icon
   end
 end
 ```
 
 `subcategory?` 判定条件为 `parent.present?`（第 109-111 行）。
 
-### 5.2 表单层配合
+**关键事实**：回调只覆盖 `self.color = parent.color`，对 `lucide_icon` 完全不做处理。这意味着：
+- 子分类数据库中的 `color` 永远等于父分类的 `color`
+- 子分类数据库中的 `lucide_icon` 是子分类自己保存的值，与父分类无关
+
+### 5.2 数据库 Schema 佐证
+
+[schema.rb 第 162-172 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/db/schema.rb#L162-L172) 中 `color` 和 `lucide_icon` 都是独立列，有各自的默认值（`#6172F3` / `shapes`），没有任何外键或关联声明暗示图标需要从父分类取值。
+
+### 5.3 表单层配合
 
 [_form.html.erb 第 15 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_form.html.erb#L15)：
 
@@ -230,13 +325,31 @@ end
 <div data-category-target="selection" style="<%= "display:none;" if @category.subcategory? %>">
 ```
 
-当编辑子分类时，颜色与图标选择区直接被 `display:none` 隐藏。此外 `handleParentChange` 方法（[category_controller.js 第 153-158 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/javascript/controllers/category_controller.js#L153-L158)）在用户为分类选择父级时，也会动态隐藏该区域。
+该 `div` 包裹了**颜色选择区 + 图标选择区**两个区域。当编辑子分类时，颜色和图标选择区整体被 `display:none` 隐藏。
 
-### 5.3 设计作用
+但从实际持久化行为看，这个"一起隐藏"是 UI 层面的简化：保存时颜色会被父分类覆盖（无论表单提交什么），而图标由于没有对应的继承回调，如果前端被绕过并直接提交了不同的 `lucide_icon`，数据库中会保留子分类自己的图标值。不过在正常 UI 路径下，子分类提交的 `lucide_icon` 就是它已有的值（因为图标选择区被隐藏，用户无法修改）。
 
-1. **视觉一致性**：父分类与其子分类在列表、徽章、预算视图中保持同色，形成清晰的分组视觉层级
-2. **双重保护**：表单 UI 隐藏是前端防御，`before_save` 回调是后端防御。即使绕过前端直接提交，数据库中的颜色仍然一致
-3. **渲染时无需额外逻辑**：由于子分类的颜色已在保存时被覆盖，所有视图模板无需判断"如果是子分类则取父分类颜色"，直接读 `category.color` 即可
+`handleParentChange` 方法（[category_controller.js 第 153-158 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/javascript/controllers/category_controller.js#L153-L158)）在用户为分类选择父级时，动态隐藏颜色+图标选择区。
+
+### 5.4 视图层的呈现表现
+
+由于 `color` 继承 + `lucide_icon` 独立，各视图对父子分类的呈现效果为：
+
+| 视图 | 父分类效果 | 子分类效果 |
+|---|---|---|
+| `_badge.html.erb` | 胶囊背景=父颜色，图标=父图标 | 胶囊背景=父颜色（继承），图标=子自己的图标（独立） |
+| `_budget_category.html.erb` 圆形图标 | 颜色=父颜色，图标=父图标 | 颜色=父颜色（继承），图标=子自己的图标（独立） |
+| `_budget_category_donut.html.erb` | 背景=父颜色，中心=父图标/首字母 | 背景=父颜色（继承），中心=子自己的图标/首字母（独立） |
+| 预算表单色条 | 竖条=父颜色 | 竖条=父颜色（继承），不展示图标 |
+| 进度条/甜甜圈扇形 | 色值=父颜色 | 色值=父颜色（继承），不展示图标 |
+| `_category.html.erb` 子分类缩进 | —— | `corner-down-right` 箭头着色=父颜色（继承） |
+
+### 5.5 设计作用
+
+1. **颜色一致性（视觉分组）**：父子分类共享颜色，保证在徽章、预算色条、进度条等所有颜色驱动的视觉中，子分类与其父分类看起来属于同一组。
+2. **图标独立性（语义区分）**：子分类可以拥有独立图标，让"Food & Drink"下的"Coffee"、"Groceries"、"Restaurant"虽然都共享橙色背景，但各自用不同的图标（如 `coffee`、`shopping-cart`、`utensils`）在视觉上被区分。
+3. **渲染零条件分支**：由于颜色已在 Model 层被子分类继承覆盖，所有视图只需 `category.color`，不需要 `if subcategory? use parent.color else category.color end`。同理，图标直接读 `category.lucide_icon` 即可获取子分类独立值。
+4. **API 层语义一致**：JSON 输出中 `color` 对于子分类也是父分类颜色，前端消费方无需处理父子颜色映射。
 
 ---
 
@@ -246,118 +359,143 @@ end
 
 | 虚拟分类 | 定义位置 | 颜色 | 图标 | 用途 |
 |---|---|---|---|---|
-| `uncategorized` | [category.rb 第 63-69 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/category.rb#L63-L69) | `#737373` | `circle-dashed` | 未分类交易的默认显示 |
+| `uncategorized` | [category.rb 第 63-69 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/category.rb#L63-L69) | `#737373` (`UNCATEGORIZED_COLOR`) | `circle-dashed` | 未分类交易的默认显示 |
 | `transfer_category` | [categories_helper.rb 第 2-7 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb#L2-L7) | `#444CE7` (`TRANSFER_COLOR`) | `arrow-right-left` | 转账交易 |
 | `payment_category` | [categories_helper.rb 第 9-14 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb#L9-L14) | `#db5a54` (`PAYMENT_COLOR`) | `arrow-right` | 还款交易 |
-| `trade_category` | [categories_helper.rb 第 16-19 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb#L16-L19) | `#e99537` (`TRADE_COLOR`) | 无 | 证券交易 |
+| `trade_category` | [categories_helper.rb 第 16-19 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb#L16-L19) | `#e99537` (`TRADE_COLOR`) | 无（未设置 `lucide_icon`） | 证券交易 |
 
 ### 6.2 创建方式
 
 虚拟分类通过 `Category.new` 创建，**不调用 `.save`**，因此不落库。它们不拥有 `id`，也不关联 `family`。
 
-### 6.3 使用场景
+### 6.3 BudgetCategory 中的虚拟分类桥接
 
-- **`uncategorized`**：在 [categories_helper.rb 第 23 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb#L23) 的 `family_categories` 方法中被插入到分类列表首位，也作为 [_badge.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_badge.html.erb#L2) 的默认回退值（`category ||= Category.uncategorized`）
+[budget_category.rb 第 31-46 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/budget_category.rb#L31-L46) 中：
+
+```ruby
+class << self
+  def uncategorized
+    new(id: Digest::UUID.uuid_v5(...), category: nil)
+  end
+end
+
+def category
+  super || budget.family.categories.uncategorized
+end
+```
+
+`BudgetCategory.uncategorized` 创建的是一个 BudgetCategory 实例（非 Category），其 `category` 关联为 `nil`，但通过方法覆写（`def category`）在访问时自动回退到 `Category.uncategorized` 虚拟分类。这样预算视图中 `budget_category.category.color` 和 `budget_category.category.lucide_icon` 可以统一取值，无需判断 nil。
+
+### 6.4 使用场景
+
+- **`uncategorized`**：在 [categories_helper.rb 第 23 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb#L23) 的 `family_categories` 方法中被插入到分类列表首位，也作为 [_badge.html.erb 第 2 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_badge.html.erb#L2) 的默认回退值（`category ||= Category.uncategorized`）
 - **`transfer_category` / `payment_category`**：在 [_transaction_category.html.erb 第 7 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/transactions/_transaction_category.html.erb#L7) 中，当交易属于 Transfer 且不可分类时使用
-- **`trade_category`**：在 [trades/_trade.html.erb 第 33 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/trades/_trade.html.erb#L33) 中为证券交易行提供分类徽章
+- **`trade_category`**：在 [_trade.html.erb 第 33 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/trades/_trade.html.erb#L33) 中为证券交易行提供分类徽章（注意它未设置 `lucide_icon`，badge 中 `if category.lucide_icon.present?` 为 false，只显示名称）
+- **BudgetCategory::uncategorized**（桥接）：在 [_uncategorized_budget_category_form.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/budget_categories/_uncategorized_budget_category_form.html.erb#L1-L21) 和预算分配进度等场景中使用，统一走 `budget_category.category.color` 访问
 
-### 6.4 设计作用
+### 6.5 设计作用
 
-1. **复用渲染管道**：虚拟分类与真实分类共享 `_badge.html.erb` 模板，同一套 `color` + `lucide_icon` 渲染逻辑无需条件分支
-2. **避免空值处理**：未分类交易不需要在视图层写 `if category.nil?` 的分支逻辑，而是传入 `uncategorized` 虚拟实例，模板直接读取 `.color` 和 `.lucide_icon`
-3. **语义明确**：转账、还款、证券交易在业务上不属于用户自建分类，用虚拟分类赋予它们独立的视觉标识，与用户分类区分开来
-4. **常量集中管理**：`UNCATEGORIZED_COLOR`、`TRANSFER_COLOR`、`PAYMENT_COLOR`、`TRADE_COLOR` 定义在 [category.rb 第 26-29 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/category.rb#L26-L29)，方便全局引用和修改
+1. **复用渲染管道**：虚拟分类与真实分类共享 `_badge.html.erb` 模板，同一套 `color` + `lucide_icon` 渲染逻辑无需条件分支。
+2. **避免空值处理**：未分类交易不需要在视图层写 `if category.nil?` 的分支逻辑，而是传入 `uncategorized` 虚拟实例，模板直接读取 `.color` 和 `.lucide_icon`。BudgetCategory 甚至通过覆写 `category` 方法让 nil 关联自动桥接到虚拟分类。
+3. **语义明确**：转账、还款、证券交易在业务上不属于用户自建分类，用虚拟分类赋予它们独立的视觉标识，与用户分类区分开来。
+4. **常量集中管理**：`UNCATEGORIZED_COLOR`、`TRANSFER_COLOR`、`PAYMENT_COLOR`、`TRADE_COLOR` 定义在 [category.rb 第 26-29 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/category.rb#L26-L29)，方便全局引用和修改。
 
 ---
 
 ## 7 完整数据流图
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│                    1. 编辑表单层 (Form Layer)                       │
-│                                                                   │
-│  new.html.erb / edit.html.erb                                     │
-│       └→ _form.html.erb (挂载 Stimulus category controller)        │
-│            ├→ _color_avatar.html.erb ← 实时预览 (color + icon)     │
-│            ├→ 预设色: Category::COLORS → radio :color              │
-│            ├→ 自定义色: Pickr → colorInput.value                   │
-│            ├→ 图标: Category.icon_codes → radio :lucide_icon       │
-│            └→ 对比度校验 (WCAG ≥ 4.5)                              │
-└─────────────────────────┬─────────────────────────────────────────┘
-                          │ form submit (color + lucide_icon)
-                          ▼
-┌───────────────────────────────────────────────────────────────────┐
-│                  2. 控制器层 (Controller Layer)                     │
-│                                                                   │
-│  CategoriesController#create / #update                             │
-│    category_params: permit(:name, :color, :lucide_icon, ...)       │
-└─────────────────────────┬─────────────────────────────────────────┘
-                          │
-                          ▼
-┌───────────────────────────────────────────────────────────────────┐
-│                   3. 模型层 (Model Layer)                           │
-│                                                                   │
-│  Category                                                          │
-│    validates :color, :lucide_icon, presence: true                  │
-│    before_save :inherit_color_from_parent                          │
-│      └→ subcategory? → self.color = parent.color (覆盖)            │
-└─────────────────────────┬─────────────────────────────────────────┘
-                          │
-                          ▼
-┌───────────────────────────────────────────────────────────────────┐
-│                 4. 数据库层 (Database Layer)                        │
-│                                                                   │
-│  categories table                                                  │
-│    color: string, default: "#6172F3", null: false                  │
-│    lucide_icon: string, default: "shapes", null: false             │
-└─────────────────────────┬─────────────────────────────────────────┘
-                          │ 读取
-                          ▼
-┌───────────────────────────────────────────────────────────────────┐
-│                5. 列表展示层 (Presentation Layer)                    │
-│                                                                   │
-│  ┌─ 分类设置列表 ───────────────────────────────────────────────┐   │
-│  │ index → _category_list_group → _category → _badge           │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                                                                   │
-│  ┌─ 交易列表 ───────────────────────────────────────────────────┐   │
-│  │ _transaction → _transaction_category → _badge                │   │
-│  │   └→ Transfer/Payment: CategoriesHelper 虚拟分类 badge       │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                                                                   │
-│  ┌─ 分类下拉选择器 ─────────────────────────────────────────────┐   │
-│  │ DropdownsController → dropdowns/show → _row → _badge         │   │
-│  │   └→ TransactionCategoriesController#update 更新关联          │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                                                                   │
-│  ┌─ 预算视图 ───────────────────────────────────────────────────┐   │
-│  │ _budget_category → icon + 进度环 (color)                      │   │
-│  │ _budget_category_donut → 中心图标 (icon + color)              │   │
-│  │ _actuals_summary → 进度条 + 图例 (color only)                 │   │
-│  │ _budget_donut → 色条 (color only)                             │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                                                                   │
-│  ┌─ API 输出 ───────────────────────────────────────────────────┐   │
-│  │ _transaction.json.jbuilder → { color, icon }                  │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-│                                                                   │
-│  ─── _badge.html.erb (核心复用组件) ──                              │
-│  background: color-mix(in oklab, <color> 10%, transparent)         │
-│  border:     color-mix(in oklab, <color> 10%, transparent)         │
-│  text/icon:  <color> (100%)                                        │
-└───────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                     1. 编辑表单层 (Form Layer)                         │
+│                                                                      │
+│  new.html.erb / edit.html.erb                                        │
+│       └→ _form.html.erb (挂载 Stimulus category controller)           │
+│            ├→ _color_avatar.html.erb ← 实时预览 (color + icon)        │
+│            ├→ 预设色: Category::COLORS → radio :color                 │
+│            ├→ 自定义色: Pickr → colorInput.value                      │
+│            ├→ 图标: Category.icon_codes → radio :lucide_icon          │
+│            ├→ 对比度校验 (WCAG ≥ 4.5)                                 │
+│            └→ 子分类: 颜色+图标选择区整体 display:none                 │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │ form submit (color + lucide_icon)
+                             ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                   2. 控制器层 (Controller Layer)                       │
+│                                                                      │
+│  CategoriesController#create / #update                                │
+│    category_params: permit(:name, :color, :lucide_icon, ...)          │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                    3. 模型层 (Model Layer)                              │
+│                                                                      │
+│  Category                                                             │
+│    validates :color, :lucide_icon, presence: true                     │
+│    before_save :inherit_color_from_parent                             │
+│      └→ subcategory? → self.color = parent.color                      │
+│         ⚠ lucide_icon 不被覆盖，保留子分类独立值                       │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                  4. 数据库层 (Database Layer)                          │
+│                                                                      │
+│  categories table                                                     │
+│    color:       string, default: "#6172F3", null: false               │
+│    lucide_icon: string, default: "shapes",   null: false               │
+│    子分类: color=父分类color, lucide_icon=子分类独立值                 │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │ 读取
+                             ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                  5. 列表展示层 (Presentation Layer)                     │
+│                                                                      │
+│  ┌─ 复用 _badge.html.erb 的场景 ──────────────────────────────────┐  │
+│  │ • 分类设置列表 _category.html.erb                               │  │
+│  │ • 交易菜单 _menu.html.erb                                       │  │
+│  │ • 交易 Transfer/Payment 虚拟分类                                │  │
+│  │ • 分类下拉 _row.html.erb                                        │  │
+│  │ • 交易搜索过滤器 _category_filter.html.erb                      │  │
+│  │ • 证券交易 _trade.html.erb                                      │  │
+│  │  渲染规则: bg=color-mix 10%, border=同, fg=color, 图标=lucide_icon│  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌─ 独立渲染的场景 ────────────────────────────────────────────────┐  │
+│  │ 预算分类行 _budget_category.html.erb                             │  │
+│  │   → 32px 圆形图标 (color 着色, lucide_icon / DS::FilledIcon)    │  │
+│  │ 预算甜甜圈中心 _budget_category_donut.html.erb                   │  │
+│  │   → hex_with_alpha 5% 背景 + lucide_icon / 大写首字母            │  │
+│  │ 预算分类表单 _budget_category_form.html.erb                      │  │
+│  │   → 1×3px 色条 (只取 color, 不展示 icon)                         │  │
+│  │ 实际支出进度条 _actuals_summary.html.erb                         │  │
+│  │   → 堆叠进度条 + 圆形图例色点 (只取 color)                        │  │
+│  │ 预算总览甜甜圈 _budget_donut.html.erb                            │  │
+│  │   → hover 色条 + to_donut_segments_json (只取 color)             │  │
+│  │ 子分类缩进 _category.html.erb                                    │  │
+│  │   → corner-down-right 固定图标 (用 color 着色, 不用 lucide_icon)  │  │
+│  │ API JSON _transaction.json.jbuilder                              │  │
+│  │   → { color, icon } 序列化交付                                    │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ─── 子分类读取规则 ───                                               │
+│  color       → 永远等于父分类颜色 (保存时已被继承覆盖)                  │
+│  lucide_icon → 子分类自身独立值                                       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 8 关键设计要点总结
 
-1. **颜色透明度公式统一**：整个系统使用 `color-mix(in oklab, <color> 10%, transparent)` 生成浅色背景。此公式在服务端模板（badge、color_avatar）和客户端 Stimulus controller（[category_controller.js 第 259-261 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/javascript/controllers/category_controller.js#L259-L261) 的 `#backgroundColor` 私有方法）中一致使用。
+1. **颜色透明度公式统一**：徽章和表单头像使用 `color-mix(in oklab, <color> 10%, transparent)` 生成浅色背景；预算甜甜圈中心使用 `hex_with_alpha(<color>, 0.05)`（5% 透明）。二者透明度不同，对应胶囊标签 vs 甜甜圈中心圆的视觉密度需求。公式分别实现在 [_badge.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_badge.html.erb#L7-L9)、[_color_avatar.html.erb](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/views/categories/_color_avatar.html.erb#L6) 和 [application_helper.rb 第 31-34 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/application_helper.rb#L31-L34)。
 
-2. **子分类颜色继承**：`before_save :inherit_color_from_parent` 回调确保子分类永远与父分类同色。表单通过 `handleParentChange` 隐藏子分类的颜色/图标选择区来配合此逻辑，但保护实际上在 Model 层。
+2. **子分类边界（颜色继承 / 图标独立）**：`before_save :inherit_color_from_parent` 只覆盖 `self.color = parent.color`，对 `lucide_icon` 不做处理。表单层将颜色和图标选择区一起隐藏是 UI 简化，但真正的语义边界在 Model 层。这使得父子分类在颜色上形成视觉分组，同时子分类可通过独立图标进行语义区分。
 
-3. **虚拟分类**：`uncategorized`、`transfer_category`、`payment_category`、`trade_category` 是不落库的 Category 实例，通过 [CategoriesHelper](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/helpers/categories_helper.rb) 和 `Category.uncategorized` 构建，复用同一套 badge 渲染逻辑，避免视图层空值分支。
+3. **_badge.html.erb 复用 vs 独立渲染的分工**：当场景需要"胶囊形标签 + 同时展示图标和名称"时走 badge；当场景涉及数据可视化（进度条、甜甜圈、色条）、特殊布局（圆形图标嵌入 donut）、或只需要 color 不需要 icon 时走独立渲染。预算模块是独立渲染的主要聚集区，预算视图有 6 处独立渲染，全部不走 badge。
 
-4. **对比度守卫**：表单层（Stimulus controller）和视觉层（badge 模板）形成配合——表单阻止用户选择对比度不足的颜色，badge 使用 10% 透明背景来保证即使颜色较浅，文字仍有可读性。
+4. **虚拟分类 + BudgetCategory 桥接**：`Category.uncategorized` 等虚拟实例让 badge 模板无需 nil 判断；`BudgetCategory` 通过覆写 `def category` 自动将 nil 关联桥接到虚拟分类，实现"预算视图统一通过 `budget_category.category.color` 取值，无需处理未分配预算"。
 
-5. **_badge.html.erb 是共享渲染枢纽**：它在分类列表、交易列表、下拉选择器、预算视图等至少 7 个位置被引用，是 `color` + `lucide_icon` 视觉呈现的单一事实来源（Single Source of Truth）。
+5. **对比度守卫**：Stimulus controller 计算自定义颜色与 10% 透明背景的 WCAG 对比度，不足 4.5 时阻止提交；badge 使用 10% 透明背景从另一层保障文字可读性。两者形成表单层与渲染层的配合。
+
+6. **BudgetCategory::Group 委托**：[budget_category.rb 第 14-15 行](file:///d:/fz/0601-1/solo-dogfeeding/code/34-maybe/app/models/budget_category.rb#L14-L15) 使用 `delegate :name, :color, to: :category`，使预算分组可以直接 `group.color` 拿到分类颜色，而 `lucide_icon` 没有被 delegate，预算视图统一通过 `budget_category.category.lucide_icon` 访问。
