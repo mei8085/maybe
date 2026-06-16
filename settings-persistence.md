@@ -50,6 +50,9 @@ users 表落库
    - `toggleRightSidebar()` (L27-L31)：切换右侧栏，调用 `#updateUserPreference("show_ai_sidebar", !isOpen)`
    - `#updateUserPreference()` (L43-L55)：发送 PATCH 请求到 `/users/:id`，以 `user[field]=value` 格式提交
 
+> **源码对照说明**：移动端侧栏 `openMobileSidebar()` / `closeMobileSidebar()` 只操作 DOM，不写库。
+> 原流程只描述了桌面端的持久化链路，但源码中移动端的两个方法（L13-L19）仅对 `mobileSidebarTarget` 添加/移除 `hidden` class，没有任何 fetch 请求调用 `#updateUserPreference`。这是有意设计：移动端侧栏是临时抽屉，状态不需要跨会话保存。
+
 2. 后端控制器 [users_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/users_controller.rb)：
    - `update` 动作 (L5-L36)：处理用户属性更新
    - `user_params` (L88-L95)：permit 了 `show_sidebar`、`show_ai_sidebar` 等字段
@@ -244,15 +247,17 @@ application.html.erb 渲染
 
 | 关注点 | 文件 | 行号 |
 |--------|------|------|
-| 用户级偏好模型 | [user.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/models/user.rb) | L85-L87 |
+| 用户级偏好模型 | [user.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/models/user.rb) | L85-L87, L93-L95 |
 | 会话级偏好模型 | [session.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/models/session.rb) | L13-L21 |
-| 全局 Current | [current.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/models/current.rb) | 全文 |
-| 侧栏展开写入（前端） | [app_layout_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/javascript/controllers/app_layout_controller.js) | L21-L55 |
+| 全局 Current（impersonation 优先级） | [current.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/models/current.rb) | L8-L18 |
+| 侧栏展开写入（前端，含移动端差异） | [app_layout_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/javascript/controllers/app_layout_controller.js) | L13-L55 |
 | 侧栏展开写入（后端） | [users_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/users_controller.rb) | L5-L36, L88-L95 |
 | 标签页写入（前端） | [tabs_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/components/DS/tabs_controller.js) | L9-L56 |
 | 标签页写入（后端） | [current_sessions_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/current_sessions_controller.rb) | L2-L8 |
-| 标签页读取恢复 | [restore_layout_preferences.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/concerns/restore_layout_preferences.rb) | L9-L23 |
-| 布局渲染入口 | [application.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/views/layouts/application.html.erb) | L74-L110 (左), L134-L155 (右) |
+| 标签页读取恢复（含 URL 白名单） | [restore_layout_preferences.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/concerns/restore_layout_preferences.rb) | L9-L23 |
+| 布局渲染入口（右侧栏两层叠加） | [application.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/views/layouts/application.html.erb) | L74-L110 (左), L134-L155 (右) |
 | 侧栏标签组件 | [_account_sidebar_tabs.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/views/accounts/_account_sidebar_tabs.html.erb) | L24 |
 | Tabs 组件定义 | [tabs.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/components/DS/tabs.rb) | L30-L40 |
 | 认证与 Current 设置 | [authentication.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/concerns/authentication.rb) | L18-L28 |
+| show_ai_sidebar 迁移（随 create_ai_chats） | [20250319212839_create_ai_chats.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/db/migrate/20250319212839_create_ai_chats.rb) | L43-L44 |
+| show_sidebar 迁移 | [20250212213301_add_user_sidebar_preference.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/db/migrate/20250212213301_add_user_sidebar_preference.rb) | L3 |
