@@ -19,10 +19,9 @@
 
 偏好存储在 [user.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/models/user.rb) 模型对应的 `users` 表中：
 
-- `show_sidebar` (boolean, default: true) — 左侧账户侧栏是否展开
-- `show_ai_sidebar` (boolean) — 右侧 AI 助手侧栏是否展开
-
-数据库迁移见 [20250212213301_add_user_sidebar_preference.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/db/migrate/20250212213301_add_user_sidebar_preference.rb)。
+- `show_sidebar` (boolean, default: true) — 左侧账户侧栏是否展开，迁移见 [20250212213301_add_user_sidebar_preference.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/db/migrate/20250212213301_add_user_sidebar_preference.rb)
+- `show_ai_sidebar` (boolean, default: true) — 右侧 AI 助手侧栏是否展开，在 `create_ai_chats` 迁移中随 AI 聊天功能一同加入，见 [20250319212839_create_ai_chats.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/db/migrate/20250319212839_create_ai_chats.rb) L43
+- `ai_enabled` (boolean, default: false) — AI 功能是否启用，同样在 create_ai_chats 迁移中添加，见同上 L44
 
 ### 2.2 写入链路（前端 → 后端 → 落库）
 
