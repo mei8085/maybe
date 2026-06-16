@@ -156,11 +156,17 @@ RestoreLayoutPreferences concern (before_action)
     ↓
 restore_active_tabs
     ↓
-Current.session.get_preferred_tab("account_sidebar_tab")
+① URL 参数 params[:account_sidebar_tab]
+    │
+    ├─ 在 asset/liability/all 白名单内 → 使用 URL 参数值
+    │
+    └─ 不在白名单内 / 无参数 → 降级
+             ↓
+       ② Current.session.get_preferred_tab("account_sidebar_tab")
+             ↓
+       ③ 若也无则默认 "asset"
     ↓
-若无则默认 "asset"
-    ↓
-@account_group_tab = 最终值（URL 参数优先）
+@account_group_tab = 最终值
     ↓
 视图中作为 active_tab 传给 DS::Tabs 组件
 ```
@@ -170,10 +176,11 @@ Current.session.get_preferred_tab("account_sidebar_tab")
 1. [restore_layout_preferences.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/concerns/restore_layout_preferences.rb)：
    - `before_action :restore_active_tabs` (L5)：每个请求前恢复标签状态
    - `restore_active_tabs` (L9-L13)：
-     - 优先读取 `params[:account_sidebar_tab]`（URL 参数）
-     - 若无则从 `Current.session.get_preferred_tab("account_sidebar_tab")` 读取
-     - 都没有则默认 `"asset"`
-     - 结果存入 `@account_group_tab` 实例变量
+     - 先取 `last_selected_tab = Current.session&.get_preferred_tab(...) || "asset"`（session 偏好或默认值）
+     - 再取 `@account_group_tab = account_group_tab_param || last_selected_tab`（URL 参数优先，但需过白名单）
+   - **白名单校验**：
+     - `valid_account_group_tabs` (L15-L17)：白名单 `%w[asset liability all]`
+     - `account_group_tab_param` (L19-L23)：`return nil unless param_value.in?(valid_account_group_tabs)` — 不在白名单内返回 nil，降级到 session 偏好
 
 2. 该 concern 被包含在 [application_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/application_controller.rb) L2，因此所有继承 ApplicationController 的控制器都自动具备标签恢复能力。
 
@@ -246,6 +253,16 @@ application.html.erb 渲染
 用户也可以在设置页面集中管理偏好，入口为 [preferences/show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/views/settings/preferences/show.html.erb)，由 [preferences_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/controllers/settings/preferences_controller.rb) 渲染。
 
 该页面使用 `auto-submit-form` Stimulus 控制器，修改后自动提交到 `UsersController#update`，走的是与侧栏按钮相同的用户级偏好持久化通道。
+
+> **源码实际情况**：偏好设置页面**并未放置 `show_sidebar` / `show_ai_sidebar` 控件**。
+>
+> 源码核查：
+> - [preferences/show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/views/settings/preferences/show.html.erb) 仅包含：货币、语言、时区、日期格式、默认周期、国家、主题等字段
+> - [profiles/show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/views/settings/profiles/show.html.erb) 仅包含：头像、邮箱、姓名、家庭管理、数据导入导出、账户删除等字段
+> - 全局搜索 `app/views` 下的 `show_sidebar` / `show_ai_sidebar`，仅在 [application.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/views/layouts/application.html.erb) 的布局渲染中出现
+>
+> **结论**：侧栏展开/折叠状态没有页面级的配置入口，只能通过布局上的折叠按钮（`app_layout_controller.js` 触发）修改。
+> 虽然 `UsersController#user_params` permit 了 `show_sidebar` 和 `show_ai_sidebar` 字段（允许 API 写入），但 UI 上没有对应控件。
 
 ---
 
