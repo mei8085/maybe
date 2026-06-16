@@ -220,8 +220,14 @@ application.html.erb 渲染
 ### 5.1 关键属性
 
 - `session` — 当前会话记录（由 Authentication concern 设置）
-- `user` — 当前用户（委托自 `session.user`，支持 impersonation）
+- `user` — 当前用户，**源码实际为 `impersonated_user` 优先于 `session.user`**，并非简单委托
+  - 实现见 [current.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/2-maybe/app/models/current.rb) L8-L10：`def user; impersonated_user || session&.user; end`
+  - `impersonated_user` (L12-L14)：从 `session.active_impersonator_session.impersonated` 获取被模拟用户
+  - **优先级**：`||` 左边优先，当会话处于 impersonation 状态时，`Current.user` 返回被模拟用户而非登录者
+- `true_user` — 真实登录用户 (L16-L18)，始终返回 `session.user`，不受 impersonation 影响，用于审计等场景
 - `family` — 当前家庭（委托自 `user.family`）
+
+**对侧栏偏好的影响**：侧栏偏好通过 `Current.user` 读取，因此管理员 impersonate 普通用户时，看到的是被模拟用户的侧栏状态（展开/折叠、标签页选择），而非管理员自己的。
 
 ### 5.2 设置时机
 
@@ -229,7 +235,7 @@ application.html.erb 渲染
 1. 从 `cookies.signed[:session_token]` 读取会话 ID
 2. 查询 `Session` 记录
 3. 赋值给 `Current.session`
-4. `Current.user` 自动通过委托获得
+4. `Current.user` 每次访问时动态计算（先检查 impersonation，再回退到 `session.user`）
 
 由于 `CurrentAttributes` 是线程安全的，整个请求生命周期内都可以通过 `Current.user` / `Current.session` 访问当前用户和会话。
 
