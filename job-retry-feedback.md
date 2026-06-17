@@ -469,23 +469,57 @@ SyncJob 执行异常
   → plaid_item.sync_later  ← 新建 Sync 记录（失败的旧记录保留历史）
 ```
 
-### 5.3 Chat AI 响应失败重试
+### 5.3 Chat AI 响应失败重试（完整链路）
+
+> 详细 7 层触发链路分析见 [2.3.1 节](#231-chat-retry-从错误展示到重新入队的完整触发链路)
 
 ```
-UserMessage 创建
-  → after_create_commit :request_response_later
-  → chat.ask_assistant_later → clear_error + AssistantResponseJob.perform_later
-Job 执行失败（在 assistant.respond_to 内部）
-  → chat.add_error(exception)
-    → update!(error: e.to_json)
-    → broadcast_append "messages" 区域追加 _error.html.erb
-用户看到 Retry 按钮
-  → retry_chat_path
-  → chat.retry_last_message!
-    → clear_error（broadcast_remove 移除错误条）
-    → ask_assistant_later（重新入队）
-  → redirect thinking: true（显示思考中指示器）
+[初始发送]
+  UserMessage.create!
+    → after_create_commit :request_response_later    [user_message.rb#L4]
+      → chat.ask_assistant_later(user_message)
+        → clear_error (DB清空 + broadcast_remove)
+        → AssistantResponseJob.perform_later(message)  [入队: high_priority]
+
+[Sidekiq执行]
+  AssistantResponseJob#perform(message)
+    → message.request_response                         [user_message.rb#L14-L16]
+      → chat.ask_assistant(message)
+        → assistant.respond_to(message)                [assistant.rb#L19-L58]
+          ├─ [成功] AssistantMessage 流式追加文本
+          │    after_create_commit 自动 broadcast_append 到 #messages
+          │    最后一条.role = "assistant"
+          │    → needs_assistant_response? = false     ← 错误条不再渲染
+          │
+          └─ [失败] rescue => e                        [assistant.rb#L60-L63]
+               stop_thinking
+               chat.add_error(e)
+                 → update!(error: e.to_json)           ← 持久化错误
+                 → broadcast_append to #messages       ← 实时追加错误条 (Turbo Stream)
+
+[用户看到错误]
+  页面渲染条件: error.present? && needs_assistant_response?  [show.html.erb#L27-L29]
+    → 渲染 _error.html.erb 错误条 + Retry 按钮               [_error.html.erb#L13-L16]
+      → DS::Button → button_to → <form method="post">        [ds/button.rb#L15]
+
+[用户点击Retry]
+  → POST /chats/:id/retry                                    [routes.rb#L22-L24]
+  → ChatsController#retry                                    [chats_controller.rb#L44-L47]
+       before_action :set_chat  (Current.user.chats.find)    ← 权限校验
+       @chat.retry_last_message!
+         Step1: update!(error: nil)                          ← 强制清空
+         Step2: conversation_messages.ordered.last
+                校验: present? && role == "user"             ← 核心入队条件
+         Step3: ask_assistant_later(last_message)
+                  clear_error (update! + broadcast_remove)   ← 双重清空
+                  AssistantResponseJob.perform_later          ← 重新入队 ⟲ 闭环
+  → redirect_to chat_path(@chat, thinking: true)
+       URL带?thinking=true → 渲染思考中指示器
 ```
+
+**关键差异提示：**
+- 视图层渲染按钮需要 `error.present?`，但模型层 `retry_last_message!` **不要求 error 非空**（强制清空即可）
+- 可通过构造 POST 请求对任意最后一条为 user 的对话触发重试
 
 ---
 
@@ -496,7 +530,7 @@ Job 执行失败（在 assistant.respond_to 内部）
 1. **状态机分离：** Sync 用 AASM（严格事件流转），Import 用 enum（直接 update，无事件机制），设计不统一
 2. **错误持久化：** 关键模型（Import、Sync、Chat、Message）均有独立 `error` 字段存储，但 FamilyExport 仅存状态，无详细错误信息
 3. **双层异常处理架构：** Job 层（仅 ApplicationJob 全局 retry_on/discard_on）+ Model 层（业务逻辑内 rescue），**主要容错逻辑在 Model 层**
-4. **两层重试漏斗：** ActiveJob `retry_on`（Deadlocked，5 次快速退避 1/4/9/16/25 秒）→ Sidekiq 原生重试（兜底 25 次，最长 21 天）
+4. **两层重试漏斗：** ActiveJob `retry_on`（Deadlocked，wait: 3.seconds, attempts: 5，固定 3 秒间隔 + 15% jitter，4 次重试约 10~14 秒）→ Sidekiq 原生重试（兜底 25 次，四次指数退避，最长 ~21 天）
 5. **DeserializationError 的静默丢弃：** 无任何重试/告警，依赖业务层定时任务（SyncCleanerJob）补偿"永远丢失"的任务
 
 ### 6.2 UI 驱动与触发链路
