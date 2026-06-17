@@ -350,22 +350,35 @@ end
 
 ---
 
-### 3.3 Chat（AI 对话）错误提示
+### 3.3 Chat（AI 对话）错误提示与重试触发
 
-**错误 UI Partial：** [_error.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/views/chats/_error.html.erb#L3-L17)
+**错误条渲染条件（双条件 AND）：** [chats/show.html.erb#L27-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/views/chats/show.html.erb#L27-L29)
+
+```erb
+<% if @chat.error.present? && @chat.needs_assistant_response? %>
+  <%= render "chats/error", chat: @chat %>
+<% end %>
+```
+
+必须**同时**满足：`error.present?`（错误字段非空）且 `needs_assistant_response?`（最后一条对话消息的 `role != "assistant"`，即 AI 未产出任何回复）。`role` 由消息子类实例方法返回：`UserMessage#role` → `"user"`（[user_message.rb#L6-L8](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/models/user_message.rb#L6-L8)），`AssistantMessage#role` → `"assistant"`（[assistant_message.rb#L4-L6](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/models/assistant_message.rb#L4-L6)）。
+
+**错误 UI Partial：** [_error.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/views/chats/_error.html.erb#L1-L18)
 
 - debug_mode? 时：显示详细错误信息 `<code><%= chat.error %></code>`
 - 普通模式："Failed to generate response. Please try again."
-- **Retry 按钮**：链接到 `retry_chat_path(chat)`
+- **Retry 按钮**：通过 `DS::Button` 组件生成（[ds/button.rb#L14-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/components/DS/button.rb#L14-L15)），内部调用 `button_to(retry_chat_path(chat))`，默认 **POST 方法**表单提交
 
-**控制器重试入口：** [chats_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/controllers/chats_controller.rb#L44-L47)
+**重试触发全链路（7 层）：**
 
-```ruby
-def retry
-  @chat.retry_last_message!
-  redirect_to chat_path(@chat, thinking: true)  # 显示思考中指示器
-end
-```
+| 层 | 环节 | 代码位置 | 触发条件/行为 |
+|---|------|---------|-------------|
+| 1 | 错误条渲染 | [show.html.erb#L27-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/views/chats/show.html.erb#L27-L29) | `error.present? && needs_assistant_response?` |
+| 2 | Retry 按钮 | [_error.html.erb#L13-L16](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/views/chats/_error.html.erb#L13-L16) | `DS::Button` → `button_to(href)` → `<form method="post">` |
+| 3 | 路由 | [routes.rb#L22-L24](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/config/routes.rb#L22-L24) | `POST /chats/:id/retry` → `ChatsController#retry` |
+| 4 | 控制器委托 | [chats_controller.rb#L44-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/controllers/chats_controller.rb#L44-L47) | `@chat.retry_last_message!` + `redirect_to thinking: true` |
+| 5 | 模型层判断 | [chat.rb#L30-L39](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/models/chat.rb#L30-L39) | `update!(error: nil)` → `last_message.role == "user"` → `ask_assistant_later` |
+| 6 | 重新入队 | [chat.rb#L59-L62](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/models/chat.rb#L59-L62) | `clear_error` + `AssistantResponseJob.perform_later` |
+| 7 | 执行闭环 | [assistant.rb#L60-L63](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/models/assistant.rb#L60-L63) | 成功 → 错误条消失；失败 → `add_error` 回到第 1 层 |
 
 ---
 
@@ -547,5 +560,5 @@ SyncJob 执行异常
 
 ### 6.4 死锁重试策略评估
 
-12. **Deadlocked 重试策略合理：** 5 次 × 二次指数退避（总计 ~55 秒）与数据库死锁的典型自愈周期匹配，几乎不会触发 Sidekiq 层的 25 次长周期重试
+12. **Deadlocked 重试策略合理：** wait: 3.seconds, attempts: 5（固定 3 秒间隔，4 次重试约 10~14 秒），与数据库死锁的典型自愈周期匹配，几乎不会触发 Sidekiq 层的 25 次长周期重试
 13. **缺省参数风险：** 未显式指定 `retry_on` 的 `attempts` 和 `wait`，依赖 Rails 默认值，未来 Rails 升级可能改变行为而无代码级感知
