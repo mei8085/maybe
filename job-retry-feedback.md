@@ -15,59 +15,70 @@ end
 ```
 
 **全局重试策略：**
-- `retry_on ActiveRecord::Deadlocked`：数据库死锁时自动重试（ActiveJob 层指数退避算法，详见 1.1.1）
+- `retry_on ActiveRecord::Deadlocked`：数据库死锁时自动重试（ActiveJob 层固定间隔重试，详见 1.1.1）
 - `discard_on ActiveJob::DeserializationError`：反序列化失败时直接丢弃（如关联记录已删除），不重试
 
 #### 1.1.1 `retry_on Deadlocked` 的退避策略深度分析
 
 **代码位置：** [application_job.rb#L2](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/jobs/application_job.rb#L2)
 
-由于 `retry_on` 调用时 **未显式指定 `:wait` 和 `:attempts` 参数**，将完全使用 Rails 7.2（ActiveJob）的默认行为：
+由于 `retry_on` 调用时 **未显式指定 `:wait`、`:attempts`、`:jitter` 参数**，将完全使用 Rails 7.2.2.1（ActiveJob 7.2.2.1）的默认行为：
 
 | 参数 | 默认值 | 说明 |
 |-----|-------|------|
-| `:attempts` | `5` | ActiveJob 层最多重试 5 次 |
-| `:wait` | `->(executions) { executions ** 2 }` | 二次指数退避，executions 为当前重试次数（从 1 开始） |
+| `:attempts` | `5` | **总尝试次数（含首次执行）**，即实际重试 4 次 |
+| `:wait` | `3.seconds` | **固定 3 秒等待**，每次重试间隔相同 |
+| `:jitter` | `0.15`（15%） | 在等待时间基础上加减随机抖动，避免"惊群效应" |
 | `:queue` | 当前队列 | 仍放回原队列（如 high_priority） |
 | `:priority` | 不指定 | 使用 Sidekiq 默认优先级 |
 
+> **重要澄清：** `retry_on` 的 `:attempts` 参数包含**首次执行**。`attempts: 5` 意味着：1 次原始执行 + 4 次重试。这与 Sidekiq 原生 retry 计数方式不同（Sidekiq 的 retry 次数不包含首次）。
+
 **死锁重试时间线（ActiveJob 层）：**
 
-| 第 N 次重试 | 等待时间公式 | 实际等待 | 距首次执行累计时间 |
-|-----------|------------|---------|-----------------|
-| 第 1 次 | `1 ** 2 = 1` | 1 秒 | 1 秒 |
-| 第 2 次 | `2 ** 2 = 4` | 4 秒 | 1 + 4 = 5 秒 |
-| 第 3 次 | `3 ** 2 = 9` | 9 秒 | 5 + 9 = 14 秒 |
-| 第 4 次 | `4 ** 2 = 16` | 16 秒 | 14 + 16 = 30 秒 |
-| 第 5 次 | `5 ** 2 = 25` | 25 秒 | 30 + 25 = 55 秒 |
+| 序号 | 性质 | 触发时机 | 等待时间（名义值） | 距首次执行累计时间（名义值） |
+|-----|------|---------|-------------------|---------------------------|
+| 第 0 次 | 原始执行 | 入队后立即 | 0 秒 | 0 秒 |
+| 第 1 次 | 第 1 次重试 | 第 0 次失败后 | 3 秒 ± 15% | ~3 秒 |
+| 第 2 次 | 第 2 次重试 | 第 1 次失败后 | 3 秒 ± 15% | ~6 秒 |
+| 第 3 次 | 第 3 次重试 | 第 2 次失败后 | 3 秒 ± 15% | ~9 秒 |
+| 第 4 次 | 第 4 次重试 | 第 3 次失败后 | 3 秒 ± 15% | ~12 秒 |
 
-若 5 次 ActiveJob 重试后死锁仍未解除，异常会 **向上冒泡到 Sidekiq 层**，此时进入 Sidekiq 的默认重试机制。
+> 加上 jitter 抖动（±15%），实际每次等待在 2.55s ~ 3.45s 之间，总计约 10~14 秒。
+
+若 5 次总尝试（4 次重试）后死锁仍未解除，异常会 **向上冒泡到 Sidekiq 层**，此时进入 Sidekiq 的默认重试机制。
 
 #### 1.1.2 ActiveJob `retry_on` 与 Sidekiq 原生重试的双层关系
 
-| 维度 | ActiveJob `retry_on` | Sidekiq 原生重试（兜底） |
-|-----|---------------------|----------------------|
-| 触发条件 | 抛出匹配的异常类（Deadlocked） | 任何未被捕获的异常（含 retry_on 耗尽后的异常） |
-| 最大重试次数 | 5 次（默认） | **25 次**（Sidekiq 默认） |
-| 退避公式 | `executions ** 2` 秒 | `(retry_count ** 4) + 15` 秒 |
-| 错误日志 | 无特殊处理 | Sidekiq::Dead 集合记录 |
-| 重试耗尽后 | 抛出异常给 Sidekiq | 移入 Dead 队列（需手动重试/清理） |
+| 维度 | ActiveJob `retry_on`（Deadlocked） | Sidekiq 原生重试（兜底） |
+|-----|-----------------------------------|----------------------|
+| 触发条件 | 抛出匹配的异常类（ActiveRecord::Deadlocked） | 任何未被捕获的异常（含 retry_on 耗尽后的异常） |
+| **总尝试次数** | 5 次（= 1 次原始 + 4 次重试） | **26 次**（= 1 次原始 + 25 次重试，Sidekiq 默认 `retry: 25`） |
+| 退避策略 | 固定间隔 3 秒 + 15% jitter | **四次指数退避**：`(retry_count ** 4) + 15` 秒 |
+| 退避时间跨度 | 约 10~14 秒内完成所有重试 | 从 16 秒到 390640 秒（≈4.5 天），25 次重试总跨度约 **21.4 天** |
+| 错误持久化 | 无特殊处理 | 失败 25 次后移入 Dead 集合 |
+| 重试耗尽后 | 抛出异常给 Sidekiq（进入 Sidekiq 重试流程） | 移入 Dead 队列（需手动重试/清理） |
 
-**双层重试最坏情况总耗时估算：**
-- ActiveJob 层 5 次 ≈ 55 秒
-- Sidekiq 层 25 次 ≈ `sum(n=1..25, n^4 + 15)` 秒 ≈ **21.4 天**（Sidekiq 默认设计用于长期自愈）
-- 实际中死锁几乎不会持续超过 ActiveJob 层的 55 秒
+**双层重试漏斗效应：**
+1. **第一层（快速通道）**：ActiveJob `retry_on` 在 10~14 秒内快速重试 4 次，适用于临时性死锁
+2. **第二层（长期自愈）**：若第一层耗尽，Sidekiq 原生重试接管，用四次指数退避在 21 天内重试 25 次
+3. **最终死亡**：Sidekiq 25 次重试全部失败后进入 Dead 队列，需人工介入
+
+**实际评估：**
+- 数据库死锁通常在秒级自愈，几乎不会超过 ActiveJob 层的 4 次重试
+- 因此死锁场景下 Sidekiq 原生重试几乎不会被触发
 
 #### 1.1.3 `discard_on DeserializationError` 的丢弃语义
 
 **触发场景：**
-- Job 入队时的参数（如 `self` 模型对象）在执行时已被删除
-- ActiveJob `GlobalID` 反序列化查找失败
+- Job 入队时的参数（如模型对象）在执行时已被删除
+- ActiveJob 通过 `GlobalID` 反序列化查找记录失败
 
 **行为：**
 - 无任何重试，直接丢弃
 - **不会触发 Sidekiq 的重试/Dead 队列**
-- 业务层必须通过状态机或定时任务检测此类"永远丢失"的任务（Import/Sync 的状态持久化和 SyncCleanerJob 的 stale 标记即为补偿机制）
+- 业务层必须通过状态机或定时任务检测此类"永远丢失"的任务
+- **补偿机制：** Import/Sync 的状态持久化 + SyncCleanerJob 的 stale 标记（超过 24h 未完成标记为失效）
 
 ### 1.2 Sidekiq 队列优先级配置
 
@@ -480,9 +491,27 @@ Job 执行失败（在 assistant.respond_to 内部）
 
 ## 6. 代码设计模式总结
 
-1. **状态机分离：** Sync 用 AASM，Import 用 enum（无事件机制），设计不统一
-2. **错误持久化：** 关键模型（Import、Sync、Chat）均有独立 `error` 字段存储
-3. **两层异常处理：** Job 层（少量）+ Model 层（业务逻辑内 rescue），主要在 Model 层
-4. **UI 状态驱动：** 视图完全依赖模型 status 枚举分支渲染，无独立的 ViewModel 层
-5. **实时更新差异：** Sync/Account 用 Turbo Stream 广播，FamilyExport 用定时轮询
-6. **重试按钮前置条件：** 失败视图中统一提供重试按钮，无次数限制
+### 6.1 重试与状态设计
+
+1. **状态机分离：** Sync 用 AASM（严格事件流转），Import 用 enum（直接 update，无事件机制），设计不统一
+2. **错误持久化：** 关键模型（Import、Sync、Chat、Message）均有独立 `error` 字段存储，但 FamilyExport 仅存状态，无详细错误信息
+3. **双层异常处理架构：** Job 层（仅 ApplicationJob 全局 retry_on/discard_on）+ Model 层（业务逻辑内 rescue），**主要容错逻辑在 Model 层**
+4. **两层重试漏斗：** ActiveJob `retry_on`（Deadlocked，5 次快速退避 1/4/9/16/25 秒）→ Sidekiq 原生重试（兜底 25 次，最长 21 天）
+5. **DeserializationError 的静默丢弃：** 无任何重试/告警，依赖业务层定时任务（SyncCleanerJob）补偿"永远丢失"的任务
+
+### 6.2 UI 驱动与触发链路
+
+6. **UI 纯状态驱动：** 视图完全依赖模型 status 枚举分支渲染，无独立的 ViewModel 层，状态与 UI 强耦合
+7. **重试按钮前置条件差异：** 视图层（错误条渲染）与模型层（实际入队）校验条件不完全一致，存在"UI 不可见但接口可调用"的场景
+8. **实时更新双轨制：** Sync/Account/Chat 用 Turbo Stream 点对点广播（即时），FamilyExport 用 turbo_refresh_interval 定时轮询（每 3 秒）
+9. **重试无次数限制：** Import/Chat 均无重试次数上限，无指数退避/熔断保护（完全由用户手动触发频率决定）
+
+### 6.3 Web 与 API 设计不一致
+
+10. **Chat 重试语义分裂：** Web 端复用原 UserMessage + 强制清空 error，API 端新建空 AssistantMessage，两者对消息历史的可观察行为完全不同
+11. **入口控制器宽松度不同：** ChatsController 直接委托模型（宽松），API 版本对最后一条消息类型做反向严格校验
+
+### 6.4 死锁重试策略评估
+
+12. **Deadlocked 重试策略合理：** 5 次 × 二次指数退避（总计 ~55 秒）与数据库死锁的典型自愈周期匹配，几乎不会触发 Sidekiq 层的 25 次长周期重试
+13. **缺省参数风险：** 未显式指定 `retry_on` 的 `attempts` 和 `wait`，依赖 Rails 默认值，未来 Rails 升级可能改变行为而无代码级感知
