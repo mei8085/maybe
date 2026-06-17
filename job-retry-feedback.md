@@ -15,8 +15,59 @@ end
 ```
 
 **全局重试策略：**
-- `retry_on ActiveRecord::Deadlocked`：数据库死锁时自动重试（Sidekiq 默认指数退避算法）
+- `retry_on ActiveRecord::Deadlocked`：数据库死锁时自动重试（ActiveJob 层指数退避算法，详见 1.1.1）
 - `discard_on ActiveJob::DeserializationError`：反序列化失败时直接丢弃（如关联记录已删除），不重试
+
+#### 1.1.1 `retry_on Deadlocked` 的退避策略深度分析
+
+**代码位置：** [application_job.rb#L2](file:///d:/fz/0601-2/solo-dogfeeding/code/22-maybe/app/jobs/application_job.rb#L2)
+
+由于 `retry_on` 调用时 **未显式指定 `:wait` 和 `:attempts` 参数**，将完全使用 Rails 7.2（ActiveJob）的默认行为：
+
+| 参数 | 默认值 | 说明 |
+|-----|-------|------|
+| `:attempts` | `5` | ActiveJob 层最多重试 5 次 |
+| `:wait` | `->(executions) { executions ** 2 }` | 二次指数退避，executions 为当前重试次数（从 1 开始） |
+| `:queue` | 当前队列 | 仍放回原队列（如 high_priority） |
+| `:priority` | 不指定 | 使用 Sidekiq 默认优先级 |
+
+**死锁重试时间线（ActiveJob 层）：**
+
+| 第 N 次重试 | 等待时间公式 | 实际等待 | 距首次执行累计时间 |
+|-----------|------------|---------|-----------------|
+| 第 1 次 | `1 ** 2 = 1` | 1 秒 | 1 秒 |
+| 第 2 次 | `2 ** 2 = 4` | 4 秒 | 1 + 4 = 5 秒 |
+| 第 3 次 | `3 ** 2 = 9` | 9 秒 | 5 + 9 = 14 秒 |
+| 第 4 次 | `4 ** 2 = 16` | 16 秒 | 14 + 16 = 30 秒 |
+| 第 5 次 | `5 ** 2 = 25` | 25 秒 | 30 + 25 = 55 秒 |
+
+若 5 次 ActiveJob 重试后死锁仍未解除，异常会 **向上冒泡到 Sidekiq 层**，此时进入 Sidekiq 的默认重试机制。
+
+#### 1.1.2 ActiveJob `retry_on` 与 Sidekiq 原生重试的双层关系
+
+| 维度 | ActiveJob `retry_on` | Sidekiq 原生重试（兜底） |
+|-----|---------------------|----------------------|
+| 触发条件 | 抛出匹配的异常类（Deadlocked） | 任何未被捕获的异常（含 retry_on 耗尽后的异常） |
+| 最大重试次数 | 5 次（默认） | **25 次**（Sidekiq 默认） |
+| 退避公式 | `executions ** 2` 秒 | `(retry_count ** 4) + 15` 秒 |
+| 错误日志 | 无特殊处理 | Sidekiq::Dead 集合记录 |
+| 重试耗尽后 | 抛出异常给 Sidekiq | 移入 Dead 队列（需手动重试/清理） |
+
+**双层重试最坏情况总耗时估算：**
+- ActiveJob 层 5 次 ≈ 55 秒
+- Sidekiq 层 25 次 ≈ `sum(n=1..25, n^4 + 15)` 秒 ≈ **21.4 天**（Sidekiq 默认设计用于长期自愈）
+- 实际中死锁几乎不会持续超过 ActiveJob 层的 55 秒
+
+#### 1.1.3 `discard_on DeserializationError` 的丢弃语义
+
+**触发场景：**
+- Job 入队时的参数（如 `self` 模型对象）在执行时已被删除
+- ActiveJob `GlobalID` 反序列化查找失败
+
+**行为：**
+- 无任何重试，直接丢弃
+- **不会触发 Sidekiq 的重试/Dead 队列**
+- 业务层必须通过状态机或定时任务检测此类"永远丢失"的任务（Import/Sync 的状态持久化和 SyncCleanerJob 的 stale 标记即为补偿机制）
 
 ### 1.2 Sidekiq 队列优先级配置
 
