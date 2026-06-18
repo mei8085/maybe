@@ -2,7 +2,7 @@
 
 ## 一、整体架构概览
 
-本项目快捷键系统采用 **三层协同架构**：全局监听层 → 焦点/作用域过滤层 → 命令分发层。核心技术栈为 `@github/hotkey` 库 + Stimulus 控制器 + HTML5 Dialog。
+本项目快捷键系统采用 **三层协同架构**：全局监听层 → 焦点/作用域过滤层 → 命令分发层。核心技术栈为 `@github/hotkey` v3.1.1 + Stimulus 控制器 + HTML5 Dialog。
 
 ```
 用户按键
@@ -22,7 +22,7 @@
 
 ### 2.1 核心库：@github/hotkey
 
-源码位置：[vendor/javascript/@github--hotkey.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/vendor/javascript/@github--hotkey.js)
+源码位置：[vendor/javascript/@github--hotkey.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/vendor/javascript/@github--hotkey.js)（v3.1.1，见 [importmap.rb:10](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/config/importmap.rb#L10)）
 
 **数据结构 — RadixTrie（基数树）：**
 - 使用前缀树存储所有已注册的快捷键组合，高效支持序列快捷键（如 `t t /`）
@@ -42,7 +42,7 @@ Object.keys(o.children).length === 0 && document.removeEventListener("keydown", 
 1. `event.defaultPrevented` → 已被阻止的事件直接跳过
 2. `event.target instanceof Node` → 合法性校验
 3. **焦点过滤**（见第三章）
-4. `eventToHotkeyString(e)` → 将键盘事件归一化为标准字符串（如 `Control+k`）
+4. `eventToHotkeyString(e)` → 将键盘事件归一化为标准字符串（如 `Control+k`、`Escape`）
 5. 在 RadixTrie 中逐级匹配，命中 `Leaf` 节点后：
    - 反向遍历绑定元素，配合 `data-hotkey-scope` 选择合适目标
    - 调用 `fireDeterminedAction(r, a.path)` 触发动作
@@ -50,7 +50,7 @@ Object.keys(o.children).length === 0 && document.removeEventListener("keydown", 
 
 ### 2.2 Stimulus 包装层：hotkey_controller
 
-源码位置：[app/javascript/controllers/hotkey_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/hotkey_controller.js)
+源码位置：[hotkey_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/hotkey_controller.js)
 
 ```javascript
 export default class extends Controller {
@@ -61,6 +61,41 @@ export default class extends Controller {
 ```
 
 **设计意图：** 将 `@github/hotkey` 的生命周期与 Stimulus 控制器的 DOM 绑定周期对齐——元素挂载时注册快捷键，卸载时自动清理，防止内存泄漏和幽灵快捷键。
+
+### 2.3 data-hotkey 属性的解析逻辑 — expandHotkeyToEdges
+
+`install(element)` 被调用时，读取 `element.getAttribute("data-hotkey")`，交给 `expandHotkeyToEdges` 解析。
+
+**解析规则（逐字符状态机）：**
+
+| 字符 | 作用 | 含义 |
+|---|---|---|
+| 空格 ` ` | 序列步分隔符 | `t t /` → 三步序列 |
+| 逗号 `,` | 替代键分隔符 | `k,K` → k 或 K |
+| 加号 `+` | 组合键修饰符连接 | `Control+k` |
+| 其他字符 | 键名的一部分 | 原样拼接到当前 token |
+
+**关键点：冒号 `:` 不是分隔符，它只是键名字符串的一部分。**
+
+解析后每个 token 再经过 `normalizeHotkey()`，该函数只做两件事：
+1. `localizeMod`：将 `Mod` 替换为 `Control`（Windows/Linux）或 `Meta`（macOS）
+2. `sortModifiers`：按 `Control → Alt → Meta → Shift → 键名` 排序
+
+**实际解析结果对照：**
+
+| data-hotkey 值 | expandHotkeyToEdges 输出 | 说明 |
+|---|---|---|
+| `"Escape"` | `[["Escape"]]` | 单步序列，单键 |
+| `"t t /"` | `[["t"], ["t"], ["/"]]` | 三步序列 |
+| `"k,K,ArrowUp,ArrowLeft"` | `[["k", "K", "ArrowUp", "ArrowLeft"]]` | 四个替代键 |
+| **`"esc:DS--dialog#close"`** | **`[["esc:DS--dialog#close"]]`** | **整个字符串被当作一个键名** |
+
+**`eventToHotkeyString` 对 Escape 键的输出：**
+- 读取 `event.key`，值为 `"Escape"`
+- 经过修饰符映射（无修饰符按下）和别名映射 `n = {" ":"Space","+":"Plus"}`（无 Escape 映射）
+- 最终输出：**`"Escape"`**
+
+**匹配结论：** RadixTrie 中注册的是 `"esc:DS--dialog#close"`，但键盘事件归一化为 `"Escape"`——二者永远不匹配。`data-hotkey="esc:DS--dialog#close"` 在 @github/hotkey 的路由中**是无效绑定**。
 
 ---
 
@@ -82,22 +117,27 @@ function isFormField(e) {
 }
 ```
 
-**在 keyDownHandler 中的应用：**
+**在 keyDownHandler 中的应用——全量短路逻辑：**
 ```javascript
 if (isFormField(e.target)) {
   const t = e.target;
-  if (!t.id) return;  // 表单字段无 id → 快捷键完全禁用
-  // 只有匹配 data-hotkey-scope="该字段id" 的元素才能响应
+  if (!t.id) return;  // ① 表单字段无 id → 所有快捷键禁用，直接退出
+  // ② 只有存在 data-hotkey-scope="该字段id" 的绑定元素时才继续
   if (!t.ownerDocument.querySelector(`[data-hotkey-scope="${t.id}"]`)) return;
 }
 ```
 
 **效果：** 用户在输入框输入时，全局导航类快捷键（如 `j/k`、`Escape` 关闭页面级菜单）不会误触发，避免打断输入流。
 
+**边界条件：**
+- `isFormField` 对 `contentEditable` 元素也返回 true，因此富文本编辑区同样会屏蔽全局快捷键
+- 判断粒度是"全有或全无"——无法区分"应屏蔽的字母键"和"仍需响应的修饰键组合"（如 `Cmd+Enter`）
+
 ### 3.2 data-hotkey-scope 作用域限定
 
-在 `Leaf` 节点的反向选择中：
+在 `Leaf` 节点的反向选择中（同一快捷键可能绑定了多个元素）：
 ```javascript
+const s = isFormField(n);  // n = e.target（当前焦点元素）
 for (let e = t.children.length - 1; e >= 0; e -= 1) {
   r = t.children[e];
   const o = r.getAttribute("data-hotkey-scope");
@@ -106,36 +146,99 @@ for (let e = t.children.length - 1; e >= 0; e -= 1) {
 ```
 
 规则：
-- **非表单焦点 (`s=false`)**：只响应没有 `data-hotkey-scope` 属性的绑定元素（即全局快捷键）
-- **表单焦点 (`s=true`)**：只响应 `data-hotkey-scope` 等于该表单字段 `id` 的绑定元素
+- **非表单焦点 (`s=false`)**：只匹配没有 `data-hotkey-scope` 属性的绑定元素（全局快捷键）
+- **表单焦点 (`s=true`)**：只匹配 `data-hotkey-scope` 等于当前焦点元素 `id` 的绑定元素
 
-### 3.3 HTML5 Dialog 原生焦点陷阱
+**边界条件：** 如果同一快捷键同时有带 scope 和不带 scope 的绑定元素，表单焦点下只会选带 scope 的那个；非表单焦点下只会选不带 scope 的那个——两者互斥，不会同时触发。
 
-Dialog 组件使用原生 `<dialog>` 元素的 `showModal()` 方法。
+### 3.3 HTML5 Dialog 的 Escape 关闭——两条并行路径
+
+Dialog 组件使用原生 `<dialog>` 元素。
 
 源码位置：
-- [app/components/DS/dialog.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.rb#L102-L106)
-- [app/components/DS/dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog_controller.js#L12-L17)
+- [dialog.rb:98-110](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.rb#L98-L110)（merged_opts 注入）
+- [dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog_controller.js)（Stimulus 控制器）
+- [dialog.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.html.erb)（模板）
 
-在 dialog.rb 的 `merged_opts` 中自动注入：
+在 [dialog.rb:102-106](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.rb#L102-L106) 的 `merged_opts` 中自动注入：
 ```ruby
 data[:controller] = [ "DS--dialog", "hotkey", data[:controller] ].compact.join(" ")
+data[:action] = [ "mousedown->DS--dialog#clickOutside", data[:action] ].compact.join(" ")
 data[:hotkey] = "esc:DS--dialog#close"
 ```
 
-**`<dialog showModal()>` 的原生行为：**
-- 对话框以外的所有 DOM 自动获得 `inert` 属性，无法被 Tab 聚焦或点击
-- 焦点被捕获在对话框内部
-- 按 `Esc` 键原生触发 `close` 事件
+**渲染后的 `<dialog>` 元素上会同时出现：**
+```html
+<dialog data-controller="DS--dialog hotkey ..."
+        data-action="mousedown->DS--dialog#clickOutside"
+        data-hotkey="esc:DS--dialog#close"
+        data-ds--dialog-auto-open-value="true"
+        data-ds--dialog-reload-on-close-value="false">
+```
 
-**叠加 @github/hotkey 的 `esc:DS--dialog#close`：**
-- Dialog 内部仍然存在快捷键响应（因为 `hotkey` 控制器挂在 `<dialog>` 自身上）
-- 外部页面的全局 `Escape` 快捷键（如 `_settings_nav.html.erb` 中的返回）因 `inert` 失效
-- 形成隐式的"模态作用域"
+**路径 A — 原生 `<dialog>` 行为（实际生效的路径）：**
 
-### 3.4 Menu 组件的局部监听
+`<dialog>.showModal()` 激活后，浏览器 UA 层面自动处理 Escape 键：
+1. 用户按 Escape → 浏览器在 UA 层触发 `cancel` 事件
+2. 若 `cancel` 未被 `preventDefault()` → 浏览器调用 `dialog.close()`
+3. `close` 事件在 dialog 上触发
+4. dialog 的 `open` 属性变为 `false`，页面其余部分解除 `inert`
 
-源码位置：[app/components/DS/menu_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/menu_controller.js#L37-L62)
+**路径 B — @github/hotkey 路由（失效的路径）：**
+
+1. 用户按 Escape → `keydown` 事件冒泡到 `document`
+2. `keyDownHandler` 调用 `eventToHotkeyString(e)` → 产生 `"Escape"`
+3. 在 RadixTrie 中查找 `"Escape"` → 找不到 `"esc:DS--dialog#close"`（见 2.3 节分析）→ 无匹配
+4. 此路径**永远不会触发 `DS--dialog#close`**
+
+**两条路径的关键差异：**
+
+| | 路径 A（原生） | 路径 B（hotkey，失效） |
+|---|---|---|
+| 触发条件 | UA 层自动处理 | RadixTrie 匹配（实际不匹配） |
+| 调用方法 | `dialog.close()`（浏览器内置） | `DS--dialog#close()`（Stimulus） |
+| `reloadOnClose` | **不执行** | 会执行 `Turbo.visit()` |
+| `e.preventDefault()` | 不涉及 | 会阻止原生 Escape 行为 |
+
+**后果：** [dialog_controller.js:26-32](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog_controller.js#L26-L32) 中的 `reloadOnClose` 逻辑在用户按 Escape 时不会被执行：
+
+```javascript
+close() {
+  this.element.close();
+  if (this.reloadOnCloseValue) {  // ← 原生 Escape 关闭时这段被跳过
+    Turbo.visit(window.location.href);
+  }
+}
+```
+
+### 3.4 Dialog 打开时外部 Escape 绑定的冲突
+
+当 `<dialog showModal()>` 打开时，页面其余部分被标记 `inert`。但 RadixTrie 中仍保留着外部元素的快捷键注册。
+
+源码位置：[_settings_nav.html.erb:43](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/settings/_settings_nav.html.erb#L43)
+
+```erb
+<%= link_to previous_path, ..., data: { controller: "hotkey", hotkey: "Escape" } do %>
+  <kbd>esc</kbd>
+<% end %>
+```
+
+**在 Dialog 打开时按 Escape 的实际执行流：**
+
+1. `keyDownHandler` 在 document 上触发
+2. `eventToHotkeyString(e)` → `"Escape"`
+3. RadixTrie 查找 `"Escape"` → **找到设置页链接**（其 `data-hotkey="Escape"` 正确注册）
+4. 反向遍历 Leaf 的 children，该链接无 `data-hotkey-scope`，焦点不在表单字段 → `i = true`
+5. `fireDeterminedAction(settingsNavLink, path)` → `settingsNavLink.click()`
+6. `e.preventDefault()` → **阻止了浏览器原生的 Dialog 关闭行为！**
+
+**这意味着：在设置页面上，如果 Dialog 是打开的，按 Escape 不会关闭 Dialog，而是触发页面返回导航。** 外部 `inert` 元素上的 `click()` 在程序层面仍能被调用（`inert` 只阻止用户交互，不阻止程序触发的 `click()`），而 `e.preventDefault()` 则阻止了原生的 Dialog Escape 关闭。
+
+**不过**，该链接有 `pointer-events-none` CSS 类，且通常 Turbo 对 `inert` 元素内的导航链接会有拦截。实际表现取决于浏览器对 `inert` + 程序化 `click()` 的处理细节——不同浏览器可能有差异。
+
+### 3.5 Menu 组件的局部监听
+
+源码位置：[menu_controller.js:37-62](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/menu_controller.js#L37-L62)
 
 Menu 不使用全局 `@github/hotkey`，而是在组件元素上直接监听：
 ```javascript
@@ -152,6 +255,7 @@ handleKeydown = (event) => {
 **特点：**
 - 作用域严格限定在菜单 DOM 子树内
 - `Escape` 同时负责关闭菜单 + 归还焦点到触发按钮
+- 不经过 RadixTrie，不与其他 Escape 绑定冲突
 
 ---
 
@@ -162,7 +266,7 @@ handleKeydown = (event) => {
 ```javascript
 function fireDeterminedAction(e, t) {
   const n = new CustomEvent("hotkey-fire", { cancelable: true, detail: { path: t } });
-  const i = !e.dispatchEvent(n);  // 允许外部阻止默认触发
+  const i = !e.dispatchEvent(n);  // 允许外部通过 hotkey-fire 事件阻止触发
   i || (isFormField(e) ? e.focus() : e.click());
 }
 ```
@@ -173,9 +277,13 @@ function fireDeterminedAction(e, t) {
 | 表单字段 (`isFormField=true`) | `e.focus()` | 将焦点移到某个输入框 |
 | 非表单元素 | `e.click()` | 触发按钮/链接的点击事件 |
 
+**边界条件：**
+- `hotkey-fire` 事件是 `cancelable` 的——外部代码可以 `addEventListener("hotkey-fire", e => e.preventDefault())` 来阻止默认的 click/focus 行为
+- `e.focus()` 对 `hidden` 元素无效——但 `hidden` 按钮上的 `isFormField` 返回 false，所以实际走 `click()` 路径
+
 ### 4.2 Stimulus data-action 桥接
 
-`click()` 事件触发后，由 Stimulus 的 Action 系统接管。
+`click()` 事件触发后，由 Stimulus 的 Action 系统接管。关键：`click()` 是在**绑定 hotkey 的元素自身**上触发的，该元素同时有 `data-action` 声明。
 
 **声明式绑定示例：**
 
@@ -189,7 +297,9 @@ function fireDeterminedAction(e, t) {
    ```ruby
    data[:hotkey] = "esc:DS--dialog#close"
    ```
-   注意：`esc:DS--dialog#close` 语法中 `esc` 是键，冒号后是**该元素上绑定的元素 ID 或作用域标识**，实际的动作仍由同元素的 `data-controller="DS--dialog"` 配合 `click()` 或 Stimulus 约定路由。
+   **此绑定无效**——`"esc:DS--dialog#close"` 整体被当作键名，无法匹配 `eventToHotkeyString` 输出的 `"Escape"`。实际的 Dialog Escape 关闭走的是原生 `<dialog>` 路径（见 3.3 节）。
+   
+   如果要让此绑定生效，`data-hotkey` 应改为 `"Escape"`，并添加 `data-action="keydown->DS--dialog#close"` 或通过 Stimulus 的 click → action 路由。但需注意与原生行为的 `preventDefault` 协调。
 
 3. **列表键盘导航** — [_container.html.erb:23-24](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/accounts/new/_container.html.erb#L23-L24)
    ```erb
@@ -199,9 +309,19 @@ function fireDeterminedAction(e, t) {
    ```
    流程：`k`/`↑`/`←` → `button.click()` → Stimulus 路由到 [list_keyboard_navigation_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/list_keyboard_navigation_controller.js) 的 `focusPrevious()` → 计算索引 → `element.focus()`
 
+4. **设置页 Escape 返回** — [_settings_nav.html.erb:43](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/settings/_settings_nav.html.erb#L43)
+   ```erb
+   <%= link_to previous_path, ..., data: { controller: "hotkey", hotkey: "Escape" } do %>
+     <kbd>esc</kbd>
+   <% end %>
+   ```
+   流程：`Escape` → `link.click()` → 浏览器导航到 `previous_path`
+   
+   **注意**：这是代码库中唯一一个**正确使用** `data-hotkey="Escape"` 的绑定（与 `eventToHotkeyString` 的输出一致）。
+
 ### 4.3 Chat 输入的特殊处理
 
-源码位置：[app/javascript/controllers/chat_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/chat_controller.js#L36-L41)
+源码位置：[chat_controller.js:36-41](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/chat_controller.js#L36-L41)
 
 ```javascript
 handleInputKeyDown(e) {
@@ -218,12 +338,14 @@ handleInputKeyDown(e) {
 - 业务需求是 Enter 发送（而非换行），Shift+Enter 换行——这是输入框内部语义，与导航快捷键体系不同
 - 因此直接在输入元素上绑定 `keydown` 监听
 
+**边界条件：** Chat 区域的 `<div>` 声明了 `data-controller="chat hotkey"`（见 [application.html.erb:140](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/layouts/application.html.erb#L140)），但并未设置 `data-hotkey` 属性——所以 `hotkey` 控制器虽然挂载，`install(this.element)` 时读到空字符串，不会注册任何快捷键。这个 `hotkey` 控制器的挂载可能是预留扩展位或历史遗留。
+
 ### 4.4 Turbo Confirm Dialog 覆盖
 
 源码位置：
-- [app/javascript/controllers/application.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/application.js#L9-L17)
-- [app/javascript/controllers/confirm_dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/confirm_dialog_controller.js)
-- [app/helpers/custom_confirm.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/helpers/custom_confirm.rb)
+- [application.js:9-17](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/application.js#L9-L17)
+- [confirm_dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/confirm_dialog_controller.js)
+- [custom_confirm.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/helpers/custom_confirm.rb)
 
 ```javascript
 Turbo.config.forms.confirm = (data) => {
@@ -238,53 +360,80 @@ Turbo.config.forms.confirm = (data) => {
 1. 带 `data-turbo-confirm` 的表单提交 → Turbo 调用自定义 confirm
 2. 获取全局单例 `#confirm-dialog` 的 Stimulus 控制器
 3. `handleConfirm()` 准备数据、调用 `showModal()`、返回 Promise
-4. 用户在 Modal 中按 Enter（确认按钮 autofocus）或点按钮 → Promise resolve
-5. **同时**，Dialog 上的 `hotkey` 控制器绑定 `esc:DS--dialog#close`，按 ESC 关闭对话框（此时 Promise resolve 为 false，取消提交）
+4. 用户在 Modal 中按 Enter（确认按钮 `autofocus`）或点按钮 → `dialog.returnValue = "confirm"` → Promise resolve(true)
+5. 用户按 Escape → **原生 `<dialog>` 行为关闭** → `dialog.returnValue = ""` → `"" !== "confirm"` → Promise resolve(false) → 取消提交
+
+**Confirm Dialog 的 Escape 处理恰好正确**——虽然 `data-hotkey="esc:DS--dialog#close"` 无效，但原生关闭将 `returnValue` 设为空字符串，等效于"取消"。
 
 ---
 
-## 五、"页面上下文不直观"的根因分析
+## 五、全局监听、输入焦点限制与命令触发的边界条件总结
 
-基于上述架构，用户感知"快捷键触发命令时页面上下文不太直观"的可能原因：
+### 5.1 三层过滤的完整判定链
 
-### 5.1 多层 ESC 语义叠加，无视觉反馈
-
-| 层级 | ESC 行为 | 来源 |
-|---|---|---|
-| 全局设置页 | 返回上一页 | [_settings_nav.html.erb:43](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/settings/_settings_nav.html.erb#L43) |
-| 打开的 Menu | 关闭菜单 + 焦点回按钮 | [menu_controller.js:57-62](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/menu_controller.js#L57-L62) |
-| 打开的 Dialog | 关闭 Modal | [dialog.rb:106](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.rb#L106) |
-| Confirm Dialog | 取消操作 | 继承 Dialog 机制 |
-
-用户按下 ESC 时，**无法从视觉上预判**当前是哪一层在响应——尤其当 Dialog 内部嵌套 Menu 时。
-
-### 5.2 "隐藏按钮"模式导致映射不可见
-
-所有 `@github/hotkey` 绑定都通过 `<button hidden>` 实现：
-
-```erb
-<button hidden data-controller="hotkey" data-hotkey="k,K,ArrowUp,ArrowLeft"
-  data-action="list-keyboard-navigation#focusPrevious">Previous</button>
+```
+keydown 事件到达 document
+  │
+  ├─ event.defaultPrevented? ──→ 是 → 退出（被其他处理器吞掉）
+  │
+  ├─ event.target instanceof Node? ──→ 否 → 退出
+  │
+  ├─ isFormField(event.target)?
+  │   ├─ 是 → target.id 存在?
+  │   │   ├─ 否 → 退出（表单字段无 id，所有快捷键禁用）
+  │   │   └─ 是 → DOM 中存在 [data-hotkey-scope="target.id"]?
+  │   │       ├─ 否 → 退出（无该字段专属的快捷键绑定）
+  │   │       └─ 是 → 继续匹配（只匹配带 scope 的绑定）
+  │   └─ 否 → 继续匹配（只匹配不带 scope 的全局绑定）
+  │
+  ├─ RadixTrie.get(eventToHotkeyString(event))
+  │   ├─ undefined → SequenceTracker 可能进入序列中间态
+  │   │   （如已按了 "t"，等待下一步，1500ms 超时重置）
+  │   └─ 找到节点 →
+  │       ├─ RadixTrie 中间节点 → 等待序列下一步
+  │       └─ Leaf 节点 →
+  │           ├─ 遍历 children 找匹配元素
+  │           │   ├─ 无匹配 → 什么都不做
+  │           │   └─ 有匹配 → fireDeterminedAction + preventDefault
+  │           └─ SequenceTracker.reset()
+  │
+  └─ 无匹配 → SequenceTracker.reset()
+       （原生浏览器行为不被 preventDefault，如 <dialog> 的 Escape 关闭）
 ```
 
-- DOM 中存在但不可见，DevTools 中才能看到绑定关系
-- 无统一快捷键帮助面板（如按 `?` 显示所有可用快捷键）
-- 页面上下文切换（如进入 Dialog）后可用快捷键集合变化了，但 UI 没有任何提示
+### 5.2 `<dialog showModal()>` 打开时的 Escape 优先级
 
-### 5.3 Dialog 的原生 inert 与 hotkey 作用域的隐式冲突
+```
+用户按 Escape（dialog 打开状态）
+  │
+  ├─ [1] keydown 事件 → @github/hotkey keyDownHandler
+  │     ├─ RadixTrie 中有 "Escape" 绑定?（如 settings_nav）
+  │     │   ├─ 是 → fireDeterminedAction → click() → e.preventDefault()
+  │     │   │        ⚠ 原生 dialog 关闭被阻止！
+  │     │   └─ 否 → 不 preventDefault
+  │     └─ RadixTrie 中 "esc:DS--dialog#close" 不匹配 "Escape"
+  │          → dialog 的 hotkey 绑定永远不触发
+  │
+  └─ [2] 浏览器 UA 层 → cancel 事件
+        ├─ 若 keydown 被 preventDefault → cancel 不触发（dialog 不关闭）
+        └─ 若 keydown 未被 preventDefault → cancel 触发 → dialog.close()
+             ⚠ 绕过 DS--dialog#close()，reloadOnClose 不执行
+```
 
-`<dialog showModal()>` 让页面其余部分 `inert`，但 @github/hotkey 的 RadixTrie 中仍然注册着那些全局快捷键。按键事件虽然发生在 Dialog 焦点内，但：
+### 5.3 各快捷键场景的边界条件速查表
 
-- Dialog 元素本身注册了 `hotkey` 控制器 → 它的快捷键先被遍历匹配
-- 外部页面的快捷键因 `inert` 导致 click/focus 无效而"静默失败"
-- **没有日志或视觉提示**说明某个快捷键因为模态被忽略了
-
-### 5.4 isFormField 的"全有或全无"策略过于粗糙
-
-当焦点在 Chat 输入框内时：
-- `isFormField` 返回 `true`
-- 所有无 `data-hotkey-scope` 的全局快捷键（如侧边栏折叠、主题切换）全部静默失效
-- 用户可能期望某些快捷键（如 `Cmd+Enter` 发送、`Esc` 失焦输入框）在输入态下仍可工作，但当前无区分粒度
+| 场景 | 焦点位置 | isFormField | 快捷键是否生效 | 原因 |
+|---|---|---|---|---|
+| 页面空白处按 `j/k` | 普通元素 | false | ✅ 生效 | 匹配全局导航绑定 |
+| 输入框内按 `j/k` | input/textarea | true | ❌ 禁用 | 无 `data-hotkey-scope` 匹配 |
+| Dialog 内按 `j/k` | dialog 内普通元素 | false | ✅ 生效（如果 dialog 内有绑定） | dialog 内元素不在 inert 区域 |
+| Dialog 外按 `j/k` | inert 元素 | false | ⚠️ 匹配但 click 可能无效 | RadixTrie 找到绑定但目标 inert |
+| 设置页按 Escape | 普通元素 | false | ✅ 导航返回 | `data-hotkey="Escape"` 正确匹配 |
+| 设置页 Dialog 开时按 Escape | dialog 内元素 | 视具体元素 | ⚠️ 可能导航返回而非关闭 dialog | 外部 Escape 绑定在 RadixTrie 中仍存在 |
+| 非 Dialog 页面按 Escape | 普通元素 | false | ❌ 无响应 | 无匹配的 Escape 绑定 |
+| Dialog 内按 Escape | dialog 内普通元素 | false | ✅ 关闭 dialog | 原生 `<dialog>` 行为（非 hotkey） |
+| Dialog 内输入框按 Escape | dialog 内 input | true | ⚠️ 原生行为仍关闭 dialog | `isFormField` 阻止 hotkey 但不阻止 UA 层 |
+| Confirm Dialog 按 Escape | dialog 内元素 | 视具体元素 | ✅ 取消操作 | 原生关闭 → returnValue="" → 非确认 |
 
 ---
 
@@ -292,16 +441,19 @@ Turbo.config.forms.confirm = (data) => {
 
 | 文件 | 职责 |
 |---|---|
-| [@github--hotkey.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/vendor/javascript/@github--hotkey.js) | 全局 keydown 监听、RadixTrie、作用域匹配 |
+| [@github--hotkey.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/vendor/javascript/@github--hotkey.js) | 全局 keydown 监听、RadixTrie、expandHotkeyToEdges 解析、作用域匹配 |
+| [importmap.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/config/importmap.rb#L10) | 声明 @github/hotkey v3.1.1 |
 | [hotkey_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/hotkey_controller.js) | Stimulus 包装，管理 install/uninstall 生命周期 |
-| [dialog.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.rb) | Dialog 组件，自动注入 hotkey + ESC 关闭 |
-| [dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog_controller.js) | showModal()、点击外部关闭、重载逻辑 |
+| [dialog.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.rb#L98-L110) | Dialog 组件 merged_opts，注入 hotkey + `esc:DS--dialog#close` |
+| [dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog_controller.js) | showModal()、clickOutside、close()（含 reloadOnClose） |
 | [dialog.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/dialog.html.erb) | Dialog 模板，使用原生 `<dialog>` |
-| [menu_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/menu_controller.js) | 菜单局部 ESC 监听、焦点管理 |
+| [menu_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/menu_controller.js#L57-L62) | 菜单局部 ESC 监听、焦点管理 |
 | [list_keyboard_navigation_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/list_keyboard_navigation_controller.js) | j/k/方向键导航列表项 |
-| [chat_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/chat_controller.js) | Chat 输入框 Enter/Shift+Enter 语义 |
+| [chat_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/chat_controller.js#L36-L41) | Chat 输入框 Enter/Shift+Enter 语义 |
 | [confirm_dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/confirm_dialog_controller.js) | Turbo 自定义 confirm 弹窗 |
-| [application.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/application.js) | Stimulus 启动 + Turbo.confirm 覆盖 |
-| [_htmldoc.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/layouts/shared/_htmldoc.html.erb) | 全局快捷键（开发环境 t t / 切换主题） |
-| [_container.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/accounts/new/_container.html.erb) | 账户新建流程中的列表键盘导航 |
+| [application.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/javascript/controllers/application.js#L9-L17) | Stimulus 启动 + Turbo.confirm 覆盖 |
+| [_htmldoc.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/layouts/shared/_htmldoc.html.erb#L18) | 全局快捷键（开发环境 `t t /` 切换主题） |
+| [_container.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/accounts/new/_container.html.erb#L23-L24) | 账户新建流程中的列表键盘导航 |
+| [_settings_nav.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/settings/_settings_nav.html.erb#L43) | 设置页 Escape 返回（唯一正确的 `data-hotkey="Escape"` 绑定） |
+| [application.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/views/layouts/application.html.erb#L140) | Chat 区域挂载 `chat hotkey` 双控制器 |
 | [custom_confirm.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/helpers/custom_confirm.rb) | confirm 弹窗数据构造 |
