@@ -97,47 +97,132 @@ export default class extends Controller {
 
 **匹配结论：** RadixTrie 中注册的是 `"esc:DS--dialog#close"`，但键盘事件归一化为 `"Escape"`——二者永远不匹配。`data-hotkey="esc:DS--dialog#close"` 在 @github/hotkey 的路由中**是无效绑定**。冒号后的 `DS--dialog#close` 对 hotkey 库无意义，看起来是写代码时混淆了 `data-action` 语法（`controller#method`）和 `data-hotkey` 语法。
 
-### 2.4 序列按键状态的重置机制
+### 2.4 序列按键状态的重置机制 — 逐行代码追踪
 
-**两个核心变量：**
-- `c`：当前在 RadixTrie 中的位置指针（初始指向根节点 `o`）
-- `a`：`SequenceTracker` 实例，维护 `_path` 按键序列数组 + 超时计时器
+源码位置：[@github--hotkey.js](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/vendor/javascript/@github--hotkey.js)
 
-**SequenceTracker 关键方法：**
+#### 2.4.1 三个核心变量
+
 ```javascript
-class SequenceTracker {
-  registerKeypress(e) {
-    this._path = [...this._path, eventToHotkeyString(e)];
-    this.startTimer();  // 每次按键重启 1500ms 计时器
-  }
-  reset() {
-    this.killTimer();
-    this._path = [];
-    this.onReset?.call(this);  // 回调：c = o（回到根节点）
-  }
-}
-SequenceTracker.CHORD_TIMEOUT = 1500;
+const o = new RadixTrie;        // 根节点（固定不变）
+let c = o;                      // 当前位置指针（每次按键后可能移动）
+const a = new SequenceTracker({ // 序列追踪器
+  onReset() { c = o }           // reset() 的回调：把 c 指回根节点
+});
 ```
 
-**序列状态重置的五种场景：**
+- `c` 是序列进度的"书签"——指向 RadixTrie 中当前匹配到的层级
+- `a.reset()` 做两件事：清空 `_path` 数组 + 把 `c` 指回根节点 `o`
 
-| 场景 | 是否重置 | 触发方式 | 说明 |
-|---|---|---|---|
-| 命中 Leaf 节点 | ✅ 立即重置 | `a.reset()` | 动作触发后清空序列 |
-| 完全不匹配（`t` 为 falsy） | ✅ 立即重置 | `a.reset()` | 序列中断，回到根节点 |
-| 命中中间节点（RadixTrie 非 Leaf） | ❌ 不重置 | — | 序列继续，等待下一步按键 |
-| 超时 1500ms 无新按键 | ✅ 超时重置 | `setTimeout` → `a.reset()` | 序列过期自动清理 |
-| `isFormField` 过滤早期 return | ❌ 不重置 | — | **序列状态保留但不推进**，计时器继续跑 |
+#### 2.4.2 keyDownHandler 完整逻辑展开
 
-**关键边界：isFormField 过滤 return 时不重置。** 代码原文：
+将 minified 代码展开为可读伪代码，**每一步标注 `c` 和 `a` 的变化**：
+
+```javascript
+function keyDownHandler(e) {
+  // ── 前置过滤 ──
+  if (e.defaultPrevented) return;                    // ① 已被阻止 → 退出
+  if (!(e.target instanceof Node)) return;           // ② 非法 target → 退出
+  if (isFormField(e.target)) {                       // ③ 表单字段过滤
+    const t = e.target;
+    if (!t.id) return;                               //    无 id → 退出
+    if (!t.ownerDocument.querySelector(              //    无 scope 绑定 → 退出
+      `[data-hotkey-scope="${t.id}"]`
+    )) return;
+  }
+  // ⚠ 注意：③ 中的三个 return 都不调用 a.reset()
+  //    序列状态保留，计时器继续跑
+
+  // ── 核心匹配 ──
+  const t = c.get(eventToHotkeyString(e));
+  //        ↑ 从当前位置 c 查找按键对应的子节点
+
+  if (t) {                                           // ④ 找到了子节点
+    a.registerKeypress(e);                           //    _path 推入本次按键 + 重启 1500ms 计时
+    c = t;                                           //    移动书签到子节点
+
+    if (t instanceof Leaf) {                         // ⑤ 子节点是 Leaf（序列完成）
+      const n = e.target;
+      let i = false;
+      let r;
+      const s = isFormField(n);
+      for (let e = t.children.length - 1; e >= 0; e -= 1) {
+        r = t.children[e];
+        const o = r.getAttribute("data-hotkey-scope");
+        if (!s && !o || s && n.id === o) {           //    scope 匹配
+          i = true;
+          break;
+        }
+      }
+      if (r && i) {
+        fireDeterminedAction(r, a.path);             //    触发动作
+        e.preventDefault();                          //    阻止默认行为
+      }
+      a.reset();                                     //    ← 无论是否触发动作，都重置！
+                                                       //      a._path = [], c = o
+
+    } else {                                         // ⑥ 子节点是 RadixTrie（中间节点）
+      // 什么都不做！
+      // c 已经指向中间节点，a._path 已记录本次按键
+      // 等待下一次 keydown → 从 c（中间节点）继续查找
+    }
+
+  } else {                                           // ⑦ 没找到子节点（完全不匹配）
+    a.reset();                                       //    ← 立即重置！
+                                                       //      a._path = [], c = o
+  }
+}
+```
+
+#### 2.4.3 五种场景的状态变化对照
+
+以项目中的序列快捷键 `t t /`（主题切换）为例，RadixTrie 结构：
+
+```
+根节点 o
+  └── "t" → RadixTrie（中间节点）
+        └── "t" → RadixTrie（中间节点）
+              └── "/" → Leaf（挂载 theme#toggle 按钮）
+```
+
+| # | 用户操作 | `c.get(按键)` 结果 | 走哪条分支 | `c` 变化 | `a._path` 变化 | 是否重置 |
+|---|---|---|---|---|---|---|
+| 1 | 按 `t`（第 1 次） | 找到中间节点 `"t"` | ④→⑥ | `o → 中间节点1` | `[] → ["t"]` | ❌ 不重置，等待下一步 |
+| 2 | 按 `t`（第 2 次） | 找到中间节点 `"t"` | ④→⑥ | `中间节点1 → 中间节点2` | `["t"] → ["t","t"]` | ❌ 不重置，等待下一步 |
+| 3 | 按 `/` | 找到 Leaf | ④→⑤ | `中间节点2 → Leaf` | `["t","t","/"]` | ✅ `a.reset()` → `c=o, _path=[]` |
+| 4 | 按 `t` 后按 `k` | `c="中间节点1"`, `.get("k")` 为 `undefined` | ⑦ | — | — | ✅ `a.reset()` → `c=o, _path=[]` |
+| 5 | 按 `t` 后等 1500ms | 超时 | — | — | — | ✅ `a.reset()` → `c=o, _path=[]` |
+| 6 | 按 `t` 后切到输入框按键 | `isFormField` return | ③ | 不变 | 不变 | ❌ 不重置，计时继续 |
+
+**核心区分：分支 ④→⑥ vs 分支 ⑦**
+
+- **④→⑥ 找到了子节点且是中间节点**：这是"序列进行中"——`c` 移动到子节点，`a._path` 记录按键，计时器重启，等待下一步
+- **⑦ 完全没找到子节点**：这是"序列中断"——`a.reset()` 立即执行，`c` 回到根节点，`_path` 清空
+
+二者的区别完全由 `c.get(eventToHotkeyString(e))` 的返回值决定：
+- 返回 `RadixTrie 实例` → 进入 ④→⑥ 分支，序列继续
+- 返回 `undefined` → 进入 ⑦ 分支，序列立即重置
+- 返回 `Leaf 实例` → 进入 ④→⑤ 分支，动作触发后重置
+
+#### 2.4.4 isFormField 过滤 return 不重置的隐含影响
+
+代码中 `isFormField` 的三个 `return` 路径都不调用 `a.reset()`：
+
 ```javascript
 if (isFormField(e.target)) {
   const t = e.target;
-  if (!t.id) return;                                  // ← 直接 return，不调用 a.reset()
-  if (!t.ownerDocument.querySelector(...)) return;    // ← 直接 return，不调用 a.reset()
+  if (!t.id) return;                               // ← 不重置
+  if (!t.ownerDocument.querySelector(...)) return;  // ← 不重置
 }
 ```
-这意味着：如果用户在输入框里打字，序列状态停留在之前的位置（比如已按了 `"t"`），不会因为输入框内的按键而重置，也不会推进。直到超时 1500ms 后才会自动重置。
+
+**实际后果：** 如果用户按了序列首键 `"t"`（`c` 指向中间节点），然后切到输入框打字：
+1. 输入框内每次 keydown 都经过 ③ 的 `return` → `c` 仍停留在中间节点
+2. `a._path` 仍为 `["t"]`，计时器在跑
+3. 用户如果 1500ms 内切回非表单元素并按 `"t"` → 序列继续（从中间节点再推进一步）
+4. 如果超时 → `a.reset()` 自动清理
+
+这个行为是**有意设计**还是**遗漏**？从代码结构看，`isFormField` 过滤位于 RadixTrie 匹配之前，它只决定"是否进入匹配逻辑"，但不干预已有的序列状态。设计意图可能是：输入框内的按键不应打断用户之前在非输入区域启动的序列操作。
 
 ---
 
@@ -464,18 +549,23 @@ keydown 事件到达 document
 
 ### 5.3 各快捷键场景的边界条件速查表
 
-| 场景 | 焦点位置 | isFormField | 快捷键是否生效 | 原因 |
-|---|---|---|---|---|
-| 页面空白处按 `j/k` | 普通元素 | false | ✅ 生效 | 匹配全局导航绑定 |
-| 输入框内按 `j/k` | input/textarea | true | ❌ 禁用 | 无 `data-hotkey-scope` 匹配 |
-| Dialog 内按 `j/k` | dialog 内普通元素 | false | ✅ 生效（如果 dialog 内有绑定） | dialog 内元素不在 inert 区域 |
-| Dialog 外按 `j/k` | inert 元素 | false | ⚠️ 匹配但 click 可能无效 | RadixTrie 找到绑定但目标 inert |
-| 设置页按 Escape | 普通元素 | false | ✅ 导航返回 | `data-hotkey="Escape"` 正确匹配 |
-| 设置页 Dialog 开时按 Escape | dialog 内元素 | 视具体元素 | ⚠️ 可能导航返回而非关闭 dialog | 外部 Escape 绑定在 RadixTrie 中仍存在 |
-| 非 Dialog 页面按 Escape | 普通元素 | false | ❌ 无响应 | 无匹配的 Escape 绑定 |
-| Dialog 内按 Escape | dialog 内普通元素 | false | ✅ 关闭 dialog | 原生 `<dialog>` 行为（非 hotkey） |
-| Dialog 内输入框按 Escape | dialog 内 input | true | ⚠️ 原生行为仍关闭 dialog | `isFormField` 阻止 hotkey 但不阻止 UA 层 |
-| Confirm Dialog 按 Escape | dialog 内元素 | 视具体元素 | ✅ 取消操作 | 原生关闭 → returnValue="" → 非确认 |
+| # | 场景 | 焦点位置 | isFormField | 快捷键是否生效 | 原因 |
+|---|---|---|---|---|---|
+| 1 | 页面空白处按 `j/k` | 普通元素 | false | ✅ 生效 | 匹配全局导航绑定 |
+| 2 | 输入框内按 `j/k` | input/textarea | true | ❌ 禁用 | 无 `data-hotkey-scope`，直接 return |
+| 3 | 输入框内按序列首键 | input | true | ❌ 无效且不重置 | isFormField 过滤 return，序列状态冻结，计时继续 |
+| 4 | Dialog 内按 `j/k` | dialog 内普通元素 | false | ✅ 生效（如有绑定） | dialog 内元素不在 inert 区域 |
+| 5 | Dialog 外按 `j/k` | inert 元素 | false | ⚠ 匹配但 click 可能无效 | RadixTrie 找到绑定但目标元素 inert |
+| 6 | 设置页按 Escape | 普通元素 | false | ✅ 导航返回 | `data-hotkey="Escape"` 正确匹配 |
+| 7 | 设置页 Dialog 开时按 Escape | dialog 内元素 | 视具体元素 | ⚠ 可能导航返回而非关 dialog | 外部 Escape 绑定在 RadixTrie 中仍存在，preventDefault 阻止原生关闭 |
+| 8 | 非 Dialog 页面按 Escape | 普通元素 | false | ❌ 无响应 | 无匹配的 Escape 绑定，序列直接 reset |
+| 9 | Dialog 内按 Escape | dialog 内普通元素 | false | ✅ 关闭 dialog | 原生 `<dialog>` UA 层 cancel 事件（非 hotkey） |
+| 10 | Dialog 内输入框按 Escape | dialog 内 input | true | ⚠ 原生行为仍关 dialog | isFormField 阻止 hotkey 但不阻止 UA 层 cancel |
+| 11 | Confirm Dialog 按 Escape | dialog 内元素 | 视具体元素 | ✅ 取消操作 | 原生关闭 → returnValue="" → 非确认 |
+| 12 | Menu 内按 Escape | 菜单内元素 | 视具体元素 | ✅ 关菜单 + 可能连带全局 | Menu handleKeydown 先关菜单，冒泡后全局继续匹配 |
+| 13 | Menu + Dialog 嵌套时按 Escape | 菜单内元素 | 视具体元素 | ⚠ 关菜单 + 可能阻止 dialog 关 | 全局 Escape 匹配 → preventDefault → 阻止原生 dialog 关闭 |
+| 14 | 序列中间按不匹配的键 | 普通元素 | false | ✅ 立即重置 | `t` 为 falsy → `a.reset()`，序列清空 |
+| 15 | 序列中间切换到输入框 | input | true | ⚠ 序列冻结计时中 | isFormField return 不重置，1500ms 后超时重置 |
 
 ---
 
