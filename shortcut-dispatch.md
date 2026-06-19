@@ -75,7 +75,7 @@ export default class extends Controller {
 | 加号 `+` | 组合键修饰符连接 | `Control+k` |
 | 其他字符 | 键名的一部分 | 原样拼接到当前 token |
 
-**关键点：冒号 `:` 不是分隔符，它只是键名字符串的一部分。**
+**关键点：冒号 `:` 不是分隔符，它只是键名字符串的一部分。** `data-hotkey` 属性本身**不包含动作声明**——动作由同元素上的 `data-action`（Stimulus 约定）决定，冒号后的内容不会被 @github/hotkey 解析为任何有意义的字段。
 
 解析后每个 token 再经过 `normalizeHotkey()`，该函数只做两件事：
 1. `localizeMod`：将 `Mod` 替换为 `Control`（Windows/Linux）或 `Meta`（macOS）
@@ -88,14 +88,56 @@ export default class extends Controller {
 | `"Escape"` | `[["Escape"]]` | 单步序列，单键 |
 | `"t t /"` | `[["t"], ["t"], ["/"]]` | 三步序列 |
 | `"k,K,ArrowUp,ArrowLeft"` | `[["k", "K", "ArrowUp", "ArrowLeft"]]` | 四个替代键 |
-| **`"esc:DS--dialog#close"`** | **`[["esc:DS--dialog#close"]]`** | **整个字符串被当作一个键名** |
+| **`"esc:DS--dialog#close"`** | **`[["esc:DS--dialog#close"]]`** | **整个字符串被当作一个键名，冒号和 # 均无特殊含义** |
 
 **`eventToHotkeyString` 对 Escape 键的输出：**
 - 读取 `event.key`，值为 `"Escape"`
 - 经过修饰符映射（无修饰符按下）和别名映射 `n = {" ":"Space","+":"Plus"}`（无 Escape 映射）
 - 最终输出：**`"Escape"`**
 
-**匹配结论：** RadixTrie 中注册的是 `"esc:DS--dialog#close"`，但键盘事件归一化为 `"Escape"`——二者永远不匹配。`data-hotkey="esc:DS--dialog#close"` 在 @github/hotkey 的路由中**是无效绑定**。
+**匹配结论：** RadixTrie 中注册的是 `"esc:DS--dialog#close"`，但键盘事件归一化为 `"Escape"`——二者永远不匹配。`data-hotkey="esc:DS--dialog#close"` 在 @github/hotkey 的路由中**是无效绑定**。冒号后的 `DS--dialog#close` 对 hotkey 库无意义，看起来是写代码时混淆了 `data-action` 语法（`controller#method`）和 `data-hotkey` 语法。
+
+### 2.4 序列按键状态的重置机制
+
+**两个核心变量：**
+- `c`：当前在 RadixTrie 中的位置指针（初始指向根节点 `o`）
+- `a`：`SequenceTracker` 实例，维护 `_path` 按键序列数组 + 超时计时器
+
+**SequenceTracker 关键方法：**
+```javascript
+class SequenceTracker {
+  registerKeypress(e) {
+    this._path = [...this._path, eventToHotkeyString(e)];
+    this.startTimer();  // 每次按键重启 1500ms 计时器
+  }
+  reset() {
+    this.killTimer();
+    this._path = [];
+    this.onReset?.call(this);  // 回调：c = o（回到根节点）
+  }
+}
+SequenceTracker.CHORD_TIMEOUT = 1500;
+```
+
+**序列状态重置的五种场景：**
+
+| 场景 | 是否重置 | 触发方式 | 说明 |
+|---|---|---|---|
+| 命中 Leaf 节点 | ✅ 立即重置 | `a.reset()` | 动作触发后清空序列 |
+| 完全不匹配（`t` 为 falsy） | ✅ 立即重置 | `a.reset()` | 序列中断，回到根节点 |
+| 命中中间节点（RadixTrie 非 Leaf） | ❌ 不重置 | — | 序列继续，等待下一步按键 |
+| 超时 1500ms 无新按键 | ✅ 超时重置 | `setTimeout` → `a.reset()` | 序列过期自动清理 |
+| `isFormField` 过滤早期 return | ❌ 不重置 | — | **序列状态保留但不推进**，计时器继续跑 |
+
+**关键边界：isFormField 过滤 return 时不重置。** 代码原文：
+```javascript
+if (isFormField(e.target)) {
+  const t = e.target;
+  if (!t.id) return;                                  // ← 直接 return，不调用 a.reset()
+  if (!t.ownerDocument.querySelector(...)) return;    // ← 直接 return，不调用 a.reset()
+}
+```
+这意味着：如果用户在输入框里打字，序列状态停留在之前的位置（比如已按了 `"t"`），不会因为输入框内的按键而重置，也不会推进。直到超时 1500ms 后才会自动重置。
 
 ---
 
