@@ -1,4 +1,4 @@
-# 账户余额快照修正路径说明
+﻿# 账户余额快照修正路径说明
 
 ## 一、核心概念
 
@@ -73,19 +73,57 @@
 | 手动触发全家同步 | `AccountsController#sync_all` | [accounts_controller.rb#L13](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/accounts_controller.rb#L13) |
 | Plaid 手动同步 | `PlaidItemsController#sync` | [plaid_items_controller.rb#L42](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/plaid_items_controller.rb#L42) |
 
-**C. 模型层业务操作（间接触发）**
+**C. 控制器层显式调度（Entry 条目的增删改）**
 
-| 操作 | 触发位置 | 代码位置 |
-|------|----------|----------|
-| 交易/对账/交易删除 | `Entry#sync_account_later` | [entry.rb#L46-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/entry.rb#L46-L49) |
-| 转账创建 | 源账户 + 目标账户各触发一次 | [transfer/creator.rb#L18-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/transfer/creator.rb#L18-L19) |
-| 交易创建/更新 | 通过 Entry callback 触发 | (同上 Entry) |
-| 持仓更新 | `Holding` callback | [holding.rb#L60](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/holding.rb#L60) |
-| 交易表单创建 | 买卖/分红/拆分等 | [trade/create_form.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/trade/create_form.rb) |
-| Plaid Webhook | 交易/投资/持仓更新 | [plaid_item/webhook_processor.rb#L20-L24](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/plaid_item/webhook_processor.rb#L20-L24) |
-| 数据导入完成 | 全家级触发 | [import.rb#L70](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/import.rb#L70) |
+Entry 模型本身 **没有任何 after_save/after_destroy 之类的回调** 来触发同步。所有同步调度都是控制器在 save/destroy 成功后 **显式调用** 的。
 
-**D. 同步器级联调度（Family → PlaidItem → Account）**
+| 操作 | 谁调度 sync | 调用方式 | 代码位置 |
+|------|------------|----------|----------|
+| 交易创建 | TransactionsController#create | `@entry.sync_account_later` | [transactions_controller.rb#L61](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions_controller.rb#L61) |
+| 交易更新 | TransactionsController#update | `@entry.sync_account_later` | [transactions_controller.rb#L88](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions_controller.rb#L88) |
+| 交易删除（单条） | EntryableResource#destroy | `@entry.sync_account_later` | [entryable_resource.rb#L34](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/concerns/entryable_resource.rb#L34) |
+| 交易删除（批量） | BulkDeletionsController#create | 对每个受影响账户调 `account.sync_later` | [bulk_deletions_controller.rb#L4](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions/bulk_deletions_controller.rb#L4) |
+| 交易更新（批量） | BulkUpdatesController#create | **不触发同步**（只改分类/标签等，不影响金额/日期） | [bulk_updates_controller.rb#L6-L9](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions/bulk_updates_controller.rb#L6-L9) |
+| Trade 更新 | TradesController#update | `@entry.sync_account_later` | [trades_controller.rb#L33](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/trades_controller.rb#L33) |
+| API 交易创建 | Api::V1::TransactionsController#create | `@entry.sync_account_later` | [api/v1/transactions_controller.rb#L83](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/api/v1/transactions_controller.rb#L83) |
+| API 交易更新 | Api::V1::TransactionsController#update | `@entry.sync_account_later` | [api/v1/transactions_controller.rb#L109](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/api/v1/transactions_controller.rb#L109) |
+| API 交易删除 | Api::V1::TransactionsController#destroy | `@entry.sync_account_later` | [api/v1/transactions_controller.rb#L135](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/api/v1/transactions_controller.rb#L135) |
+| 转账匹配创建 | TransferMatchesController#create | `@transfer.sync_account_later` | [transfer_matches_controller.rb#L17](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transfer_matches_controller.rb#L17) |
+
+`Entry#sync_account_later` 的作用是计算同步窗口起始日期并委托给 `account.sync_later`：
+```ruby
+def sync_account_later
+  sync_start_date = [ date_previously_was, date ].compact.min unless destroyed?
+  account.sync_later(window_start_date: sync_start_date)
+end
+```
+（[entry.rb#L46-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/entry.rb#L46-L49)）
+
+`Transfer#sync_account_later` 则委托给双方的 Entry：
+```ruby
+def sync_account_later
+  inflow_transaction&.entry&.sync_account_later
+  outflow_transaction&.entry&.sync_account_later
+end
+```
+（[transfer.rb#L51-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/transfer.rb#L51-L54)）
+
+**D. 模型层业务操作（非回调，显式调度）**
+
+以下操作不在控制器中，而在模型层对象（表单/创建器）的 `create` 方法中 **显式调用** `account.sync_later`。它们同样不依赖任何 ActiveRecord 回调。
+
+| 操作 | 谁调度 sync | 调用方式 | 代码位置 |
+|------|------------|----------|----------|
+| Trade 创建（买卖） | Trade::CreateForm#create_trade | `account.sync_later` | [trade/create_form.rb#L50](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/trade/create_form.rb#L50) |
+| Trade 创建（利息收入） | Trade::CreateForm#create_interest_income | `account.sync_later` | [trade/create_form.rb#L69](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/trade/create_form.rb#L69) |
+| Trade 创建（无关联转账） | Trade::CreateForm#create_unlinked_transfer | `account.sync_later` | [trade/create_form.rb#L106](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/trade/create_form.rb#L106) |
+| 转账创建 | Transfer::Creator#create | 源账户 + 目标账户各调 `account.sync_later` | [transfer/creator.rb#L18-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/transfer/creator.rb#L18-L19) |
+| 持仓清理 | Holding#destroy | `account.sync_later` | [holding.rb#L60](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/holding.rb#L60) |
+| Plaid Webhook | PlaidItem::WebhookProcessor | `plaid_item.sync_later`（级联到 Account） | [plaid_item/webhook_processor.rb#L20-L24](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/plaid_item/webhook_processor.rb#L20-L24) |
+| 数据导入完成 | Import#process_rows | `family.sync_later` | [import.rb#L70](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/import.rb#L70) |
+| 数据导入重置 | Import#reset | `family.sync_later` | [import.rb#L91](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/import.rb#L91) |
+
+**E. 同步器级联调度（Family → PlaidItem → Account）**
 
 Family 同步器不直接重算，而是调度子同步任务：
 
@@ -697,8 +735,8 @@ end
 | 锚点模块 | [anchorable.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/account/anchorable.rb) |
 | 对账模块 | [reconcileable.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/account/reconcileable.rb) |
 | 对账控制器 | [valuations_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/valuations_controller.rb) |
-| 通用账户控制器 | [accountable_resource.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/concerns/accountable_resource.rb) |
-| 通用条目控制器 | [entryable_resource.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/concerns/entryable_resource.rb) |
+| Transaction 控制器 | [transactions_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions_controller.rb) |
+| Trade 控制器 | [trades_controller.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/trades_controller.rb) |
 | 展示组件 | [balance_reconciliation.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/components/UI/account/balance_reconciliation.rb) |
 | 估值模型 | [valuation.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/valuation.rb) |
 | 账户模型 | [account.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/account.rb) |
