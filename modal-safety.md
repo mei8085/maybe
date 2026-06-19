@@ -4,24 +4,33 @@
 
 本项目的删除/撤销确认保护完全依赖 **Turbo 的 `data-turbo-confirm` 前端钩子**。整个流程是纯前端拦截——如果用户绕过前端（如直接构造 HTTP 请求、禁用 JS、修改 DOM），后端没有任何二次确认保护。
 
+部分高风险操作（有依赖关系的分类/标签删除）使用了**独立的删除页面流程**（DeletionsController），但那是业务流程上的二次确认，而非安全防护。
+
 ---
 
 ## 完整代码路径梳理
 
 ### 阶段 1：确认弹窗的触发
 
-#### 1.1 入口：组件层注入 `data-turbo-confirm`
+#### 1.1 三种确认数据注入方式
 
-所有危险操作按钮通过两个组件注入确认数据：
+删除操作的确认数据注入有 **3 种层级**，并非所有删除都有完整的 CustomConfirm 配置：
 
-- [DS::Button](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/components/DS/button.rb#L28-L30)：`confirm:` 参数 → 合并为 `data-turbo-confirm`
-- [DS::MenuItem](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/components/DS/menu_item.rb#L52-L54)：同上逻辑
+| 注入方式 | 说明 | 代码位置 |
+|---|---|---|
+| **`confirm: CustomConfirm.new(...)`** | 完整自定义，带 title/body/btn_text/variant | [DS::Button#merged_opts](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/components/DS/button.rb#L28-L30)、[DS::MenuItem#merged_opts](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/components/DS/menu_item.rb#L52-L54) |
+| **`data: { turbo_confirm: true }`** | 最简形式，使用默认文案 "Are you sure?" | 直接写在 view 中的 `button_to` |
+| **无确认（直接提交）** | 没有任何 `turbo_confirm`，点击即删 | 部分 `_category.html.erb` 等 |
 
 ```ruby
-# button.rb / menu_item.rb 中核心代码
-if confirm.present?
-  data = data.merge(turbo_confirm: confirm.to_data_attribute)
-end
+# 方式1：组件层注入（推荐）
+DS::Button.new(confirm: CustomConfirm.for_resource_deletion("account", high_severity: true))
+
+# 方式2：原生 turbo_confirm 属性（简略）
+button_to "Delete", path, method: :delete, data: { turbo_confirm: true }
+
+# 方式3：无确认（危险）
+menu.with_item(variant: "button", text: "Delete", href: category_path(category), method: :delete)
 ```
 
 #### 1.2 确认数据构造：CustomConfirm
@@ -30,21 +39,80 @@ end
 
 | 工厂方法 | 用途 | 按钮变体 |
 |---|---|---|
-| `CustomConfirm.for_resource_deletion(name, high_severity:)` | 资源删除 | `high_severity=true` → `destructive`（红色实心），否则 `outline-destructive`（红色描边） |
-| `CustomConfirm.new(...)` | 自定义（如撤销 Import） | 默认 `primary`（蓝色） |
-
-**关键示例：**
-
-- [\_tag.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/tags/_tag.html.erb#L23-L30)：删除 Tag（无关联交易时），使用 `CustomConfirm.for_resource_deletion`
-- [\_menu.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/accounts/show/_menu.html.erb#L17-L25)：删除 Account，`high_severity: true`
-- [\_import.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/imports/_import.html.erb#L43-L53)：撤销 Import，使用自定义 `CustomConfirm.new`
-- [\_selection_bar.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/entries/_selection_bar.html.erb#L9-L13)：批量删除 Entry
+| `CustomConfirm.for_resource_deletion(name, high_severity:)` | 通用资源删除 | `high_severity=true` → `destructive`（红色实心），否则 `outline-destructive`（红色描边） |
+| `CustomConfirm.new(title:, body:, btn_text:, destructive:, high_severity:)` | 自定义（撤销、禁用 MFA 等） | 默认 `primary`（蓝色） |
 
 ---
 
-### 阶段 2：弹窗渲染与用户交互
+### 阶段 2：所有删除/撤销入口点汇总
 
-#### 2.1 Turbo 钩子接管浏览器原生 confirm
+按风险等级从高到低排列：
+
+#### 2.1 高风险：有确认 + 后端校验
+
+| 操作 | 视图入口 | 确认方式 | 后端 Action | 后端校验 |
+|---|---|---|---|---|
+| 删除账户（手动账户） | [\_menu.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/accounts/show/_menu.html.erb#L17-L25) | `CustomConfirm.for_resource_deletion("account", high_severity: true)` | [accounts#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/accounts_controller.rb#L56-L63) | `linked?` 检查（已关联账户不可删） |
+| 删除 Plaid 连接 | [\_plaid_item.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/plaid_items/_plaid_item.html.erb#L66-L75) | `CustomConfirm.for_resource_deletion(plaid_item.name, high_severity: true)` | [plaid_items#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/plaid_items_controller.rb#L35-L38) | 无（直接 `destroy_later`） |
+| 撤销 API Key | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/api_keys/show.html.erb#L132-L140) | `data: { turbo_confirm: "Are you sure you want to revoke this API key?" }`（字符串形式） | [api_keys#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/settings/api_keys_controller.rb#L38-L45) | `revoke!` 返回 boolean |
+| 撤销 Import | [\_import.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/imports/_import.html.erb#L43-L53) | `CustomConfirm.new(title: "Revert import?", ...)` | [imports#revert](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L41-L44) | `revertable?` 校验（模型层 raise） |
+| 删除 Import | [\_import.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/imports/_import.html.erb#L56-L63) | `CustomConfirm.for_resource_deletion("import")` | [imports#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L55-L59) | 无 |
+| 禁用 MFA | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/securities/show.html.erb#L24-L35) | `CustomConfirm.new(destructive: true)` | [mfa#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/mfa_controller.rb) | 有（MFA 验证流程） |
+| 注销用户 | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/profiles/show.html.erb#L157-L166) | `CustomConfirm.new(title: "Reset account?", ...)` | [users#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/users_controller.rb#L43-L50) | `can_deactivate` 模型验证 |
+| 删除团队成员 | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/profiles/show.html.erb#L54-L60) | `CustomConfirm.for_resource_deletion(user.display_name, high_severity: true)` | [settings/profiles#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/settings/profiles_controller.rb#L10-L17) | 管理员权限校验 |
+| 撤销邀请 | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/profiles/show.html.erb#L101-L107) | `CustomConfirm.for_resource_deletion(invitation.email, high_severity: true)` | [invitations#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/invitations_controller.rb#L37-L44) | 管理员权限校验 |
+
+#### 2.2 中风险：有确认 + 后端无校验
+
+| 操作 | 视图入口 | 确认方式 | 后端 Action |
+|---|---|---|---|
+| 删除交易（详情页） | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/transactions/show.html.erb#L160-L167) | `CustomConfirm.for_resource_deletion("transaction")` | entries#destroy（单条） |
+| 批量删除交易 | [\_selection_bar.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/transactions/_selection_bar.html.erb#L17-L21)、[entries/_selection_bar.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/entries/_selection_bar.html.erb#L9-L13) | `turbo_confirm: true`（仅默认文案） | [transactions/bulk_deletions#create](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/transactions/bulk_deletions_controller.rb#L2-L6) |
+| 删除 Valuation | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/valuations/show.html.erb#L66-L70) | `CustomConfirm.for_resource_deletion("value update")` | entries#destroy |
+| 删除 Transfer | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/transfers/show.html.erb#L94-L99) | `turbo_confirm: true`（仅默认文案） | [transfers#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/transfers_controller.rb#L46-L49) |
+| 删除 Trade | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/trades/show.html.erb#L88-L93) | `turbo_confirm: true`（仅默认文案） | entries#destroy |
+| 删除 Holding | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/holdings/show.html.erb#L91-L95) | `turbo_confirm: true`（仅默认文案） | holdings#destroy |
+| 删除规则 | [\_rule.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/rules/_rule.html.erb#L66-L72) | `CustomConfirm.for_resource_deletion("rule")` | [rules#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/rules_controller.rb#L57-L60) |
+| 删除聊天 | [\_chat.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/chats/_chat.html.erb#L22-L28)、[\_chat_nav.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/chats/_chat_nav.html.erb#L32-L38) | `CustomConfirm.for_resource_deletion("chat")` | [chats#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/chats_controller.rb#L37-L42) |
+| 删除标签（无交易时） | [\_tag.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/tags/_tag.html.erb#L23-L30) | `CustomConfirm.for_resource_deletion(tag.name)` | [tags#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/tags_controller.rb#L32-L35) |
+| 删除 Family Merchant | [\_family_merchant.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/family_merchants/_family_merchant.html.erb#L20-L26) | `CustomConfirm.for_resource_deletion(family_merchant.name)` | family_merchants#destroy |
+
+#### 2.3 批量/全量删除（最高风险）
+
+| 操作 | 视图入口 | 确认方式 | 后端 Action |
+|---|---|---|---|
+| 删除全部分类 | [index.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/categories/index.html.erb#L6-L12) | `CustomConfirm.for_resource_deletion("all categories", high_severity: true)` | [categories#destroy_all](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/categories_controller.rb#L59-L62) |
+| 删除全部标签 | [index.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/tags/index.html.erb#L6-L12) | `CustomConfirm.for_resource_deletion("all tags", high_severity: true)` | [tags#destroy_all](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/tags_controller.rb#L37-L40) |
+| 删除全部规则 | [index.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/rules/index.html.erb#L6-L12) | `CustomConfirm.for_resource_deletion("all rules", high_severity: true)` | [rules#destroy_all](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/rules_controller.rb#L62-L65) |
+
+#### 2.4 特殊：独立删除页面流程（非弹窗确认）
+
+部分资源在**有依赖关系**时，不走弹窗确认，而是跳转到专门的删除页面（DeletionsController），用户可选择替换资源后再提交：
+
+| 资源 | 触发条件 | 删除页面 | 后端 |
+|---|---|---|---|
+| Category（分类） | `category.transactions.any?` | [category/deletions/new.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/category/deletions/new.html.erb) | [Category::DeletionsController](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/category/deletions_controller.rb) |
+| Tag（标签） | `tag.transactions.any?` | [tag/deletions/new.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/tag/deletions/new.html.erb) | [Tag::DeletionsController](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/tag/deletions_controller.rb) |
+
+**注意：** 这些删除页面的提交按钮**没有 `turbo_confirm` 二次确认**，因为页面本身就是确认流程。
+
+**关键漏洞：** 无依赖关系的分类删除（`_category.html.erb` 第 21 行）—— **没有任何确认弹窗**，点击即删除！
+
+```erb
+# app/views/categories/_category.html.erb:18-21
+<% if category.transactions.any? %>
+  <% menu.with_item(variant: "link", text: t(".delete"), ... href: new_category_deletion_path(category), ...) %>
+<% else %>
+  <% menu.with_item(variant: "button", text: t(".delete"), ... href: category_path(category), method: :delete) %>
+  <%# ⚠️ 无 confirm 属性！直接删除！ %>
+<% end %>
+```
+
+---
+
+### 阶段 3：弹窗渲染与用户交互
+
+#### 3.1 Turbo 钩子接管浏览器原生 confirm
 
 [application.js](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/javascript/controllers/application.js#L9-L17) 覆盖了 Turbo 的默认确认行为：
 
@@ -58,25 +126,25 @@ Turbo.config.forms.confirm = (data) => {
 };
 ```
 
-**关键点：** 返回的是 `Promise<boolean>`。Turbo 会等待 Promise resolve：
-- `true` → 继续提交表单/访问链接
+**关键点：** 返回 `Promise<boolean>`。Turbo 等待 Promise resolve：
+- `true` → 继续提交
 - `false` → 中止操作
 
-#### 2.2 全局共享对话框
+#### 3.2 全局共享对话框
 
 唯一的对话框 DOM 定义在 [\_confirm_dialog.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/layouts/shared/_confirm_dialog.html.erb)：
 
 - 基于原生 `<dialog>` 元素 + Stimulus 控制器 `confirm-dialog`
 - 内置 3 个隐藏按钮（`primary` / `outline-destructive` / `destructive`），根据数据显示对应变体
-- 提交机制：使用 `<form method="dialog">`，按钮的 `value="confirm"` 或 `value="cancel"` 设置为 `dialog.returnValue`
+- 提交机制：`<form method="dialog">`，按钮的 `value="confirm"` / `value="cancel"` 设置 `dialog.returnValue`
 
-#### 2.3 弹窗控制器逻辑
+#### 3.3 弹窗控制器逻辑
 
 [confirm_dialog_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/javascript/controllers/confirm_dialog_controller.js)：
 
 ```
 handleConfirm(rawData)
-  → #normalizeRawData()：解析 JSON 或直接用字符串作 title
+  → #normalizeRawData()：JSON 解析 / 字符串 / boolean true → 转换为配置对象
   → #prepareDialog()：填充 title/subtitle/按钮文本、切换按钮变体
   → this.element.showModal()
   → 返回 Promise，监听 dialog close 事件，检查 returnValue === "confirm"
@@ -88,98 +156,165 @@ handleConfirm(rawData)
 3. 按 ESC 键（由 `dialog_controller.js` 的 hotkey 绑定 `esc:DS--dialog#close`）
 4. 点击遮罩外部区域（`clickOutside` → `close()`）
 
-> **注意 1：** ESC 和点击外部区域 2 种方式的 `returnValue` 是空字符串，不等于 `"confirm"`，因此等同于取消。
-> **注意 2：** 用户可以在浏览器 DevTools 中手动执行 `document.getElementById("confirm-dialog").close("confirm")` 来绕过弹窗。
+> **注意 1：** ESC 和点击外部区域的 `returnValue` 是空字符串，不等于 `"confirm"`，等同于取消。
+> **注意 2：** 用户可在 DevTools 执行 `document.getElementById("confirm-dialog").close("confirm")` 强制绕过。
 
 ---
 
-### 阶段 3：提交动作（后端处理）
+### 阶段 4：后端提交动作
 
-确认通过后，Turbo 正常执行原本的请求。后端完全信任请求，**没有二次校验 token 或确认标志**。
+确认通过后，Turbo 正常执行请求。后端完全信任请求，**没有二次校验 token 或确认标志**。
 
-#### 3.1 同步删除（直接 destroy）
+#### 4.1 同步删除（直接 destroy）
 
-| Controller#action | Model 方法 | 错误处理 |
-|---|---|---|
-| [tags#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/tags_controller.rb#L32-L35) | `@tag.destroy!` | 无异常捕获，抛异常由 Rails 全局处理 |
-| [transfers#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/transfers_controller.rb#L46-L49) | `@transfer.destroy!` | 同上 |
-| [rules#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/rules_controller.rb#L57-L60) | `@rule.destroy`（无 bang，失败静默） | 无错误反馈，无论成功都显示 "Rule deleted" |
-| [imports#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L55-L59) | `@import.destroy` | 同上 |
-| [sessions#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/sessions_controller.rb#L25-L28) | `@session.destroy` | 登出，正常 |
+| Controller#action | Model 方法 | 错误处理 | 成功反馈 |
+|---|---|---|---|
+| [accounts#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/accounts_controller.rb#L56-L63) | `@account.destroy_later`（异步） | `linked?` 检查 → alert | notice: "Account scheduled for deletion" |
+| [categories#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/categories_controller.rb#L53-L57) | `@category.destroy` | 无 | notice: t(".success") |
+| [categories#destroy_all](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/categories_controller.rb#L59-L62) | `Current.family.categories.destroy_all` | 无 | notice: "All categories deleted" |
+| [tags#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/tags_controller.rb#L32-L35) | `@tag.destroy!` | 无（异常冒泡） | notice: t(".deleted") |
+| [tags#destroy_all](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/tags_controller.rb#L37-L40) | `Current.family.tags.destroy_all` | 无 | notice: "All tags deleted" |
+| [rules#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/rules_controller.rb#L57-L60) | `@rule.destroy`（无 bang） | 无（静默失败） | notice: "Rule deleted" |
+| [rules#destroy_all](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/rules_controller.rb#L62-L65) | `Current.family.rules.destroy_all` | 无 | notice: "All rules deleted" |
+| [chats#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/chats_controller.rb#L37-L42) | `@chat.destroy` | 无 | notice: "Chat was successfully deleted" |
+| [transfers#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/transfers_controller.rb#L46-L49) | `@transfer.destroy!` | 无（异常冒泡） | notice: t(".success") |
+| [imports#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L55-L59) | `@import.destroy` | 无 | notice: "Your import has been deleted." |
+| [sessions#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/sessions_controller.rb#L25-L28) | `@session.destroy` | 无 | notice: t(".logout_successful") |
+| [transactions/bulk_deletions#create](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/transactions/bulk_deletions_controller.rb#L2-L6) | `destroy_by(id: ...)` | 无 | notice: "N transactions deleted" |
+| [settings/api_keys#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/settings/api_keys_controller.rb#L38-L45) | `@api_key.revoke!` | 失败 → alert | notice: "API key has been revoked successfully" |
+| [invitations#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/invitations_controller.rb#L37-L44) | `@invitation.destroy` | 非管理员 → alert | 无显式 notice |
 
-#### 3.2 异步/延迟删除
+#### 4.2 异步/延迟删除（Job 队列）
 
-| 操作 | 代码路径 |
-|---|---|
-| 删除 PlaidItem | [plaid_items#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/plaid_items_controller.rb#L35-L38) → `@plaid_item.destroy_later` → [plaid_item.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/models/plaid_item.rb#L44-L47) 标记 `scheduled_for_deletion: true` + 入队 `DestroyJob` |
-| 撤销 Import | [imports#revert](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L41-L44) → `@import.revert_later` → [import.rb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/models/import.rb#L77-L83) 校验 `revertable?`（`complete? \|\| revert_failed?`）→ 标记 `reverting` + 入队 `RevertImportJob` |
-| 发布 Import | [imports#publish](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L4-L10) 有 `rescue Import::MaxRowCountExceededError` → 返回 alert |
-| 注销用户 | [users#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/users_controller.rb#L43-L50) → `@user.deactivate`（软删除，更新 `active: false`）→ 有模型验证 `can_deactivate` 保护 |
+| 操作 | 调用链 | 前置校验 | Job 失败处理 |
+|---|---|---|---|
+| 删除账户 | [accounts#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/accounts_controller.rb#L60) → `@account.destroy_later` → [account.rb#L91-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/models/account.rb#L91-L94) `mark_for_deletion!` + `DestroyJob` | `linked?` 检查 | [DestroyJob](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/jobs/destroy_job.rb#L4-L8) rescue 后重置 `scheduled_for_deletion: false` |
+| 删除 PlaidItem | [plaid_items#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/plaid_items_controller.rb#L36) → `@plaid_item.destroy_later` → [plaid_item.rb#L44-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/models/plaid_item.rb#L44-L47) | 无 | 同上 |
+| 撤销 Import | [imports#revert](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L42) → `@import.revert_later` → [import.rb#L77-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/models/import.rb#L77-L83) | `revertable?` 校验（raise） | 状态变为 `revert_failed`，无主动通知 |
+| 发布 Import | [imports#publish](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L5) → `@import.publish_later` | `MaxRowCountExceededError`（controller 层 rescue） | 状态变为 `failed` |
+| 注销用户 | [users#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/users_controller.rb#L44) → `@user.deactivate`（软删除） → [user.rb#L101-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/models/user.rb#L101-L103) `purge_later` | `can_deactivate` 验证 | 异步 purge，无用户反馈 |
+| 重置账户 | [users#reset](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/users_controller.rb#L39) → `FamilyResetJob.perform_later` | 管理员权限 | 无 |
 
----
-
-### 阶段 4：错误反馈
-
-错误反馈有 3 种层次，但**与确认弹窗完全解耦**，确认弹窗无法感知后端错误：
-
-#### 4.1 Flash 消息（重定向场景）
-
-大部分 destroy 动作使用 `redirect_to ..., notice:` 或 `alert:`：
-
+**`DestroyJob` 的特殊处理：**
 ```ruby
-# 成功
-redirect_to tags_path, notice: t(".deleted")
-# 失败（仅 users#destroy 等少数）
-redirect_to settings_profile_path, alert: @user.errors.full_messages.to_sentence
+# app/jobs/destroy_job.rb
+def perform(model)
+  model.destroy
+rescue => e
+  model.update!(scheduled_for_deletion: false)  # 重置状态，让用户可重试
+end
 ```
 
-#### 4.2 Model 验证错误（表单场景）
+#### 4.3 独立删除页面流程
 
-仅对带有表单的编辑操作生效，删除操作基本不涉及：
+[Category::DeletionsController](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/category/deletions_controller.rb) 和 [Tag::DeletionsController](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/tag/deletions_controller.rb) 流程：
+
+```
+GET /categories/:category_id/deletions/new
+  → 显示删除确认页面，可选替换分类
+  → 提交 POST /category_deletions
+    → replace_and_destroy!（替换关联交易的分类 + 删除原分类）
+    → redirect_back_or_to transactions_path
+```
+
+对应的 [deletion_controller.js](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/javascript/controllers/deletion_controller.js) 仅控制按钮文本切换，不涉及安全校验。
+
+---
+
+### 阶段 5：错误反馈
+
+错误反馈有 4 种层次，**均与确认弹窗完全解耦**，确认弹窗无法感知后端错误：
+
+#### 5.1 Flash 消息（重定向场景）
+
+大部分 destroy 动作使用 `redirect_to ..., notice:` 或 `alert:`。成功时显示 notice，失败时（少数有校验的）显示 alert。
+
+#### 5.2 Model 验证错误（表单场景）
+
+仅对带有表单的编辑操作生效，标准删除操作基本不涉及：
 - [\_form_errors.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/shared/_form_errors.html.erb) 渲染 `model.errors.full_messages`
 
-#### 4.3 异常 Rescue（部分关键操作）
+#### 5.3 状态字段更新（异步 Job 场景）
 
-- `imports#publish`：rescue `Import::MaxRowCountExceededError` → redirect with alert
-- `import#revert_later`：模型层 `raise "Import is not revertable" unless revertable?`，**但 controller 中未 rescue**，异常会冒泡为 500
-- `users#destroy`：通过模型验证返回 boolean，controller 分支处理
+异步操作通过模型状态字段反馈，用户需要刷新页面才能看到：
+- Import: `revert_failed` / `failed` 状态
+- PlaidItem / Account: `scheduled_for_deletion` 标记，失败后重置为 false
+- 视图中显示 `(deletion in progress...)` 动画
+
+#### 5.4 异常冒泡
+
+以下操作失败时直接抛异常，由 Rails 全局错误处理（500 页面）：
+- `tags#destroy`（`destroy!` 抛异常）
+- `transfers#destroy`（`destroy!` 抛异常）
+- `imports#revert`（`revert_later` 的 `revertable?` 校验失败抛异常，controller 未 rescue）
 
 ---
 
 ## 整体流程图
+
+### 弹窗确认流程（快速删除）
 
 ```
 用户点击删除按钮
     │
     ▼
 [View 层] button_to / link_to
-    │  data-turbo-confirm="{title, body, confirmText, variant}"
-    ▼
-[Turbo] Turbo.config.forms.confirm 钩子被触发
-    │  调用 confirm-dialog 控制器 handleConfirm(data)
-    ▼
-[Stimulus] confirm_dialog_controller
-    │  1. 解析数据  2. 更新弹窗 DOM  3. showModal()
-    ▼
-[用户交互] 弹窗显示
+    │  data-turbo-confirm="{title, body, confirmText, variant}" 或 true 或 无
     │
-    ├─ 取消 / ESC / 点外部 → Promise.resolve(false) → Turbo 中止 ✓
+    ├─ 有 turbo_confirm 属性 → Turbo 拦截
+    │       │
+    │       ▼
+    │ [Turbo] Turbo.config.forms.confirm 钩子
+    │       │  调用 confirm-dialog 控制器 handleConfirm(data)
+    │       ▼
+    │ [Stimulus] confirm_dialog_controller
+    │       │  1. 解析数据  2. 更新弹窗 DOM  3. showModal()
+    │       ▼
+    │ [用户交互] 弹窗显示
+    │       │
+    │       ├─ 取消 / ESC / 点外部 → Promise.resolve(false) → Turbo 中止 ✓
+    │       │
+    │       └─ 确认按钮 → Promise.resolve(true) → Turbo 继续提交
+    │                            │
+    └────────────────────────────┘
+                        │
+                        ▼
+              [HTTP 请求] DELETE / PUT / POST
+                    │  无任何确认 token 或签名
+                    ▼
+              [Backend Controller]
+                    │
+                    ├─ 同步 destroy / destroy!
+                    │    ├─ 成功 → redirect notice
+                    │    └─ 失败 → 500 / alert（少数有验证）
+                    │
+                    └─ 异步 *_later（入队 Job）
+                         ├─ 前置校验（如 revertable? / linked?）
+                         └─ 立即返回 notice（Job 失败无主动反馈）
+```
+
+### 独立删除页面流程（有依赖关系的资源）
+
+```
+用户点击删除按钮（有依赖关系时）
     │
-    └─ 确认按钮 → Promise.resolve(true) → Turbo 继续提交
-                         │
-                         ▼
-                   [HTTP 请求] DELETE / PUT
-                         │  无任何确认 token 或签名
-                         ▼
-                   [Backend Controller]
-                         │
-                         ├─ 同步 destroy / destroy!
-                         │    ├─ 成功 → redirect notice
-                         │    └─ 失败（仅少数有验证）→ redirect alert
-                         │
-                         └─ 异步 *_later（入队 Job）
-                              ├─ 前置校验（如 revertable?）
-                              └─ 立即返回 notice（Job 失败无反馈给用户）
+    ▼
+[GET] /xxx/:id/deletions/new（modal/turbo_frame）
+    │
+    ▼
+显示删除确认页面
+    ├─ 显示影响范围说明
+    ├─ 可选替换资源（replacement_id）
+    └─ 提交按钮（无二次确认弹窗）
+    │
+    ▼
+[POST] /xxx_deletions
+    │
+    ▼
+replace_and_destroy!(replacement)
+    │
+    ▼
+redirect + notice
 ```
 
 ---
@@ -188,23 +323,38 @@ redirect_to settings_profile_path, alert: @user.errors.full_messages.to_sentence
 
 | 绕过方式 | 说明 | 防护现状 |
 |---|---|---|
-| **直接发送 HTTP 请求** | 用 curl/Postman 发 DELETE 请求，或在控制台执行 `fetch('/tags/1', {method: 'DELETE'})` | ❌ 无防护，仅靠 Devise 登录态 |
+| **直接发送 HTTP 请求** | curl/Postman 发 DELETE 请求，或控制台 `fetch('/tags/1', {method: 'DELETE'})` | ❌ 无防护，仅靠 Devise 登录态和资源归属校验 |
 | **修改 DOM 删除属性** | F12 删除按钮上的 `data-turbo-confirm` 属性 | ❌ 无防护 |
 | **禁用 JavaScript** | Turbo 不加载，`button_to` 生成的 form 仍可直接提交（带 `_method=delete`） | ❌ 无防护 |
 | **JS 控制台调用 close** | `document.getElementById('confirm-dialog').close('confirm')` 强制返回确认 | ❌ 仅前端防护 |
-| **后台 Job 失败无感知** | `RevertImportJob`、`DestroyJob` 失败后，用户看到的是"已提交"，实际状态变为 `revert_failed` | ⚠️ 状态会更新，但无主动通知 |
+| **无确认的删除点** | 无交易的分类删除（`_category.html.erb`）等少数入口没有 confirm | ❌ 完全无确认 |
+| **后台 Job 失败无感知** | `RevertImportJob`、`DestroyJob` 失败后状态更新但无主动通知 | ⚠️ 状态会更新，但用户需刷新才能看到 |
+| **批量操作风险放大** | `destroy_all` 系列操作一次删除全部资源，仅一次弹窗确认 | ⚠️ 有确认但单次确认即全删 |
 
 ---
 
 ## 已有的保护措施
 
-1. **部分操作前置校验**：
+1. **业务分层的确认流程**：
+   - 无依赖资源：弹窗快速确认
+   - 有依赖资源（分类/标签）：跳转独立删除页面，可选择替换资源
+
+2. **部分操作前置校验**：
    - `import.revert_later` 检查 `revertable?`
    - `user.deactivate` 检查 `can_deactivate`（管理员+多用户不可删）
-   - Tag 删除分场景：有交易的走专门的 `new_tag_deletion_path` 页面流程，无交易的才走快速确认
+   - `account.destroy` 检查 `linked?`（已关联账户不可删）
+   - API Key 撤销、邀请删除等有管理员权限校验
 
-2. **软删除/延迟删除**：
-   - User：软删除（`active: false`）
-   - PlaidItem：`scheduled_for_deletion` 标记 + 异步 Job
+3. **软删除/延迟删除**：
+   - User：软删除（`active: false`）+ 异步 purge
+   - Account / PlaidItem：`scheduled_for_deletion` 标记 + 异步 `DestroyJob`
+   - DestroyJob 失败后重置状态，可重试
 
-3. **按钮变体分级**：高严重级别使用 `destructive` 红色实心按钮，视觉警示。
+4. **按钮变体分级**：
+   - 高严重级别使用 `destructive` 红色实心按钮
+   - 普通删除使用 `outline-destructive` 红色描边按钮
+   - 视觉警示分级
+
+5. **专门的 DeletionsController**：
+   - 有依赖关系的分类/标签删除走独立页面流程
+   - 提供替换资源选项，降低数据丢失风险
