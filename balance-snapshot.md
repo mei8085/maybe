@@ -1,4 +1,4 @@
-﻿# 账户余额快照修正路径说明
+# 账户余额快照修正路径说明
 
 ## 一、核心概念
 
@@ -83,7 +83,7 @@ Entry 模型本身 **没有任何 after_save/after_destroy 之类的回调** 来
 | 交易更新 | TransactionsController#update | `@entry.sync_account_later` | [transactions_controller.rb#L88](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions_controller.rb#L88) |
 | 交易删除（单条） | EntryableResource#destroy | `@entry.sync_account_later` | [entryable_resource.rb#L34](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/concerns/entryable_resource.rb#L34) |
 | 交易删除（批量） | BulkDeletionsController#create | 对每个受影响账户调 `account.sync_later` | [bulk_deletions_controller.rb#L4](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions/bulk_deletions_controller.rb#L4) |
-| 交易更新（批量） | BulkUpdatesController#create | **不触发同步**（只改分类/标签等，不影响金额/日期） | [bulk_updates_controller.rb#L6-L9](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions/bulk_updates_controller.rb#L6-L9) |
+| 交易更新（批量） | BulkUpdatesController#create | **缺失：未触发同步**（允许改 date，会影响余额快照） | [bulk_updates_controller.rb#L6-L9](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transactions/bulk_updates_controller.rb#L6-L9) |
 | Trade 更新 | TradesController#update | `@entry.sync_account_later` | [trades_controller.rb#L33](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/trades_controller.rb#L33) |
 | API 交易创建 | Api::V1::TransactionsController#create | `@entry.sync_account_later` | [api/v1/transactions_controller.rb#L83](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/api/v1/transactions_controller.rb#L83) |
 | API 交易更新 | Api::V1::TransactionsController#update | `@entry.sync_account_later` | [api/v1/transactions_controller.rb#L109](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/api/v1/transactions_controller.rb#L109) |
@@ -107,6 +107,57 @@ def sync_account_later
 end
 ```
 （[transfer.rb#L51-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/transfer.rb#L51-L54)）
+
+**批量更新（BulkUpdatesController）的参数范围与同步缺失说明**
+
+按代码执行顺序，批量更新的完整链路如下：
+
+```
+用户提交批量编辑表单
+  ↓
+① BulkUpdatesController#bulk_update_params（参数白名单）
+  permitted: :date, :notes, :category_id, :merchant_id, entry_ids: [], tag_ids: []
+  ↑ 注意：允许传 :date，意味着可以批量修改交易日期
+  ↓
+② Entry.bulk_update!(bulk_update_params)（[entry.rb#L73-L97](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/entry.rb#L73-L97)）
+  ├─ 组装 bulk_attributes：
+  │    {
+  │      date: bulk_update_params[:date],
+  │      notes: bulk_update_params[:notes],
+  │      entryable_attributes: { category_id, merchant_id, tag_ids }
+  │    }.compact_blank   ← 值为 nil/空的字段会被剔除，只 UPDATE 用户实际传了的字段
+  │
+  ├─ transaction do
+  │    all.each do |entry|
+  │      entry.update! bulk_attributes    ← 逐条 UPDATE Entry + Transaction
+  │      entry.lock_saved_attributes!     ← 锁定已保存属性快照
+  │      entry.entryable.lock_attr!(:tag_ids) if entry.transaction?
+  │    end                                ← 此处没有 entry.sync_account_later
+  │  end
+  │
+  └─ return all.size   ← 返回更新条数
+  ↓
+③ BulkUpdatesController 重定向到 transactions_path
+  ↑ 此处也没有 account.sync_later
+```
+
+**重算调度边界与潜在问题**：
+
+| 步骤 | 是否触发 sync_later | 为什么 |
+|------|---------------------|--------|
+| ① 控制器接收参数 | 否 | 参数解析阶段 |
+| ② `entry.update! bulk_attributes` | **否** — 这是关键边界 | Entry 没有 after_save callback；虽然 `update!` 会触发 ActiveRecord 回调，但应用层没有任何 callback 调 sync；而单条 `TransactionsController#update` 是在 save 成功后 **显式** 调 `entry.sync_account_later`，这个显式调用在批量路径上 **缺失** |
+| ③ 控制器返回前 | 否 | 控制器没有补调 sync |
+
+**允许改 date 为什么会影响余额快照**：
+
+ForwardCalculator / ReverseCalculator 是按日期遍历 `account.entries.chronological`，逐条将金额累加到对应日期。如果用户把 2025-01-15 的一笔交易日期改成 2025-02-20：
+- 旧日期 01-15 的净流量会减少该笔金额 → 该日及之后所有日期的期末余额都变了
+- 新日期 02-20 的净流量会增加该笔金额 → 该日及之后的余额也变了
+- 这意味着必须从 `min(旧日期, 新日期)` 开始重算，也就是 `Entry#sync_account_later` 中 `[ date_previously_was, date ].compact.min` 的逻辑
+- 但批量路径既没调 `sync_account_later`，也没传 `window_start_date`，所以 balances 表不会刷新，展示值与实际值会脱节
+
+对比：单条删除 `EntryableResource#destroy` 在 destroy 后显式调了 `@entry.sync_account_later`；批量删除 `BulkDeletionsController` 对每个受影响账户调了 `account.sync_later`。只有批量更新这条路径存在调度缺失。
 
 **D. 模型层业务操作（非回调，显式调度）**
 
