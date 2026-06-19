@@ -15,10 +15,22 @@
 | 级别 | 名称 | 说明 |
 |---|---|---|
 | **Level 4** | 独立删除页面流程 | 独立的删除确认页面 + 可选替换资源 + 后端业务校验 |
-| **Level 3** | 前端确认 + 后端校验 | 前端弹窗确认（CustomConfirm）+ 后端有业务逻辑校验（权限/状态/关联） |
-| **Level 2** | 完整前端确认 | 前端弹窗确认（CustomConfirm 完整配置）+ 后端无校验 |
-| **Level 1** | 简单前端确认 | `turbo_confirm: true`（默认文案 "Are you sure?"）+ 后端无校验 |
+| **Level 3** | 前端确认 + 后端校验 | 前端弹窗确认 + 后端有业务逻辑校验（状态/关联/数量） |
+| **Level 2** | 完整前端确认 | 前端弹窗确认（CustomConfirm 完整配置）+ 后端无业务校验 |
+| **Level 1** | 简单前端确认 | `turbo_confirm: true` 或字符串（无 CustomConfirm 结构化配置）+ 后端无业务校验 |
 | **Level 0** | 无保护 | 无任何确认属性，点击即删 |
+
+### 后端校验类型说明
+
+后端校验分为 **3 类**，其中仅"业务逻辑校验"算真正的删除保护，另外两类是通用权限控制：
+
+| 类型 | 说明 | 举例 |
+|---|---|---|
+| **业务逻辑校验** | 针对删除操作本身的状态/关联/数量校验 | `revertable?`、`linked?`、`can_deactivate`、`row_count_exceeded?` |
+| **管理员权限校验** | 检查 `Current.user.admin?` 角色权限 | invitations#destroy、settings/profiles#destroy、users#reset |
+| **资源归属校验** | 通过 `Current.family.xxx` 或 `Current.user.xxx` 查找资源，确保只能操作自己/家庭的资源 | api_keys#destroy、大部分 destroy action |
+
+> **注意**：管理员权限校验和资源归属校验是应用的通用权限机制，不是专门为删除确认设计的保护。所有操作都隐式或显式地有资源归属校验。
 
 ### 异步任务反馈强度（4 级）
 
