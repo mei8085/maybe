@@ -363,7 +363,7 @@ close() {
 
 **不过**，该链接有 `pointer-events-none` CSS 类，且通常 Turbo 对 `inert` 元素内的导航链接会有拦截。实际表现取决于浏览器对 `inert` + 程序化 `click()` 的处理细节——不同浏览器可能有差异。
 
-### 3.5 Menu 组件的局部监听
+### 3.5 Menu 组件的局部监听 — 不阻止冒泡，全局快捷键仍会触发
 
 源码位置：[menu_controller.js:37-62](file:///d:/fz/0601-2/solo-dogfeeding/code/41-maybe/app/components/DS/menu_controller.js#L37-L62)
 
@@ -496,37 +496,61 @@ Turbo.config.forms.confirm = (data) => {
 
 ## 五、全局监听、输入焦点限制与命令触发的边界条件总结
 
-### 5.1 三层过滤的完整判定链
+### 5.1 keyDownHandler 完整判定链（与 2.4.2 节代码编号一一对应）
 
 ```
-keydown 事件到达 document
+keydown 事件到达 document → keyDownHandler(e)
   │
-  ├─ event.defaultPrevented? ──→ 是 → 退出（被其他处理器吞掉）
+  ├─ ① e.defaultPrevented? ──→ 是 → return（不重置序列）
   │
-  ├─ event.target instanceof Node? ──→ 否 → 退出
+  ├─ ② e.target instanceof Node? ──→ 否 → return（不重置序列）
   │
-  ├─ isFormField(event.target)?
+  ├─ ③ isFormField(e.target)?
   │   ├─ 是 → target.id 存在?
-  │   │   ├─ 否 → 退出（表单字段无 id，所有快捷键禁用）
-  │   │   └─ 是 → DOM 中存在 [data-hotkey-scope="target.id"]?
-  │   │       ├─ 否 → 退出（无该字段专属的快捷键绑定）
+  │   │   ├─ 否 → return（不重置序列）
+  │   │   └─ 是 → DOM 中有 [data-hotkey-scope="target.id"]?
+  │   │       ├─ 否 → return（不重置序列）
   │   │       └─ 是 → 继续匹配（只匹配带 scope 的绑定）
   │   └─ 否 → 继续匹配（只匹配不带 scope 的全局绑定）
   │
-  ├─ RadixTrie.get(eventToHotkeyString(event))
-  │   ├─ undefined → SequenceTracker 可能进入序列中间态
-  │   │   （如已按了 "t"，等待下一步，1500ms 超时重置）
-  │   └─ 找到节点 →
-  │       ├─ RadixTrie 中间节点 → 等待序列下一步
-  │       └─ Leaf 节点 →
-  │           ├─ 遍历 children 找匹配元素
-  │           │   ├─ 无匹配 → 什么都不做
-  │           │   └─ 有匹配 → fireDeterminedAction + preventDefault
-  │           └─ SequenceTracker.reset()
+  ├─ t = c.get(eventToHotkeyString(e))    ← 从当前位置 c 的 children 中查找
   │
-  └─ 无匹配 → SequenceTracker.reset()
-       （原生浏览器行为不被 preventDefault，如 <dialog> 的 Escape 关闭）
+  ├─ ④ t 存在（truthy）?
+  │   ├─ 是 →
+  │   │   ├─ a.registerKeypress(e)        ← _path 推入按键 + 重启 1500ms 计时
+  │   │   ├─ c = t                        ← 书签移动到子节点
+  │   │   │
+  │   │   ├─ ⑤ t instanceof Leaf?
+  │   │   │   ├─ 是（序列完成）→ 反向遍历 children 找 scope 匹配
+  │   │   │   │   ├─ 有匹配 → fireDeterminedAction + e.preventDefault()
+  │   │   │   │   └─ 无匹配 → 什么都不做
+  │   │   │   └─ a.reset()                ← 无条件重置！
+  │   │   │         c = o, _path = []      （无论是否触发动作）
+  │   │   │
+  │   │   └─ ⑥ else（t 是 RadixTrie，中间节点）
+  │   │       └─ 什么都不做！
+  │   │         c 停在中间节点，_path 保留
+  │   │         ⚠ 这就是"序列进行中，等待下一步"
+  │   │
+  │   └─ ⑦ else（t 为 undefined/falsy，完全不匹配）
+  │       └─ a.reset()                    ← 立即重置！
+  │             c = o, _path = []
+  │             ⚠ 不是"进入中间态"，是直接清空
+  │
+  └─ 最终 preventDefault? → 仅在 ⑤ 中 scope 匹配到元素时为 true
+          其余所有情况：false，原生行为保留
 ```
+
+**核心区分 — 立即重置 vs 等待下一步：**
+
+| 条件 | 触发分支 | 结果 | 序列状态 |
+|---|---|---|---|
+| `c.get(按键)` 返回 `undefined` | ⑦ | `a.reset()` 立即调用 | 序列清空，回到起点 |
+| `c.get(按键)` 返回 `RadixTrie` 实例 | ④→⑥ | 什么都不做 | 序列继续，等待下一步 |
+| `c.get(按键)` 返回 `Leaf` 实例 | ④→⑤ | 动作后 `a.reset()` | 序列完成，清空 |
+| `isFormField` 提前 return | ③ | 不调用 reset | 序列冻结，计时继续 |
+
+**判定顺序明确：** 先走 ④ 的 `if(t)`（存在性），再在其内部走 ⑤/⑥ 的类型判断（Leaf vs RadixTrie）。所以"不匹配"和"匹配到中间节点"是两条互斥分支——不可能同时发生。
 
 ### 5.2 `<dialog showModal()>` 打开时的 Escape 优先级
 
