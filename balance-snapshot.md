@@ -90,7 +90,7 @@ Entry 模型本身 **没有任何 after_save/after_destroy 之类的回调** 来
 | API 交易删除 | Api::V1::TransactionsController#destroy | `@entry.sync_account_later` | [api/v1/transactions_controller.rb#L135](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/api/v1/transactions_controller.rb#L135) |
 | 转账匹配创建 | TransferMatchesController#create | `@transfer.sync_account_later` | [transfer_matches_controller.rb#L17](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/controllers/transfer_matches_controller.rb#L17) |
 
-`Entry#sync_account_later` 的作用是计算同步窗口起始日期并委托给 `account.sync_later`：
+`Entry#sync_account_later` 的作用是计算受影响日期范围并委托给 `account.sync_later`：
 ```ruby
 def sync_account_later
   sync_start_date = [ date_previously_was, date ].compact.min unless destroyed?
@@ -98,6 +98,8 @@ def sync_account_later
 end
 ```
 （[entry.rb#L46-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/entry.rb#L46-L49)）
+
+**重要：** 这里计算的 `sync_start_date` 只是**存入 Sync 记录的 `window_start_date` 字段**，用于同步任务的去重合并（见下文"同步窗口的真实作用"）。**Account 层重算时完全不消费这个窗口**，每次都是全量重算。
 
 `Transfer#sync_account_later` 则委托给双方的 Entry：
 ```ruby
@@ -107,6 +109,92 @@ def sync_account_later
 end
 ```
 （[transfer.rb#L51-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/transfer.rb#L51-L54)）
+
+**同步窗口（window_start_date / window_end_date）的真实作用**
+
+同步窗口是 **Sync 任务去重与合并机制** 的核心，而不是用来做增量重算的。让我们从 `sync_later` 入口开始讲清完整逻辑：
+
+```ruby
+# Syncable#sync_later（[syncable.rb#L14-L34](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/concerns/syncable.rb#L14-L34)）
+def sync_later(parent_sync: nil, window_start_date: nil, window_end_date: nil)
+  Sync.transaction do
+    with_lock do
+      sync = self.syncs.incomplete.first   # 找 pending 或 syncing 状态的同步
+
+      if sync
+        Rails.logger.info("There is an existing sync, expanding window if needed (#{sync.id})")
+        sync.expand_window_if_needed(window_start_date, window_end_date)   # ← 关键调用
+      else
+        sync = self.syncs.create!(...)
+        SyncJob.perform_later(sync)
+      end
+    end
+  end
+end
+```
+
+**等待中（pending）与执行中（syncing）的窗口扩展差异**：
+
+`expand_window_if_needed` 方法（[sync.rb#L107-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/sync.rb#L107-L127)）的第一行就是关键边界：
+
+```ruby
+def expand_window_if_needed(new_window_start_date, new_window_end_date)
+  return unless pending?   # ← 只有 pending 状态才扩展！
+  return if self.window_start_date.nil? && self.window_end_date.nil?
+
+  # 取更早的 start_date，更晚的 end_date
+  earliest_start_date = [ self.window_start_date, new_window_start_date ].compact.min
+  latest_end_date   = [ self.window_end_date,   new_window_end_date   ].compact.max
+
+  update(window_start_date: earliest_start_date, window_end_date: latest_end_date)
+end
+```
+
+所以 `sync_later` 的完整行为可以总结为：
+
+| 现有同步状态 | `syncs.incomplete.first` 命中？ | 是否创建新 Sync | 是否调用 `expand_window_if_needed` | 实际效果 |
+|-------------|-------------------------------|----------------|-----------------------------------|----------|
+| 无 incomplete | 否 | ✅ 是 | 否 | 新建 Sync，入队执行 |
+| **pending**（等待中） | 是 | ❌ 否 | ✅ 是（且生效） | 复用现有 Sync，扩展窗口（取最早 start、最晚 end） |
+| **syncing**（执行中） | 是 | ❌ 否 | ❌ 否（方法第一行 return） | 复用现有 Sync，但不扩展窗口（因为已经在跑了，窗口扩展没用） |
+
+**同步窗口的传递链（但 Account 层不消费）**：
+
+窗口参数在 Family → PlaidItem → Account 层级间传递，但 Account 层重算时完全忽略：
+
+```
+Family::Syncer
+  syncable.sync_later(
+    parent_sync: sync,
+    window_start_date: sync.window_start_date,   ← 传递窗口给子同步
+    window_end_date: sync.window_end_date
+  )
+  ↓
+PlaidItem::Syncer
+  plaid_item.schedule_account_syncs(
+    window_start_date: sync.window_start_date,   ← 继续传递
+    window_end_date: sync.window_end_date
+  )
+  ↓
+Account.sync_later(window_start_date: ...)        ← 存入 Sync 记录
+  ↓
+Account::Syncer#perform_sync(sync)
+  import_market_data
+  materialize_balances                              ← 这里 **完全不读取 sync.window_start_date**
+    Balance::Materializer.new(account, strategy:)    ← 只传 account 和 strategy
+      ForwardCalculator.new(account)                  ← 只传 account
+        # 从 opening_anchor 到 latest_entry_date，全量遍历计算
+```
+
+**Account 层重算总是全量的证据**：
+- `Account::Syncer#perform_sync(sync)`（[account/syncer.rb#L8-L12](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/account/syncer.rb#L8-L12)）：方法体完全没有使用 `sync` 参数
+- `Balance::Materializer#materialize_balances`（[materializer.rb#L9-L23](file:///d:/fz/0601-2/solo-dogfeeding/code/42-maybe/app/models/balance/materializer.rb#L9-L23)）：只依赖 `@account` 和 `@strategy`
+- `ForwardCalculator` / `ReverseCalculator`：总是从锚点日期遍历到最新条目日期，没有 `window_start_date` 过滤
+
+**同步窗口的唯一真实用途**：
+1. **去重合并**：短时间内多次 `sync_later` 调用（如批量导入、多次快速修改）不会产生多个 Sync 任务，而是合并到一个 pending Sync 中
+2. **标记受影响范围**：`window_start_date` 记录了"最早哪一天的数据可能变了"，虽然当前 Account 重算不用，但保留了未来做增量重算的可能性
+3. **Plaid 数据拉取**：Plaid 层可能在 `import_latest_plaid_data` 中使用窗口拉取增量数据（虽然当前代码也没传窗口参数）
 
 **批量更新（BulkUpdatesController）的参数范围与同步缺失说明**
 
