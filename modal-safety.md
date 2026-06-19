@@ -93,17 +93,28 @@ menu.with_item(variant: "button", text: "Delete", href: category_path(category),
 
 ---
 
-### Level 3：前端确认 + 后端校验
+### Level 3：前端确认 + 后端业务校验
 
-| 操作 | 视图入口 | 确认方式 | 后端 Action | 后端校验 |
+| 操作 | 视图入口 | 确认方式 | 后端 Action | 后端业务校验 |
 |---|---|---|---|---|
 | 删除账户（手动账户） | [\_menu.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/accounts/show/_menu.html.erb#L17-L25) | `CustomConfirm.for_resource_deletion("account", high_severity: true)` | [accounts#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/accounts_controller.rb#L56-L63) | `linked?` 检查（已关联账户不可删） |
-| 撤销 Import | [\_import.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/imports/_import.html.erb#L43-L53) | `CustomConfirm.new(title: "Revert import?", ...)` | [imports#revert](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L41-L44) | `revertable?` 校验（模型层 raise） |
-| 发布 Import | 配置完成后的按钮 | `CustomConfirm.new` | [imports#publish](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L4-L10) | `MaxRowCountExceededError`（controller 层 rescue） |
+| 撤销 Import | [\_import.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/imports/_import.html.erb#L43-L53) | `CustomConfirm.new(title: "Revert import?", ...)` | [imports#revert](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L41-L44) | `revertable?` 校验（`complete? \|\| revert_failed?`，模型层 raise） |
 | 注销用户 | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/profiles/show.html.erb#L157-L166) | `CustomConfirm.new(title: "Reset account?", ...)` | [users#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/users_controller.rb#L43-L50) | `can_deactivate` 模型验证（管理员+多用户不可删） |
-| 删除团队成员 | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/profiles/show.html.erb#L54-L60) | `CustomConfirm.for_resource_deletion(user.display_name, high_severity: true)` | [settings/profiles#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/settings/profiles_controller.rb#L10-L17) | 管理员权限校验 |
+| 删除团队成员 | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/profiles/show.html.erb#L54-L60) | `CustomConfirm.for_resource_deletion(user.display_name, high_severity: true)` | [settings/profiles#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/settings/profiles_controller.rb#L10-L17) | 管理员权限 + 不能删除自己 |
 | 撤销邀请 | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/profiles/show.html.erb#L101-L107) | `CustomConfirm.for_resource_deletion(invitation.email, high_severity: true)` | [invitations#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/invitations_controller.rb#L37-L44) | 管理员权限校验 |
-| 撤销 API Key | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/api_keys/show.html.erb#L132-L140) | `data: { turbo_confirm: "Are you sure you want to revoke this API key?" }`（字符串形式） | [api_keys#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/settings/api_keys_controller.rb#L38-L45) | `revoke!` 返回 boolean |
+
+> **排除说明**：以下两项曾误入 Level 3，实际不属于此级别：
+> - **Import 发布**：按钮无 `confirm` 属性（见下方"无前端确认的操作"小节），不属于任何前端确认级别。
+> - **撤销 API Key**：前端仅字符串 `turbo_confirm`（Level 1 确认），后端仅资源归属范围（`Current.user.api_keys.active.first`），无业务校验也无管理员校验，已归入 Level 1。
+
+---
+
+### 无前端确认的操作（仅有后端业务校验）
+
+| 操作 | 视图入口 | 前端确认 | 后端 Action | 后端业务校验 |
+|---|---|---|---|---|
+| 发布 Import | [\_ready.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/imports/_ready.html.erb#L38) | ❌ **无**（`DS::Button.new(text: "Publish import", ...)`，无 confirm 参数） | [imports#publish](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/imports_controller.rb#L4-L10) | `row_count_exceeded?`（MaxRowCountExceededError）+ `publishable?` |
+| Import 发布重试 | [\_failure.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/imports/_failure.html.erb#L14) | ❌ **无**（`DS::Button.new(text: "Try again", ...)`，无 confirm 参数） | 同上 | 同上 |
 
 ---
 
@@ -128,7 +139,7 @@ menu.with_item(variant: "button", text: "Delete", href: category_path(category),
 
 ---
 
-### Level 1：简单前端确认 + 后端无校验
+### Level 1：简单前端确认 + 后端无业务校验
 
 | 操作 | 视图入口 | 确认方式 | 后端 Action |
 |---|---|---|---|
@@ -136,6 +147,9 @@ menu.with_item(variant: "button", text: "Delete", href: category_path(category),
 | 删除 Transfer | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/transfers/show.html.erb#L94-L99) | `turbo_confirm: true`（仅默认文案） | [transfers#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/transfers_controller.rb#L46-L49) |
 | 删除 Trade | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/trades/show.html.erb#L88-L93) | `turbo_confirm: true`（仅默认文案） | entries#destroy |
 | 删除 Holding | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/holdings/show.html.erb#L91-L95) | `turbo_confirm: true`（仅默认文案） | holdings#destroy |
+| 撤销 API Key | [show.html.erb](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/views/settings/api_keys/show.html.erb#L132-L140) | `data: { turbo_confirm: "Are you sure you want to revoke this API key?" }`（字符串，非 CustomConfirm） | [settings/api_keys#destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/43-maybe/app/controllers/settings/api_keys_controller.rb#L38-L45) |
+
+> **API Key 撤销说明**：按钮使用字符串形式的 `turbo_confirm`，而非结构化的 `CustomConfirm`，属于 Level 1 简单确认。后端仅有资源归属校验（`Current.user.api_keys.active.first`），无业务逻辑校验。 |
 
 ---
 
